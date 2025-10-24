@@ -70,28 +70,11 @@ def main():
             ctx.enqueue_copy(host_out, result_tensor.storage)
             ctx.synchronize()
 
-            # Also copy inputs for inspection
-            var total_a = dims.get[0]() * dims.get[1]()   # M * K
-            var total_b = other_dims.get[0]() * other_dims.get[1]()  # K * N
-            var host_a = ctx.enqueue_create_host_buffer[dtype](total_a)
-            var host_b = ctx.enqueue_create_host_buffer[dtype](total_b)
-            ctx.enqueue_copy(host_a, first_tensor.storage)
-            ctx.enqueue_copy(host_b, other_tensor.storage)
-            ctx.synchronize()
-
-            print("A (", M, "x", K, "):")
-            for i in range(M):
-                for k in range(K):
-                    var idx_a = i * K + k
-                    print(host_a[idx_a])
-                print("")
-
-            print("B (", K, "x", N, "):")
-            for k in range(K):
-                for j in range(N):
-                    var idx_b = k * N + j
-                    print(host_b[idx_b])
-                print("")
+            # Use tensor printers (no duplication)
+            print("A:")
+            first_tensor.print_tensor(ctx)
+            print("B:")
+            other_tensor.print_tensor(ctx)
 
             print("Result (", M, "x", N, "):")
             for i in range(M):
