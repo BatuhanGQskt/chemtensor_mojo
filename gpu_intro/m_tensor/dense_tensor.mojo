@@ -6,7 +6,6 @@ from gpu import thread_idx, block_idx, block_dim, barrier
 from gpu.host import DeviceContext, DeviceBuffer
 from layout.tensor_builder import LayoutTensorBuild as tb
 from layout.layout import DimList
-from main import THREADS_PER_BLOCK, TPB, my_layout, res_layout, dynamic_layout
 from math import ceildiv
 
 alias dtype = DType.float32
@@ -28,29 +27,23 @@ struct DenseTensor[
     fn print_tensor(self) -> None:
         print("Tensor: ", self.data)
 
-## GPU-optimized dot product for dense tensors
-fn dense_tensor_dot(first_tensor: DenseTensor[dynamic_layout], other_tensor: DenseTensor[dynamic_layout], result_tensor: DenseTensor[dynamic_layout]) raises -> None:  # Removed unused size
-    print("Dense tensor dot")
-    # Naive approach for now: https://docs.modular.com/max/tutorials/custom-ops-matmul/
-    var M = first_tensor.dims.get[0]()
-    var N = other_tensor.dims.get[1]()
-    var K = other_tensor.dims.get[0]()
-
-    print("M: ", M, "N: ", N, "K: ", K)
+## GPU-optimized dot product for dense tensors (device-friendly view)
+fn dense_tensor_dot[layout: Layout](
+    first: LayoutTensor[mut=False, dtype, layout, MutableAnyOrigin],
+    other: LayoutTensor[mut=False, dtype, layout, MutableAnyOrigin],
+    result: LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin],
+    M: Int, N: Int, K: Int,
+) -> None:
     var row = Int(block_dim.x * block_idx.x + thread_idx.x)
     var col = Int(block_dim.y * block_idx.y + thread_idx.y)
 
-    var dst_reg: Float32 = 0.0
+    if row < M and col < N and K > 0:
+        var dst = first[row, 0] * other[0, col]
+        for k in range(1, K):
+            dst += first[row, k] * other[k, col]
+        result[row, col] = dst
 
-    if row < M and col < N:
-        for k_index in range(K):
-            k_index += 1
-            # dst_reg += first_tensor.data[row, k_index] * other_tensor.data[k_index, col]
-            pass
-    result_tensor.data[row, col] = dst_reg
-
-
-fn create_tensor(ctx: DeviceContext, dims: DimList, layout: Layout) raises -> DenseTensor[dynamic_layout]:
+fn create_tensor[layout: Layout](ctx: DeviceContext, dims: DimList) raises -> DenseTensor[layout]:
     var x = dims.get[0]()
     var y = dims.get[1]()
     var size = x * y
@@ -65,10 +58,33 @@ fn create_tensor(ctx: DeviceContext, dims: DimList, layout: Layout) raises -> De
     ctx.enqueue_copy(device_storage, host_storage)
 
     # Runtime layout (row-major)
-    var rt_shape = RuntimeTuple[dynamic_layout.shape](x, y)
-    var rt_stride = RuntimeTuple[dynamic_layout.stride](y, 1)
-    var rt_layout = RuntimeLayout[dynamic_layout](shape=rt_shape, stride=rt_stride)  # Named params fix positional error
+    var rt_shape = RuntimeTuple[layout.shape](x, y)
+    var rt_stride = RuntimeTuple[layout.stride](y, 1)
+    var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)  # Named params fix positional error
 
     # LayoutTensor on device
-    var tensor = LayoutTensor[mut=True, dtype, dynamic_layout, MutableAnyOrigin](device_storage, runtime_layout=rt_layout)
-    return DenseTensor[dynamic_layout](tensor, dims, device_storage)
+    var tensor = LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin](device_storage, runtime_layout=rt_layout)
+    return DenseTensor[layout](tensor, dims, device_storage)
+
+## Explicit shape/stride variant for runtime-configurable layouts
+fn create_tensor_with_stride[layout: Layout](ctx: DeviceContext, dims: DimList, stride_dims: DimList) raises -> DenseTensor[layout]:
+    var x = dims.get[0]()
+    var y = dims.get[1]()
+    var sx = stride_dims.get[0]()
+    var sy = stride_dims.get[1]()
+
+    var size = x * y
+
+    var host_storage = ctx.enqueue_create_host_buffer[dtype](size)
+    for i in range(size):
+        host_storage[i] = 42.0
+
+    var device_storage = ctx.enqueue_create_buffer[dtype](size)
+    ctx.enqueue_copy(device_storage, host_storage)
+
+    var rt_shape = RuntimeTuple[layout.shape](x, y)
+    var rt_stride = RuntimeTuple[layout.stride](sx, sy)
+    var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)
+
+    var tensor = LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin](device_storage, runtime_layout=rt_layout)
+    return DenseTensor[layout](tensor, dims, device_storage)
