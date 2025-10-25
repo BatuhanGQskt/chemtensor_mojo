@@ -1,5 +1,4 @@
 from memory import Pointer, AddressSpace, OwnedPointer
-from io import Writer, Writable
 from layout import Layout, LayoutTensor, RuntimeLayout, IntTuple, RuntimeTuple
 from collections.list import List
 from gpu import thread_idx, block_idx, block_dim, barrier
@@ -7,6 +6,7 @@ from gpu.host import DeviceContext, DeviceBuffer
 from layout.tensor_builder import LayoutTensorBuild as tb
 from layout.layout import DimList
 from math import ceildiv
+from main import MAX_RANK
 
 alias dtype = DType.float32
 
@@ -53,7 +53,12 @@ fn dense_tensor_dot[layout: Layout](
     result: LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin],
     M: Int, N: Int, K: Int,
 ) -> None:
-    var row = Int(block_dim.x * block_idx.x + thread_idx.x)
+    # TODO: Make this more general for N number of ranks if possible dynamic(not static 5)
+    # TODO: Investigate complex and try to implement dot accordingly
+    # TODO: kronecker
+    # TODO: scalar add
+    # TODO: SVD function (hard)
+    var row = Int(block_dim.x * block_idx.x + thread_idx.x) #TODO: Make a version for coalescing
     var col = Int(block_dim.y * block_idx.y + thread_idx.y)
 
     if row < M and col < N and K > 0:
@@ -62,28 +67,50 @@ fn dense_tensor_dot[layout: Layout](
             dst += first[row, k] * other[k, col]
         result[row, col] = dst
 
-fn create_tensor[layout: Layout](ctx: DeviceContext, dims: DimList) raises -> DenseTensor[layout]:
-    var x = dims.get[0]()
-    var y = dims.get[1]()
-    var size = x * y
+fn list_to_dimlist(dims: List[Int]) -> DimList:
+    """Convert List[Int] to DimList (assumes MAX_RANK=4).
+    
+    Args:
+        dims: List of integers that represents dimensions.
 
-    # Host buffer for initialization
-    var host_storage = ctx.enqueue_create_host_buffer[dtype](size)
-    for i in range(size):
-        host_storage[i] = 42.0
+    Returns:
+        dimlist: Returns 2 or 4 size DimList
+    
+    Descriptions:
+        var dims = List[Int](2, 4)
+        var m_dimlist = list_to_dimlist(dims)
+        m_dimlist = [2, 4, 1, 1] # if MAX_RANK == 4.
+    """
+    @parameter
+    if MAX_RANK == 4:
+        return DimList(dims[0], dims[1], dims[2], dims[3])
+    else:
+        # Fallback for other ranks - would need to be extended
+        return DimList(dims[0], dims[1])
 
-    # Device buffer and copy
-    var device_storage = ctx.enqueue_create_buffer[dtype](size)
-    ctx.enqueue_copy(device_storage, host_storage)
 
-    # Runtime layout (row-major)
-    var rt_shape = RuntimeTuple[layout.shape](x, y)
-    var rt_stride = RuntimeTuple[layout.stride](y, 1)
-    var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)  # Named params fix positional error
+fn compute_strides(dims: List[Int], rank: Int) -> List[Int]:
+    """Compute row-major strides for given dimensions."""
+    var strides = List[Int]()
+    var stride = 1
+    
+    # Compute strides in reverse order (row-major)
+    for i in range(rank - 1, -1, -1):
+        strides.insert(0, stride)
+        stride *= dims[i]
+    
+    # Pad remaining with 1s
+    for _ in range(MAX_RANK - rank):
+        strides.append(1)
+    
+    return strides
 
-    # LayoutTensor on device
-    var tensor = LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin](device_storage, runtime_layout=rt_layout)
-    return DenseTensor[layout](tensor, dims, device_storage)
+fn compute_stride_and_dimlist_from_list(dims: List[Int], rank: Int) -> Tuple[DimList, DimList]:
+    """Compute dimlist and strides from a list of dimensions."""
+    var dim_list = list_to_dimlist(dims)
+    var strides = list_to_dimlist(compute_strides(dims, rank))
+
+    return Tuple[DimList, DimList](dim_list, strides)
 
 ## Explicit shape/stride variant for runtime-configurable layouts
 fn create_tensor_with_stride[layout: Layout](ctx: DeviceContext, dims: DimList, stride_dims: DimList) raises -> DenseTensor[layout]:
@@ -107,3 +134,7 @@ fn create_tensor_with_stride[layout: Layout](ctx: DeviceContext, dims: DimList, 
 
     var tensor = LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin](device_storage, runtime_layout=rt_layout)
     return DenseTensor[layout](tensor, dims, device_storage)
+
+fn create_tensor[layout: Layout](ctx: DeviceContext, dims: List[Int], rank: Int) raises -> DenseTensor[layout]:
+    var dims_dl, stride = compute_stride_and_dimlist_from_list(dims, rank)
+    return create_tensor_with_stride[layout](ctx, dims_dl, stride)
