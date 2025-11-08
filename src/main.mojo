@@ -1,0 +1,328 @@
+from sys import has_accelerator
+from m_tensor.dense_tensor import create_static_tensor, create_static_tensor_with_stride
+from m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot
+from layout.layout import DimList, Layout
+from gpu import thread_idx, block_idx, block_dim
+from gpu.host import DeviceContext
+from math import ceildiv
+from time import perf_counter_ns
+from collections import optional, List
+from python import Python
+from layout import IntTuple, LayoutTensor, RuntimeTuple
+from layout.runtime_layout import RuntimeLayout, make_layout
+
+alias dtype = DType.float32
+
+fn create_runtime_layout_from_user_input[layout: Layout](
+    shape: List[Int], 
+    stride: List[Int], 
+    rank: Int
+) -> Optional[RuntimeLayout[layout]]:
+    """Create a RuntimeLayout from user-provided shape and stride.
+    
+    Args:
+        shape: List of dimensions.
+        stride: List of strides.
+        rank: Number of dimensions (1-4 supported).
+    
+    Returns:
+        Optional RuntimeLayout - None if rank is unsupported.
+    """
+    if rank == 1:
+        var rt_shape = RuntimeTuple[layout.shape](shape[0])
+        var rt_stride = RuntimeTuple[layout.stride](stride[0])
+        var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)
+        return rt_layout
+    elif rank == 2:
+        var rt_shape = RuntimeTuple[layout.shape](shape[0], shape[1])
+        var rt_stride = RuntimeTuple[layout.stride](stride[0], stride[1])
+        var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)
+        return rt_layout
+    elif rank == 3:
+        var rt_shape = RuntimeTuple[layout.shape](shape[0], shape[1], shape[2])
+        var rt_stride = RuntimeTuple[layout.stride](stride[0], stride[1], stride[2])
+        var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)
+        return rt_layout
+    elif rank == 4:
+        var rt_shape = RuntimeTuple[layout.shape](shape[0], shape[1], shape[2], shape[3])
+        var rt_stride = RuntimeTuple[layout.stride](stride[0], stride[1], stride[2], stride[3])
+        var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)
+        return rt_layout
+    else:
+        print("Error: Rank", rank, "is not supported. Only 1-4 are supported")
+        return None
+
+alias SIZE = 1024
+alias MAX_RANK = 4
+alias TPB = 16  # TODO: Cannot alocate dynamic memory in the shared memory space at dense_tensor_dot. Dynamic allocation not allow both for types and size which kills the point of optimizing tensor size and fitting it to the GPU space. This is from p13 of gpu quizes
+alias THREADS_PER_BLOCK = (TPB, 2) # 16*2 = 32 for better memory utilization on Warps for threads/block
+alias BLOCK_PER_GRID = (1, 1)
+alias my_layout: Layout = Layout.row_major(THREADS_PER_BLOCK[0], THREADS_PER_BLOCK[1])
+alias res_layout: Layout = Layout.row_major(THREADS_PER_BLOCK[0], THREADS_PER_BLOCK[0])
+
+fn list_to_dimlist(dims: List[Int]) -> DimList:
+    """Convert List[Int] to DimList (assumes MAX_RANK=4).
+    
+    Args:
+        dims: List of integers that represents dimensions.
+
+    Returns:
+        DimList of size 2 or 4.
+    
+    Descriptions:
+        var dims = List[Int](2, 4)
+        var m_dimlist = list_to_dimlist(dims)
+        m_dimlist = [2, 4, 1, 1] # if MAX_RANK == 4.
+    """
+    @parameter
+    if MAX_RANK == 4:
+        return DimList(dims[0], dims[1], dims[2], dims[3])
+    else:
+        # Fallback for other ranks - would need to be extended
+        return DimList(dims[0], dims[1])
+
+
+# Look into the dynamic implementation
+fn get_dims_from_user(prompt: String, rank: Int) raises -> List[Int]:
+    """Get dimensions from user input and pad to MAX_RANK."""
+    var input = Python.import_module("builtins").input
+    var int_fn = Python.import_module("builtins").int
+    
+    print(prompt)
+    var dims = List[Int]()
+    
+    for i in range(rank):
+        var dim_prompt = "  Enter dimension " + String(i) + ": "
+        var dim_str = input(dim_prompt)
+        var dim_val = int_fn(dim_str)
+        var dim_int = Int(dim_val)
+        dims.append(dim_int)
+    
+    # Pad remaining dimensions with 1
+    for _ in range(MAX_RANK - rank):
+        dims.append(1)
+    
+    return dims.copy()
+
+def main():
+    print("Testing...")
+    test_nd_tensor_dot()
+    print("Test done.")
+    return
+
+
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found")
+    else:
+        print("\n" + "="*60)
+        print("DYNAMIC TENSOR CALCULATION DEMO (GPU)")
+        print("="*60 + "\n")
+        
+        # Get user input
+        var use_input = input("Use custom dimensions? (y/n): ")
+        var str_fn = Python.import_module("builtins").str
+        
+        var dims_A: List[Int]
+        var dims_B: List[Int]
+        var dims_C: List[Int]
+
+        if String(str_fn(use_input)).lower() == "y":
+            print("\nMatrix multiplication: C = A @ B")
+            print("For A[M, K] @ B[K, N] = C[M, N]\n")
+            
+            # Get dimensions for matrix A
+            var input_fn = Python.import_module("builtins").input
+            var int_fn = Python.import_module("builtins").int
+            
+            var m_str = input_fn("Enter M (rows of A): ")
+            var k_str = input_fn("Enter K (cols of A / rows of B): ")
+            var n_str = input_fn("Enter N (cols of B): ")
+            
+            var M = Int(int_fn(m_str))
+            var K = Int(int_fn(k_str))
+            var N = Int(int_fn(n_str))
+            
+            dims_A = List[Int](M, K)
+            dims_B = List[Int](K, N)
+            dims_C = List[Int](M, N)
+            
+            print("\nConfiguration:")
+            print("  Matrix A: [", M, ", ", K, "]")
+            print("  Matrix B: [", K, ", ", N, "]")
+            print("  Result C: [", M, ", ", N, "]")
+        else:
+            # Use default values
+            dims_A = List[Int](3, 4)
+            dims_B = List[Int](4, 3)
+            dims_C = List[Int](3, 3)
+            print("Using default dimensions: A=[3,4], B=[4,3], Result=[3,3]")
+
+        print("\n" + "-"*60)
+        var start_ns = perf_counter_ns()
+        
+        with DeviceContext() as ctx:
+            print("Creating Dynamic Tensors with sequential data patterns...")
+            
+            # Create tensor A with sequential values: [1, 2, 3, 4, 5, 6, ...]
+            var M = dims_A[0]
+            var K = dims_A[1]
+            var N = dims_B[1]
+            
+            var data_A = List[Float32]()
+            for i in range(M * K):
+                data_A.append(Float32(i + 1))
+            
+            # Create tensor B with pattern: [0.5, 1.0, 1.5, 2.0, ...]
+            var data_B = List[Float32]()
+            for i in range(K * N):
+                data_B.append(Float32(i + 1) * 0.5)
+            
+            # Create dynamic tensors from data
+            var tensor_A = create_dynamic_tensor_from_data(ctx, data_A, dims_A^)
+            var tensor_B = create_dynamic_tensor_from_data(ctx, data_B, dims_B^)
+            var tensor_C = create_dynamic_tensor(ctx, dims_C^, init_value=0.0)
+            
+            print("\nTensor A created: ", tensor_A)
+            print("Tensor B created: ", tensor_B)
+            print("Tensor C (output): ", tensor_C)
+            
+            # Check if tensors are contiguous
+            print("\n" + "-"*60)
+            print("Checking tensor properties...")
+            print("  Tensor A is contiguous: ", tensor_A.is_contiguous())
+            print("  Tensor B is contiguous: ", tensor_B.is_contiguous())
+            
+            # Print tensor A contents
+            print("\n" + "-"*60)
+            print("Tensor A contents:")
+            tensor_A.print_tensor(ctx)
+            
+            # Print tensor B contents
+            print("\n" + "-"*60)
+            print("Tensor B contents:")
+            tensor_B.print_tensor(ctx)
+            
+            # Perform matrix multiplication C = A @ B
+            print("\n" + "-"*60)
+            print("Performing matrix multiplication: C = A @ B")
+            dense_tensor_dot(tensor_C, tensor_A^, tensor_B^, ctx)
+            ctx.synchronize()
+            
+            # Print result C
+            print("\n" + "-"*60)
+            print("Result C contents:")
+            tensor_C.print_tensor(ctx)
+            
+            # Demonstrate transpose operation on result
+            print("\n" + "-"*60)
+            print("Demonstrating transpose operation on C...")
+            var perm = List[Int](1, 0)  # Transpose: swap rows and columns
+            var tensor_C_T = tensor_C^.transpose(perm, ctx)
+            print("Transposed C:", tensor_C_T)
+            print("Transposed C contents:")
+            tensor_C_T.print_tensor(ctx)
+            
+            # Demonstrate creating a 3D tensor and flattening
+            print("\n" + "-"*60)
+            print("Demonstrating 3D tensor operations...")
+            var shape_3d = List[Int](2, 3, 4)
+            var data_3d = List[Float32]()
+            for i in range(24):
+                data_3d.append(Float32(i))
+            var tensor_3d = create_dynamic_tensor_from_data(ctx, data_3d, shape_3d^)
+            print("3D Tensor: ", tensor_3d)
+            print("Is contiguous: ", tensor_3d.is_contiguous())
+            
+            # Flatten last two dimensions
+            var tensor_flat = tensor_3d^.flatten_dims(1, 3, ctx)
+            print("After flattening dims [1:3]: ", tensor_flat)
+            print("Flattened tensor contents:")
+            tensor_flat.print_tensor(ctx)
+                    
+        var finish_ns = perf_counter_ns()
+        var res_ns = finish_ns - start_ns
+        var res_s = Float64(res_ns) / 1_000_000_000.0
+        
+        print("\n" + "-"*60)
+        print("All Dynamic Tensor calculations completed!")
+        print("Execution time: ", res_s, " seconds (", res_ns, " ns)")
+        print("="*60 + "\n")
+
+
+fn test_func(val: Optional[Int]) -> Int:
+    var new_val = val.or_else(0)
+    print("After or else", new_val)
+    return val.or_else(0)
+
+
+fn test_nd_tensor_dot() raises:
+    """Test ND tensor multiplication with the example from the user.
+    
+    Tests A(4,3,2,1) @ B(1,2,5,7) with ndim_mult=2 should give C(4,3,5,7).
+    """
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found - skipping ND tensor test")
+        return
+    
+    print("\n" + "="*60)
+    print("TESTING ND TENSOR DOT PRODUCT")
+    print("="*60 + "\n")
+    
+    with DeviceContext() as ctx:
+        # Test case from user: A(4,3,2,1) @ B(1,2,5,7) -> C(4,3,5,7)
+        print("Test 1: A(4,3,2,1) @ B(1,2,5,7) with ndim_mult=2")
+        print("  Expected output shape: (4,3,5,7)")
+        print("  Contracting A's last 2 dims (2,1) with B's first 2 dims (1,2)")
+        
+        var shape_A = List[Int](4, 3, 2, 1)
+        var shape_B = List[Int](1, 2, 5, 7)
+        var shape_C = List[Int](4, 3, 5, 7)  # Result shape
+        
+        var A = create_dynamic_tensor(ctx, shape_A^, init_value=2.0)
+        var B = create_dynamic_tensor(ctx, shape_B^, init_value=3.0)
+        var C = create_dynamic_tensor(ctx, shape_C^, init_value=0.0)
+        
+        print("  A shape:", A)
+        print("  B shape:", B)
+        print("  C shape:", C)
+        
+        # Perform contraction
+        dense_tensor_dot(C, A^, B^, ctx, ndim_mult=2)
+        ctx.synchronize()
+        
+        print("\n  Result C after contraction:")
+        C.print_tensor(ctx)
+        
+        # Verify: Each element in C should be 2.0 * 3.0 * (2*1) = 12.0
+        # Because we're summing over 2*1=2 elements
+        print("  Expected value per element: 2.0 * 3.0 * 2 = 12.0")
+        
+        # Test case 2: 3D tensors
+        print("\n" + "-"*60)
+        print("Test 2: A(2,3,4) @ B(4,5,6) with ndim_mult=1")
+        print("  Expected output shape: (2,3,5,6)")
+        
+        var shape_A2 = List[Int](2, 3, 4)
+        var shape_B2 = List[Int](4, 5, 6)
+        var shape_C2 = List[Int](2, 3, 5, 6)
+        
+        var A2 = create_dynamic_tensor(ctx, shape_A2^, init_value=1.0)
+        var B2 = create_dynamic_tensor(ctx, shape_B2^, init_value=0.5)
+        var C2 = create_dynamic_tensor(ctx, shape_C2^, init_value=0.0)
+        
+        print("  A2 shape:", A2)
+        print("  B2 shape:", B2)
+        print("  C2 shape:", C2)
+        
+        dense_tensor_dot(C2, A2^, B2^, ctx, ndim_mult=1)
+        ctx.synchronize()
+        
+        print("\n  Result C2 after contraction:")
+        C2.print_tensor(ctx)
+        print("  Expected value per element: 1.0 * 0.5 * 4 = 2.0")
+        
+        print("\n" + "="*60)
+        print("ND TENSOR DOT TEST COMPLETED")
+        print("="*60 + "\n")
