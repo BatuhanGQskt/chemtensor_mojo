@@ -11,9 +11,9 @@
 - I will try to solve these issues until 07/10/2025
 
 Current issues (10/10/2025):
-- [ ] Still dense_tensor_dot not implemented completely. (Syntax and runtime issues takes all of my time to make progress)
+- [x] Still dense_tensor_dot not implemented completely. (Syntax and runtime issues takes all of my time to make progress)
 - [ ] DimList still should change, but for different reason which is get using [static_int], but we want to use arbitrary size list which limits us.
-- [ ] Weird error:
+- [x] Weird error:
 ```Bash
 /gpu_intro/main.mojo:1:1: error: ptxas application ptx input, line 5085; error   : Illegal operand type to instruction 'st'
 ptxas application ptx input, line 5086; error   : Illegal operand type to instruction 'st'
@@ -23,3 +23,20 @@ ptxas application ptx input, line 5086; error   : Unknown symbol 'func_retval0'
 ptxas application ptx input, line 5087; error   : Unknown symbol 'func_retval0'
 ptxas fatal   : Ptx assembly aborted due to errors
 ```
+
+
+# Next Talk with Prof. Mendl
+[x] Ask him to start officially
+[x] TODO: Make this more general for N number of ranks if possible dynamic(not static 5)
+[] TODO: Investigate complex
+[x] TODO: try to implement dot accordingly
+
+- TODO: kronecker
+- TODO: scalar add
+- TODO: SVD function (hard)
+
+# Theoratical Parts
+- GPU, Tensor
+- Intro(what is thesis about) -> Preliminary (explain your method what is chemtensor, dense sparse mojo) -> Method (Explain exactly what I did, explain decisions why did you implement them, experiments) -> Conclusion ( what you did ) -> Future Work [ This can be splitted up. ]
+
+Skip intro for now. -> Focus on Preliminary (explain what is tensor network, GPU programming MOJO, chemtensor (sparse, dense and logic behind reason))
