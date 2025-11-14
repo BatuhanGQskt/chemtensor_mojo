@@ -1,6 +1,7 @@
 from sys import has_accelerator
-from m_tensor.dense_tensor import create_static_tensor, create_static_tensor_with_stride
+from m_tensor.static_tensor import create_static_tensor, create_static_tensor_with_stride
 from m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot
+from m_tensor.complex_tensor import ComplexDynamicTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
 from layout.layout import DimList, Layout
 from gpu import thread_idx, block_idx, block_dim
 from gpu.host import DeviceContext
@@ -10,6 +11,7 @@ from collections import optional, List
 from python import Python
 from layout import IntTuple, LayoutTensor, RuntimeTuple
 from layout.runtime_layout import RuntimeLayout, make_layout
+from complex import ComplexSIMD
 
 alias dtype = DType.float32
 
@@ -104,8 +106,136 @@ fn get_dims_from_user(prompt: String, rank: Int) raises -> List[Int]:
     
     return dims.copy()
 
+fn test_complex_tensors() raises:
+    """Test complex tensor operations.
+    
+    Demonstrates:
+    - Creating complex tensors
+    - Complex matrix multiplication
+    - Identity matrix operations
+    """
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found - skipping complex tensor tests")
+        return
+    
+    print("\n" + "="*60)
+    print("TESTING COMPLEX TENSOR OPERATIONS")
+    print("="*60 + "\n")
+    
+    with DeviceContext() as ctx:
+        # Test 1: Create and print a simple complex matrix
+        print("Test 1: Creating a 2×2 complex matrix...")
+        var data = List[ComplexSIMD[DType.float32, 1]]()
+        data.append(ComplexSIMD[DType.float32, 1](1.0, 0.5))  # 1.0 + 0.5i
+        data.append(ComplexSIMD[DType.float32, 1](2.0, 0.5))  # 2.0 + 0.5i
+        data.append(ComplexSIMD[DType.float32, 1](3.0, 0.5))  # 3.0 + 0.5i
+        data.append(ComplexSIMD[DType.float32, 1](4.0, 0.5))  # 4.0 + 0.5i
+        
+        var A_shape = List[Int](2, 2)
+        var A = create_complex_tensor_from_data[DType.float32](
+            ctx, data, A_shape^
+        )
+        print("Matrix A:")
+        A.print_tensor(ctx)
+        
+        # Test 2: Create identity matrix
+        print("\n" + "-"*60)
+        print("Test 2: Creating 3×3 identity matrix...")
+        var I = create_complex_identity[DType.float32](ctx, 3)
+        print("Identity matrix:")
+        I.print_tensor(ctx)
+        
+        # Test 3: Complex matrix multiplication
+        print("\n" + "-"*60)
+        print("Test 3: Complex matrix multiplication (2×3) × (3×2)...")
+        var data_A2 = List[ComplexSIMD[DType.float32, 1]]()
+        data_A2.append(ComplexSIMD[DType.float32, 1](1.0, 0.1))
+        data_A2.append(ComplexSIMD[DType.float32, 1](2.0, 0.2))
+        data_A2.append(ComplexSIMD[DType.float32, 1](3.0, 0.3))
+        data_A2.append(ComplexSIMD[DType.float32, 1](4.0, 0.4))
+        data_A2.append(ComplexSIMD[DType.float32, 1](5.0, 0.5))
+        data_A2.append(ComplexSIMD[DType.float32, 1](6.0, 0.6))
+        var A2_shape = List[Int](2, 3)
+        var A2 = create_complex_tensor_from_data[DType.float32](
+            ctx, data_A2, A2_shape^
+        )
+        
+        var data_B2 = List[ComplexSIMD[DType.float32, 1]]()
+        data_B2.append(ComplexSIMD[DType.float32, 1](1.0, 0.0))
+        data_B2.append(ComplexSIMD[DType.float32, 1](0.0, 0.0))
+        data_B2.append(ComplexSIMD[DType.float32, 1](0.0, 0.0))
+        data_B2.append(ComplexSIMD[DType.float32, 1](1.0, 0.0))
+        data_B2.append(ComplexSIMD[DType.float32, 1](1.0, 0.0))
+        data_B2.append(ComplexSIMD[DType.float32, 1](1.0, 0.0))
+        var B2_shape = List[Int](3, 2)
+        var B2 = create_complex_tensor_from_data[DType.float32](
+            ctx, data_B2, B2_shape^
+        )
+        
+        print("Matrix A (2×3):")
+        print("  Shape: [", end="")
+        var shape_A2 = A2.shape()
+        for i in range(len(shape_A2)):
+            if i > 0:
+                print(", ", end="")
+            print(shape_A2[i], end="")
+        print("]")
+        
+        print("Matrix B (3×2):")
+        print("  Shape: [", end="")
+        var shape_B2 = B2.shape()
+        for i in range(len(shape_B2)):
+            if i > 0:
+                print(", ", end="")
+            print(shape_B2[i], end="")
+        print("]")
+        var C2 = create_complex_tensor[DType.float32](ctx, List[Int](2, 2))
+        complex_matmul[DType.float32](C2, A2^, B2^, ctx)
+        
+        print("Result C = A × B (2×2):")
+        C2.print_tensor(ctx)
+        
+        # Test 4: Larger matrix multiplication
+        print("\n" + "-"*60)
+        print("Test 4: Larger matrix multiplication (4×4) × (4×4)...")
+        var A4 = create_complex_tensor[DType.float32](
+            ctx, List[Int](4, 4), real_init=1.0, imag_init=0.0
+        )
+        var B4 = create_complex_tensor[DType.float32](
+            ctx, List[Int](4, 4), real_init=0.5, imag_init=0.25
+        )
+        var C4 = create_complex_tensor[DType.float32](ctx, List[Int](4, 4))
+        
+        complex_matmul[DType.float32](C4, A4^, B4^, ctx)
+        print("Result C = A × B (showing first few elements):")
+        C4.print_tensor(ctx)
+        
+        # Test 5: Test tensor properties
+        print("\n" + "-"*60)
+        print("Test 5: Tensor properties...")
+        var test_tensor = create_complex_tensor[DType.float32](
+            ctx, List[Int](3, 4, 5)
+        )
+        print("Tensor shape: [", end="")
+        var shape_test = test_tensor.shape()
+        for i in range(len(shape_test)):
+            if i > 0:
+                print(", ", end="")
+            print(shape_test[i], end="")
+        print("]")
+        print("Tensor rank:", test_tensor.rank())
+        print("Tensor size:", test_tensor.size())
+        print("Is contiguous:", test_tensor.is_contiguous())
+        
+        print("\n" + "="*60)
+        print("COMPLEX TENSOR TESTS COMPLETED")
+        print("="*60 + "\n")
+
+
 def main():
     print("Testing...")
+    test_complex_tensors()
     test_nd_tensor_dot()
     print("Test done.")
     return
@@ -179,9 +309,9 @@ def main():
                 data_B.append(Float32(i + 1) * 0.5)
             
             # Create dynamic tensors from data
-            var tensor_A = create_dynamic_tensor_from_data(ctx, data_A, dims_A^)
-            var tensor_B = create_dynamic_tensor_from_data(ctx, data_B, dims_B^)
-            var tensor_C = create_dynamic_tensor(ctx, dims_C^, init_value=0.0)
+            var tensor_A = create_dynamic_tensor_from_data[DType.float32](ctx, data_A, dims_A^)
+            var tensor_B = create_dynamic_tensor_from_data[DType.float32](ctx, data_B, dims_B^)
+            var tensor_C = create_dynamic_tensor[DType.float32](ctx, dims_C^, init_value=0.0)
             
             print("\nTensor A created: ", tensor_A)
             print("Tensor B created: ", tensor_B)
@@ -206,7 +336,7 @@ def main():
             # Perform matrix multiplication C = A @ B
             print("\n" + "-"*60)
             print("Performing matrix multiplication: C = A @ B")
-            dense_tensor_dot(tensor_C, tensor_A^, tensor_B^, ctx)
+            dense_tensor_dot[DType.float32](tensor_C, tensor_A^, tensor_B^, ctx)
             ctx.synchronize()
             
             # Print result C
@@ -230,7 +360,7 @@ def main():
             var data_3d = List[Float32]()
             for i in range(24):
                 data_3d.append(Float32(i))
-            var tensor_3d = create_dynamic_tensor_from_data(ctx, data_3d, shape_3d^)
+            var tensor_3d = create_dynamic_tensor_from_data[DType.float32](ctx, data_3d, shape_3d^)
             print("3D Tensor: ", tensor_3d)
             print("Is contiguous: ", tensor_3d.is_contiguous())
             
@@ -280,16 +410,16 @@ fn test_nd_tensor_dot() raises:
         var shape_B = List[Int](1, 2, 5, 7)
         var shape_C = List[Int](4, 3, 5, 7)  # Result shape
         
-        var A = create_dynamic_tensor(ctx, shape_A^, init_value=2.0)
-        var B = create_dynamic_tensor(ctx, shape_B^, init_value=3.0)
-        var C = create_dynamic_tensor(ctx, shape_C^, init_value=0.0)
+        var A = create_dynamic_tensor[DType.float32](ctx, shape_A^, init_value=2.0)
+        var B = create_dynamic_tensor[DType.float32](ctx, shape_B^, init_value=3.0)
+        var C = create_dynamic_tensor[DType.float32](ctx, shape_C^, init_value=0.0)
         
         print("  A shape:", A)
         print("  B shape:", B)
         print("  C shape:", C)
         
         # Perform contraction
-        dense_tensor_dot(C, A^, B^, ctx, ndim_mult=2)
+        dense_tensor_dot[DType.float32](C, A^, B^, ctx, ndim_mult=2)
         ctx.synchronize()
         
         print("\n  Result C after contraction:")
@@ -308,15 +438,15 @@ fn test_nd_tensor_dot() raises:
         var shape_B2 = List[Int](4, 5, 6)
         var shape_C2 = List[Int](2, 3, 5, 6)
         
-        var A2 = create_dynamic_tensor(ctx, shape_A2^, init_value=1.0)
-        var B2 = create_dynamic_tensor(ctx, shape_B2^, init_value=0.5)
-        var C2 = create_dynamic_tensor(ctx, shape_C2^, init_value=0.0)
+        var A2 = create_dynamic_tensor[DType.float32](ctx, shape_A2^, init_value=1.0)
+        var B2 = create_dynamic_tensor[DType.float32](ctx, shape_B2^, init_value=0.5)
+        var C2 = create_dynamic_tensor[DType.float32](ctx, shape_C2^, init_value=0.0)
         
         print("  A2 shape:", A2)
         print("  B2 shape:", B2)
         print("  C2 shape:", C2)
         
-        dense_tensor_dot(C2, A2^, B2^, ctx, ndim_mult=1)
+        dense_tensor_dot[DType.float32](C2, A2^, B2^, ctx, ndim_mult=1)
         ctx.synchronize()
         
         print("\n  Result C2 after contraction:")
