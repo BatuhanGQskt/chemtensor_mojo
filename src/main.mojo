@@ -1,6 +1,6 @@
 from sys import has_accelerator
 from m_tensor.static_tensor import create_static_tensor, create_static_tensor_with_stride
-from m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot
+from m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot, dense_tensor_qr
 from m_tensor.complex_tensor import ComplexDynamicTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
 from layout.layout import DimList, Layout
 from gpu import thread_idx, block_idx, block_dim
@@ -235,6 +235,7 @@ fn test_complex_tensors() raises:
 
 def main():
     print("Testing...")
+    dense_tensor_qr()
     test_complex_tensors()
     test_nd_tensor_dot()
     print("Test done.")

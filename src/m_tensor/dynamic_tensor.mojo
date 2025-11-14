@@ -846,3 +846,32 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
 
     # Grid: 2D (ceildiv(n, tile), ceildiv(m, tile)); Blocks: 2D (tile, tile) threads; Warps: tile/32 per dim, load tiles to shared, accumulate; Threads: each owns C element, loops over k/tilesize.
     # Tile typically 16/32 for float32.
+
+
+
+fn dense_tensor_qr[dtype: DType = DType.float32](
+    tensor: DynamicTensor[dtype]
+) -> (DynamicTensor[dtype], DynamicTensor[dtype]):
+    """Compute the QR decomposition of a dense tensor.
+    
+    Performs QR factorization where a matrix A is decomposed into:
+    - Q: An orthogonal matrix (Q^T @ Q = I)
+    - R: An upper triangular matrix
+    Such that A = Q @ R
+    
+    Parameters:
+        dtype: The data type of the tensor elements (default: DType.float32).
+    
+    Args:
+        tensor: Input dense tensor to decompose (must be 2D matrix).
+    
+    Returns:
+        A tuple (Q, R) where:
+        - Q is the orthogonal matrix with same shape as input
+        - R is the upper triangular matrix with same shape as input
+    
+    Note:
+        The input tensor must be a 2D matrix. QR decomposition is not
+        defined for higher-rank tensors in this implementation.
+    """
+    pass
