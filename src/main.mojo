@@ -233,9 +233,157 @@ fn test_complex_tensors() raises:
         print("="*60 + "\n")
 
 
+fn test_dense_qr() raises:
+    """Test QR decomposition using MAX API.
+    
+    Demonstrates:
+    - QR factorization of a 2D matrix
+    - Verification that A = Q @ R
+    - Verification that Q is orthogonal (Q^T @ Q = I)
+    """
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found - skipping QR decomposition test")
+        return
+    
+    print("\n" + "="*60)
+    print("TESTING QR DECOMPOSITION (MAX API)")
+    print("="*60 + "\n")
+    
+    with DeviceContext() as ctx:
+        print("Test 1: QR decomposition of 3×3 matrix...")
+        var data = List[Float32]()
+        # Create a well-conditioned 3×3 test matrix
+        # [12, -51,   4]
+        # [ 6, 167, -68]
+        # [-4,  24, -41]
+        data.append(12.0)
+        data.append(-51.0)
+        data.append(4.0)
+        data.append(6.0)
+        data.append(167.0)
+        data.append(-68.0)
+        data.append(-4.0)
+        data.append(24.0)
+        data.append(-41.0)
+        
+        var shape = List[Int](3, 3)
+        var A = create_dynamic_tensor_from_data[DType.float32](ctx, data, shape^)
+        
+        print("Matrix A:")
+        A.print_tensor(ctx)
+        
+        # Compute QR decomposition
+        print("\nComputing QR decomposition...")
+        var result = dense_tensor_qr[DType.float32](A, ctx)
+        var Q = result[0]
+        var R = result[1]
+        
+        print("\nMatrix Q (orthogonal):")
+        Q.print_tensor(ctx)
+        
+        print("\nMatrix R (upper triangular):")
+        R.print_tensor(ctx)
+        
+        # Verification 1: A ≈ Q @ R
+        print("\n" + "-"*60)
+        print("Verification 1: Computing Q @ R (should equal A)...")
+        
+        # Need to create new QR for A since we moved it
+        var A2 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var result2 = dense_tensor_qr[DType.float32](A2, ctx)
+        var Q2 = result2[0]
+        var R2 = result2[1]
+        
+        var A_reconstructed = create_dynamic_tensor[DType.float32](
+            ctx, List[Int](3, 3)^, init_value=0.0
+        )
+        dense_tensor_dot[DType.float32](A_reconstructed, Q2^, R2^, ctx)
+        ctx.synchronize()
+        
+        print("\nReconstructed A = Q @ R:")
+        A_reconstructed.print_tensor(ctx)
+        
+        print("\nOriginal A (for comparison):")
+        var A_original = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        A_original.print_tensor(ctx)
+        
+        # Verification 2: Q^T @ Q ≈ I
+        print("\n" + "-"*60)
+        print("Verification 2: Computing Q^T @ Q (should be identity)...")
+        
+        # Need another copy of Q for transpose
+        var A3 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var result3 = dense_tensor_qr[DType.float32](A3, ctx)
+        var Q3 = result3[0]
+        var Q4 = result3[1]  # Not used, just to consume the tuple
+        
+        # Transpose Q3
+        var perm = List[Int](1, 0)
+        var Q_T = Q3^.transpose(perm, ctx)
+        
+        # Get another Q for the multiplication
+        var A4 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var result4 = dense_tensor_qr[DType.float32](A4, ctx)
+        var Q5 = result4[0]
+        
+        var Q_T_Q = create_dynamic_tensor[DType.float32](
+            ctx, List[Int](3, 3)^, init_value=0.0
+        )
+        dense_tensor_dot[DType.float32](Q_T_Q, Q_T^, Q5^, ctx)
+        ctx.synchronize()
+        
+        print("\nQ^T @ Q (should be identity matrix):")
+        Q_T_Q.print_tensor(ctx)
+        
+        print("\nExpected identity matrix:")
+        print("[0,0] = 1.0, [1,1] = 1.0, [2,2] = 1.0")
+        print("All off-diagonal elements should be ≈ 0.0")
+        
+        # Test 2: Rectangular matrix (more rows than columns)
+        print("\n" + "="*60)
+        print("Test 2: QR decomposition of 4×3 rectangular matrix...")
+        
+        var data_rect = List[Float32]()
+        # Create a 4×3 matrix
+        for i in range(12):
+            data_rect.append(Float32(i + 1))
+        
+        var shape_rect = List[Int](4, 3)
+        var A_rect = create_dynamic_tensor_from_data[DType.float32](
+            ctx, data_rect, shape_rect^
+        )
+        
+        print("\nMatrix A (4×3):")
+        A_rect.print_tensor(ctx)
+        
+        var result_rect = dense_tensor_qr[DType.float32](A_rect, ctx)
+        var Q_rect = result_rect[0]
+        var R_rect = result_rect[1]
+        
+        print("\nMatrix Q (4×4):")
+        Q_rect.print_tensor(ctx)
+        
+        print("\nMatrix R (4×3):")
+        R_rect.print_tensor(ctx)
+        
+        # Verify reconstruction
+        var A_rect_recon = create_dynamic_tensor[DType.float32](
+            ctx, List[Int](4, 3)^, init_value=0.0
+        )
+        dense_tensor_dot[DType.float32](A_rect_recon, Q_rect^, R_rect^, ctx)
+        
+        print("\nReconstructed A (should match original):")
+        A_rect_recon.print_tensor(ctx)
+    
+    print("\n" + "="*60)
+    print("QR DECOMPOSITION TEST COMPLETED")
+    print("="*60 + "\n")
+
+
 def main():
     print("Testing...")
-    dense_tensor_qr()
+    test_dense_qr()
     test_complex_tensors()
     test_nd_tensor_dot()
     print("Test done.")
