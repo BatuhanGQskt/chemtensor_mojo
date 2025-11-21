@@ -850,28 +850,131 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
 
 
 fn dense_tensor_qr[dtype: DType = DType.float32](
-    tensor: DynamicTensor[dtype]
-) -> (DynamicTensor[dtype], DynamicTensor[dtype]):
-    """Compute the QR decomposition of a dense tensor.
+    var tensor: DynamicTensor[dtype],
+    ctx: DeviceContext
+) raises -> Tuple[DynamicTensor[dtype], DynamicTensor[dtype]]:
+    """Compute the QR decomposition of a dense tensor using MAX API.
     
     Performs QR factorization where a matrix A is decomposed into:
     - Q: An orthogonal matrix (Q^T @ Q = I)
     - R: An upper triangular matrix
     Such that A = Q @ R
     
+    Uses the Householder reflector method via MAX's linalg.qr_factorization,
+    which is equivalent to LAPACK's geqrf + orgqr/ungqr approach.
+    
     Parameters:
         dtype: The data type of the tensor elements (default: DType.float32).
     
     Args:
         tensor: Input dense tensor to decompose (must be 2D matrix).
+        ctx: Device context for GPU operations.
     
     Returns:
         A tuple (Q, R) where:
-        - Q is the orthogonal matrix with same shape as input
-        - R is the upper triangular matrix with same shape as input
+        - Q is the orthogonal matrix (m × m for full QR)
+        - R is the upper triangular matrix (m × n)
+    
+    Raises:
+        Error: If the input tensor is not a 2D matrix.
     
     Note:
         The input tensor must be a 2D matrix. QR decomposition is not
         defined for higher-rank tensors in this implementation.
+    
+    Algorithm:
+        1. Copy input matrix A (to preserve original)
+        2. Call linalg.qr_factorization to compute Householder reflectors in-place
+        3. Extract R from upper triangular part of factorized matrix
+        4. Call linalg.form_q to generate orthogonal matrix Q
+    
+    References:
+        MAX API: https://docs.modular.com/mojo/kernels/linalg/qr_factorization/qr_factorization/
+        https://docs.modular.com/mojo/kernels/linalg/qr_factorization/form_q/
     """
-    pass
+    # Require 2D matrix
+    var rank = len(tensor.shape)
+    if rank != 2:
+        raise Error("QR decomposition requires a 2D matrix, got rank " + String(rank))
+    
+    var m = tensor.shape[0]  # rows
+    var n = tensor.shape[1]  # columns
+    var k = min(m, n)
+    
+    # Create a copy of input tensor for in-place factorization
+    # (to preserve original tensor)
+    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor.shape^, init_value=0.0)
+    
+    # Copy data from input tensor to A_factorized
+    ctx.enqueue_copy(A_factorized.storage, tensor.storage)
+    ctx.synchronize()
+    
+    # Allocate sigma vector for Householder scaling factors
+    var sigma_shape = List[Int](k, 1)
+    var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
+    
+    # Convert DynamicTensor to NDBuffer for MAX API
+    # The MAX API expects NDBuffer views with IndexList shapes
+    var shape_2d = IndexList[2](m, n)
+    var A_ndbuf = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](
+        A_factorized.storage.unsafe_ptr(), shape_2d
+    )
+    
+    var sigma_shape_2d = IndexList[2](k, 1)
+    var sigma_ndbuf = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](
+        sigma.storage.unsafe_ptr(), sigma_shape_2d
+    )
+    
+    # Step 1: Compute QR factorization in-place (Householder reflectors)
+    # The function modifies A_ndbuf in-place to store Householder reflectors
+    # and stores scaling factors in sigma_ndbuf
+    linalg.qr_factorization(sigma_ndbuf, A_ndbuf)
+    ctx.synchronize()
+    
+    # Step 2: Extract R from upper triangular part of A_factorized
+    # After qr_factorization, the upper triangular part of A_factorized contains R
+    var R = create_dynamic_tensor[dtype](ctx, List[Int](m, n), init_value=0.0)
+    
+    # Copy the upper triangular part via host memory
+    var host_A = ctx.enqueue_create_host_buffer[dtype](m * n)
+    ctx.enqueue_copy(host_A, A_factorized.storage)
+    ctx.synchronize()
+    
+    var host_R = ctx.enqueue_create_host_buffer[dtype](m * n)
+    for i in range(m):
+        for j in range(n):
+            var idx = i * n + j
+            if i <= j:
+                # Upper triangular part (including diagonal)
+                host_R[idx] = host_A[idx]
+            else:
+                # Lower triangular part - set to zero
+                host_R[idx] = Scalar[dtype](0.0)
+    
+    ctx.enqueue_copy(R.storage, host_R)
+    ctx.synchronize()
+    
+    # Step 3: Form Q matrix from Householder reflectors
+    var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=0.0)
+    
+    # Create immutable NDBuffer views for sigma and A (inputs to form_q)
+    var sigma_read = NDBuffer[dtype, 2, MutableAnyOrigin](
+        sigma.storage.unsafe_ptr(), sigma_shape_2d
+    )
+    var A_read = NDBuffer[dtype, 2, MutableAnyOrigin](
+        A_factorized.storage.unsafe_ptr(), shape_2d
+    )
+    
+    # Create mutable NDBuffer view for Q (output of form_q)
+    var Q_shape_2d = IndexList[2](m, m)
+    var Q_ndbuf = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](
+        Q.storage.unsafe_ptr(), Q_shape_2d
+    )
+    
+    # Form the orthogonal matrix Q from the Householder reflectors in A and sigma
+    # According to MAX API: form_q[dtype, element_layout](sigma, A, Q)
+    alias scalar_layout = Layout.row_major(1)
+    linalg.qr_factorization.form_q[dtype, scalar_layout](sigma_read, A_read, Q_ndbuf)
+    ctx.synchronize()
+    
+    return (Q, R)
