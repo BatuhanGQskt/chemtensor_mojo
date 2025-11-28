@@ -902,9 +902,10 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     var n = tensor.shape[1]  # columns
     var k = min(m, n)
     
+    var tensor_shape_copy = tensor.shape.copy()
     # Create a copy of input tensor for in-place factorization
     # (to preserve original tensor)
-    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor.shape^, init_value=0.0)
+    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor_shape_copy^, init_value=0.0)
     
     # Copy data from input tensor to A_factorized
     ctx.enqueue_copy(A_factorized.storage, tensor.storage)
