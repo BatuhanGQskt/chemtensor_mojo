@@ -553,9 +553,9 @@ fn create_dynamic_tensor_from_data[dtype: DType = DType.float32](
     
 #     # Create NDBuffers with rank=2
 #     # These NDBuffers are non-owning views - they don't free memory when dropped
-#     var ndbuf_A = NDBuffer[dtype, 2, MutableAnyOrigin](ptr_A, shape_A)
-#     var ndbuf_B = NDBuffer[dtype, 2, MutableAnyOrigin](ptr_B, shape_B)
-#     var ndbuf_C = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](ptr_C, shape_C)
+#     var ndbuf_A = NDBuffer[dtype, 2, MutAnyOrigin](ptr_A, shape_A)
+#     var ndbuf_B = NDBuffer[dtype, 2, MutAnyOrigin](ptr_B, shape_B)
+#     var ndbuf_C = NDBuffer[mut=True, dtype, 2, MutAnyOrigin](ptr_C, shape_C)
     
 #     # Call matmul with NDBuffers
 #     # The inplace operation modifies C's underlying storage through the non-owning pointer
@@ -836,9 +836,9 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     var shape_Bf = IndexList[2](B_flat.shape[0], B_flat.shape[1])
     var shape_Cf = IndexList[2](C_flat.shape[0], C_flat.shape[1])
 
-    var ndbuf_A = NDBuffer[dtype, 2, MutableAnyOrigin](A_flat.storage.unsafe_ptr(), shape_Af)
-    var ndbuf_B = NDBuffer[dtype, 2, MutableAnyOrigin](B_flat.storage.unsafe_ptr(), shape_Bf)
-    var ndbuf_C = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](C_flat.storage.unsafe_ptr(), shape_Cf)
+    var ndbuf_A = NDBuffer[dtype, 2, MutAnyOrigin](A_flat.storage.unsafe_ptr(), shape_Af)
+    var ndbuf_B = NDBuffer[dtype, 2, MutAnyOrigin](B_flat.storage.unsafe_ptr(), shape_Bf)
+    var ndbuf_C = NDBuffer[mut=True, dtype, 2, MutAnyOrigin](C_flat.storage.unsafe_ptr(), shape_Cf)
 
     # Call matmul (tiled shared mem kernel)
     # Result is written to C_flat, which shares storage with C
@@ -927,30 +927,27 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
         shape=sigma_shape_rt,
         stride=sigma_stride_rt
     )
+    # sigma tensor
     var sigma_tensor = LayoutTensor[
-        mut=True, 
-        dtype, 
-        sigma_layout, 
-        MutableAnyOrigin,
-        layout_int_type=_,
-        linear_idx_type=_,
-        masked=_,
-        ](
+        mut=True,
+        dtype,
+        sigma_layout,
+        MutAnyOrigin
+    ](
         sigma.storage,
         runtime_layout=sigma_runtime_layout
     )
     
     var A_shape_rt = RuntimeTuple[matrix_layout.shape](m, n)
     var A_stride_rt = RuntimeTuple[matrix_layout.stride](A_factorized.stride[0], A_factorized.stride[1])
-    var A_layout = RuntimeLayout[matrix_layout](shape=A_shape_rt, stride=A_stride_rt)
+    var A_layout = RuntimeLayout[matrix_layout, linear_idx_type=_](shape=A_shape_rt, stride=A_stride_rt)
+    # A tensor
     var A_tensor = LayoutTensor[
-        mut=True, 
-        dtype, 
-        matrix_layout, 
-        MutableAnyOrigin,
-        layout_int_type=_,
-        linear_idx_type=_,
-        masked=_,](
+        mut=True,
+        dtype,
+        matrix_layout,
+        MutAnyOrigin
+    ](
         A_factorized.storage,
         runtime_layout=A_layout
     )
@@ -958,7 +955,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     # Step 1: Compute QR factorization in-place (Householder reflectors)
     # The function modifies A_tensor in-place to store Householder reflectors
     # and stores scaling factors in sigma_tensor
-    qr_factorization[dtype, matrix_layout](sigma_tensor, A_tensor)
+    qr_factorization(sigma_tensor, A_tensor)
     ctx.synchronize()
     
     # Step 2: Extract R from upper triangular part of A_factorized
@@ -991,14 +988,14 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     var Q_shape_rt = RuntimeTuple[matrix_layout.shape](m, m)
     var Q_stride_rt = RuntimeTuple[matrix_layout.stride](Q.stride[0], Q.stride[1])
     var Q_layout = RuntimeLayout[matrix_layout](shape=Q_shape_rt, stride=Q_stride_rt)
-    var Q_tensor = LayoutTensor[mut=True, dtype, matrix_layout, MutableAnyOrigin](
+    var Q_tensor = LayoutTensor[mut=True, dtype, matrix_layout, MutAnyOrigin](
         Q.storage,
         runtime_layout=Q_layout
     )
     
     # Form the orthogonal matrix Q from the Householder reflectors in A and sigma
     # According to MAX API: form_q[dtype, element_layout](sigma, A, Q)
-    form_q[dtype, matrix_layout, sigma_layout.layout_int_type](sigma_tensor, A_tensor, Q_tensor)
+    form_q(sigma_tensor, A_tensor, Q_tensor)
     ctx.synchronize()
     
     return (Q, R)
