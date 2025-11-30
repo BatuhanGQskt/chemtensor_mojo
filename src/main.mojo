@@ -12,6 +12,7 @@ from python import Python
 from layout import IntTuple, LayoutTensor, RuntimeTuple
 from layout.runtime_layout import RuntimeLayout, make_layout
 from complex import ComplexSIMD
+from state.mps_state import create_product_mps, create_uniform_mps
 
 alias dtype = DType.float32
 
@@ -376,8 +377,105 @@ fn test_dense_qr() raises:
     print("="*60 + "\n")
 
 
+fn test_mps_creation() raises:
+    """Smoke-test the MPS helpers by building a few small states."""
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found - skipping MPS creation tests")
+        return
+
+    print("\n" + "="*60)
+    print("TESTING MPS CREATION HELPERS")
+    print("="*60 + "\n")
+
+    with DeviceContext() as ctx:
+        print("Test 1: create_uniform_mps with varying bond dimensions...")
+        var num_sites = 4
+        var physical_dim = 2
+        var expected_bonds = List[Int](1, 2, 3, 2, 1)
+
+        var uniform_mps = create_uniform_mps[dtype](
+            ctx,
+            num_sites,
+            physical_dim,
+            expected_bonds.copy()^,
+            init_value=Scalar[dtype](0.25),
+        )
+        uniform_mps.describe()
+
+        if uniform_mps.num_sites() != num_sites:
+            raise Error(
+                "Uniform MPS length mismatch: expected "
+                + String(num_sites)
+                + ", got "
+                + String(uniform_mps.num_sites())
+            )
+
+        for idx in range(num_sites):
+            var site_shape = uniform_mps.site_shape(idx)
+            if len(site_shape) != 3:
+                raise Error(
+                    "Uniform MPS site "
+                    + String(idx)
+                    + " expected rank-3 tensor, got rank "
+                    + String(len(site_shape))
+                )
+
+            if site_shape[0] != expected_bonds[idx] or site_shape[2] != expected_bonds[idx + 1]:
+                raise Error(
+                    "Uniform MPS bond mismatch at site "
+                    + String(idx)
+                    + ": expected ["
+                    + String(expected_bonds[idx])
+                    + ", "
+                    + String(expected_bonds[idx + 1])
+                    + "], got ["
+                    + String(site_shape[0])
+                    + ", "
+                    + String(site_shape[2])
+                    + "]"
+                )
+
+            if site_shape[1] != physical_dim:
+                raise Error(
+                    "Uniform MPS physical dim mismatch at site "
+                    + String(idx)
+                )
+
+        print("Uniform MPS creation passed all bond/shape checks.\n")
+
+        print("Test 2: create_product_mps from a local basis pattern...")
+        var basis = List[Int](0, 1, 0, 1)
+        var product_mps = create_product_mps[dtype](ctx, physical_dim, basis.copy()^)
+        product_mps.describe()
+
+        for idx in range(product_mps.num_sites()):
+            var site_shape = product_mps.site_shape(idx)
+            if site_shape[0] != 1 or site_shape[2] != 1:
+                raise Error(
+                    "Product MPS internal bonds must both be 1 at site "
+                    + String(idx)
+                )
+
+            if site_shape[1] != physical_dim:
+                raise Error(
+                    "Product MPS physical dim mismatch at site "
+                    + String(idx)
+                )
+
+        if product_mps.bond_dimension(product_mps.num_sites()) != 1:
+            raise Error("Product MPS final bond dimension must be 1")
+
+        print("Product-state MPS creation passed bond checks.\n")
+
+    print("="*60)
+    print("MPS CREATION TEST COMPLETED")
+    print("="*60 + "\n")
+
+
 def main():
     print("Testing...")
+    test_mps_creation()
     test_dense_qr()
     # test_complex_tensors()
     # test_nd_tensor_dot()
