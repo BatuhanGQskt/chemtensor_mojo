@@ -292,7 +292,7 @@ fn test_dense_qr() raises:
         var R2 = result2[1]
         
         var A_reconstructed = create_dynamic_tensor[DType.float32](
-            ctx, List[Int](3, 3)^, init_value=0.0
+            ctx, List[Int](3, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](A_reconstructed, Q2^, R2^, ctx)
         ctx.synchronize()
@@ -324,7 +324,7 @@ fn test_dense_qr() raises:
         var Q5 = result4[0]
         
         var Q_T_Q = create_dynamic_tensor[DType.float32](
-            ctx, List[Int](3, 3)^, init_value=0.0
+            ctx, List[Int](3, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](Q_T_Q, Q_T^, Q5^, ctx)
         ctx.synchronize()
@@ -365,7 +365,7 @@ fn test_dense_qr() raises:
         
         # Verify reconstruction
         var A_rect_recon = create_dynamic_tensor[DType.float32](
-            ctx, List[Int](4, 3)^, init_value=0.0
+            ctx, List[Int](4, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](A_rect_recon, Q_rect^, R_rect^, ctx)
         
