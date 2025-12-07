@@ -9,3 +9,17 @@
     - Resolved as suggested moved to another function. Bad code design, but forced to do because language hasn't supported the method calls in enqueue_function DeviceContext function.
 
 - I will try to solve these issues until 07/10/2025
+
+Current issues (10/10/2025):
+- [ ] Still dense_tensor_dot not implemented completely. (Syntax and runtime issues takes all of my time to make progress)
+- [ ] DimList still should change, but for different reason which is get using [static_int], but we want to use arbitrary size list which limits us.
+- [ ] Weird error:
+```Bash
+/gpu_intro/main.mojo:1:1: error: ptxas application ptx input, line 5085; error   : Illegal operand type to instruction 'st'
+ptxas application ptx input, line 5086; error   : Illegal operand type to instruction 'st'
+ptxas application ptx input, line 5087; error   : Illegal operand type to instruction 'st'
+ptxas application ptx input, line 5085; error   : Unknown symbol 'func_retval0'
+ptxas application ptx input, line 5086; error   : Unknown symbol 'func_retval0'
+ptxas application ptx input, line 5087; error   : Unknown symbol 'func_retval0'
+ptxas fatal   : Ptx assembly aborted due to errors
+```
