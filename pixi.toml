@@ -10,3 +10,4 @@ version = "0.1.0"
 [dependencies]
 vector = ">=1.6.3,<2"
 mojo = ">=25.5.0,<26"
+time = ">=1.9,<2"
