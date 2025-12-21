@@ -22,10 +22,29 @@ struct DenseTensor[
     var storage: DeviceBuffer[dtype]  # Dynamic GPU storage
 
     fn write_to[W: Writer](self, mut writer: W) -> None:
-        writer.write(self.data)
+        # Minimal textual representation to avoid device-side serialization
+        var m = self.dims.get[0]()
+        var n = self.dims.get[1]()
+        writer.write("DenseTensor[" )
+        writer.write(m)
+        writer.write(" x ")
+        writer.write(n)
+        writer.write("]")
 
-    fn print_tensor(self) -> None:
-        print("Tensor: ", self.data)
+    fn print_tensor(self, ctx: DeviceContext) raises -> None:
+        var M = self.dims.get[0]()
+        var N = self.dims.get[1]()
+        var total = M * N
+        var host_out = ctx.enqueue_create_host_buffer[dtype](total)
+        ctx.enqueue_copy(host_out, self.storage)
+        ctx.synchronize()
+
+        print("Tensor (", M, "x", N, "):")
+        for i in range(M):
+            for j in range(N):
+                var idx = i * N + j
+                print("[", i, ",", j, "] = ", host_out[idx])
+        
 
 ## GPU-optimized dot product for dense tensors (device-friendly view)
 fn dense_tensor_dot[layout: Layout](
