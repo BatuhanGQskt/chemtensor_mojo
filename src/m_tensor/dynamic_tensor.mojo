@@ -9,15 +9,16 @@ from buffer.buffer import NDBuffer
 from memory.unsafe_pointer import UnsafePointer
 import linalg
 
-alias dtype = DType.float32
-
 ## Fully dynamic tensor with runtime-determined rank, shape, and stride
 @fieldwise_init
-struct DynamicTensor(Writable, Movable):
+struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     """A tensor where rank, shape, and stride are all determined at runtime.
     
     Unlike DenseTensor which requires compile-time Layout parameter, this tensor
     allows complete flexibility at runtime.
+    
+    Parameters:
+        dtype: The data type of the tensor elements (e.g., DType.float32, DType.float64).
     """
     var storage: DeviceBuffer[dtype]  # GPU storage for tensor data
     var shape: List[Int]  # Runtime shape
@@ -42,6 +43,21 @@ struct DynamicTensor(Writable, Movable):
             total_size *= elem
         self.size = total_size
 
+    fn __copyinit__(out self, existing: Self):
+        """Copy constructor for DynamicTensor.
+        
+        Creates a new tensor that shares the same GPU storage but has independent
+        shape, stride, and size metadata. This is a shallow copy - the underlying
+        GPU buffer is shared between copies.
+        
+        Args:
+            existing: The tensor to copy from.
+        """
+        self.storage = existing.storage
+        self.shape = existing.shape.copy()
+        self.stride = existing.stride.copy()
+        self.size = existing.size
+
     fn write_to[W: Writer](self, mut writer: W) -> None:
         """Write tensor information to a writer."""
         var rank = len(self.shape)
@@ -58,7 +74,7 @@ struct DynamicTensor(Writable, Movable):
 
     fn print_tensor(self, ctx: DeviceContext) raises -> None:
         """Print the entire tensor contents (works for any rank)."""
-        var host_out = ctx.enqueue_create_host_buffer[dtype](self.size)
+        var host_out = ctx.enqueue_create_host_buffer[Self.dtype](self.size)
         ctx.enqueue_copy(host_out, self.storage)
         ctx.synchronize()
 
@@ -139,7 +155,7 @@ struct DynamicTensor(Writable, Movable):
             expected_stride *= self.shape[i]
         return True
 
-    fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> DynamicTensor:
+    fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> DynamicTensor[dtype]:
         """Create a contiguous copy of the tensor in row-major order.
         
         If the tensor is already contiguous, transfers ownership without copying.
@@ -183,16 +199,16 @@ struct DynamicTensor(Writable, Movable):
         var total_size = self.size
         var new_shape = self.shape.copy()
         var new_strides = compute_row_major_strides(new_shape, len(new_shape))
-        var new_storage = ctx.enqueue_create_buffer[dtype](total_size)
+        var new_storage = ctx.enqueue_create_buffer[Self.dtype](total_size)
         
         # Simple copy - this works for contiguous data
         # For true non-contiguous support, need more complex kernel
         ctx.enqueue_copy(new_storage, self.storage)
         ctx.synchronize()
 
-        return DynamicTensor(new_storage, new_shape^, new_strides^)
+        return DynamicTensor[dtype](new_storage, new_shape^, new_strides^)
 
-    fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DynamicTensor:
+    fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DynamicTensor[dtype]:
         """Transpose tensor dimensions according to a permutation.
         
         Reorders the dimensions of the tensor according to the permutation list.
@@ -254,14 +270,14 @@ struct DynamicTensor(Writable, Movable):
             
             var new_strides = compute_row_major_strides(new_shape, rank)
             var total_size = self.size
-            var new_storage = ctx.enqueue_create_buffer[dtype](total_size)
+            var new_storage = ctx.enqueue_create_buffer[Self.dtype](total_size)
             
             # Copy transposed data using host memory (simple but works)
-            var host_src = ctx.enqueue_create_host_buffer[dtype](total_size)
+            var host_src = ctx.enqueue_create_host_buffer[Self.dtype](total_size)
             ctx.enqueue_copy(host_src, self.storage)
             ctx.synchronize()
             
-            var host_dst = ctx.enqueue_create_host_buffer[dtype](total_size)
+            var host_dst = ctx.enqueue_create_host_buffer[Self.dtype](total_size)
             for i in range(self.shape[0]):
                 for j in range(self.shape[1]):
                     var src_idx = i * self.shape[1] + j
@@ -271,7 +287,7 @@ struct DynamicTensor(Writable, Movable):
             ctx.enqueue_copy(new_storage, host_dst)
             ctx.synchronize()
             
-            return DynamicTensor(new_storage, new_shape^, new_strides^)
+            return DynamicTensor[dtype](new_storage, new_shape^, new_strides^)
         else:
             # For other permutations, create a view (stride-based)
             # This doesn't copy data, just reinterprets layout
@@ -281,9 +297,9 @@ struct DynamicTensor(Writable, Movable):
                 new_shape.append(self.shape[perm[i]])
                 new_stride.append(self.stride[perm[i]])
             
-            return DynamicTensor(self.storage^, new_shape^, new_stride^)
+            return DynamicTensor[dtype](self.storage^, new_shape^, new_stride^)
 
-    fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DynamicTensor:
+    fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DynamicTensor[dtype]:
         """Flatten a contiguous range of dimensions into a single dimension.
         
         Combines multiple consecutive dimensions into one by multiplying their sizes.
@@ -350,7 +366,7 @@ struct DynamicTensor(Writable, Movable):
         var new_strides = compute_row_major_strides(new_shape, len(new_shape))
         
         # Return a view with updated shape/stride (no data copy)
-        return DynamicTensor(self.storage^, new_shape^, new_strides^)
+        return DynamicTensor[dtype](self.storage^, new_shape^, new_strides^)
 
 
 
@@ -402,12 +418,12 @@ fn compute_column_major_strides(shape: List[Int], rank: Int) -> List[Int]:
     return strides.copy()
 
 
-fn create_dynamic_tensor(
+fn create_dynamic_tensor[dtype: DType = DType.float32](
     ctx: DeviceContext, 
     var shape: List[Int], 
     row_major: Bool = True,
-    init_value: Float32 = 0.0
-) raises -> DynamicTensor:
+    init_value: Scalar[dtype] = 0.0
+) raises -> DynamicTensor[dtype]:
     """Create a dynamic tensor with runtime-determined rank, shape, and stride.
     
     Args:
@@ -447,15 +463,15 @@ fn create_dynamic_tensor(
     var device_storage = ctx.enqueue_create_buffer[dtype](total_size)
     ctx.enqueue_copy(device_storage, host_storage)
     
-    return DynamicTensor(device_storage, shape^, strides^)
+    return DynamicTensor[dtype](device_storage, shape^, strides^)
 
 
-fn create_dynamic_tensor_from_data(
+fn create_dynamic_tensor_from_data[dtype: DType = DType.float32](
     ctx: DeviceContext, 
-    data: List[Float32],
+    data: List[Scalar[dtype]],
     var shape: List[Int], 
     row_major: Bool = True
-) raises -> DynamicTensor:
+) raises -> DynamicTensor[dtype]:
     """Create a dynamic tensor from existing data.
     
     Args:
@@ -498,7 +514,7 @@ fn create_dynamic_tensor_from_data(
     var device_storage = ctx.enqueue_create_buffer[dtype](data_size)
     ctx.enqueue_copy(device_storage, host_storage)
     
-    return DynamicTensor(device_storage, shape^, strides^)
+    return DynamicTensor[dtype](device_storage, shape^, strides^)
 
 # fn dense_tensor_dot(C: DynamicTensor, A: DynamicTensor, B: DynamicTensor, ctx: Optional[DeviceContext]) raises:
 #     """Perform matrix multiplication C = A @ B using GPU acceleration.
@@ -546,7 +562,7 @@ fn create_dynamic_tensor_from_data(
 
 
 
-fn dense_tensor_dot(C: DynamicTensor, var A: DynamicTensor, var B: DynamicTensor, ctx: DeviceContext, ndim_mult: Int = 1, axrange_A: Bool = False, axrange_B: Bool = False) raises:  # axrange False=trailing, True=leading
+fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A: DynamicTensor[dtype], var B: DynamicTensor[dtype], ctx: DeviceContext, ndim_mult: Int = 1, axrange_A: Bool = False, axrange_B: Bool = False) raises:  # axrange False=trailing, True=leading
     """Perform generalized tensor dot product (contraction) on GPU.
     
     This function implements Einstein summation-style tensor contraction by:
@@ -808,7 +824,7 @@ fn dense_tensor_dot(C: DynamicTensor, var A: DynamicTensor, var B: DynamicTensor
     # For contiguous row-major 2D tensor (m, n), strides are [n, 1]
     var C_flat_shape = List[Int](m, n)
     var C_flat_stride = List[Int](n, 1)
-    var C_flat = DynamicTensor(
+    var C_flat = DynamicTensor[dtype](
         storage=C.storage,
         shape=C_flat_shape^,
         stride=C_flat_stride^
