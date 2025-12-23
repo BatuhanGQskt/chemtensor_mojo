@@ -298,7 +298,88 @@ fn create_product_mps[dtype: DType = DType.float32](
     return MatrixProductState[dtype](sites^)
 
 
-fn create_mps_from_dense_state[dtype: DType = DType.float32](
+fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
+    ctx: DeviceContext,
+    var block: DynamicTensor[dtype],
+) raises -> Tuple[MPSSite[dtype], DynamicTensor[dtype]]:
+    """Left-orthonormalize a single site tensor and absorb R into the remainder.
+
+    Mirrors the behavior of `mps_local_orthonormalize_qr` in the reference
+    ChemTensor implementation.
+    """
+    var shape = block.shape.copy()
+    if len(shape) < 3:
+        raise Error("mps_local_orthonormalize_qr requires rank >= 3 (left, physical, remainder)")
+
+    var left_dim = shape[0]
+    var phys_dim = shape[1]
+    var tail_shape = List[Int](capacity=len(shape) - 2)
+    var right_dim = 1
+    for idx in range(2, len(shape)):
+        tail_shape.append(shape[idx])
+        right_dim *= shape[idx]
+    if right_dim < 1:
+        raise Error("Right block dimension must be >= 1 in mps_local_orthonormalize_qr")
+
+    var mat_shape = List[Int](left_dim * phys_dim, right_dim)
+    var mat = block.reshape(mat_shape^)
+
+    var qr_result = dense_tensor_qr[dtype](mat^, ctx)
+    var Q_full = qr_result[0]
+    var R_full = qr_result[1]
+
+    var m = Q_full.shape[0]  # = left_dim * phys_dim
+    var q_cols = Q_full.shape[1]
+    var r_cols = R_full.shape[1]
+    var reduced_cols = m
+    if reduced_cols > r_cols:
+        reduced_cols = r_cols
+
+    # Copy Q data and keep only the first reduced_cols columns (reduced QR)
+    var host_Q_full = ctx.enqueue_create_host_buffer[dtype](Q_full.size)
+    ctx.enqueue_copy(host_Q_full, Q_full.storage)
+    ctx.synchronize()
+
+    var q_data = List[Scalar[dtype]](capacity=m * reduced_cols)
+    for row in range(m):
+        for col in range(reduced_cols):
+            var idx_full = row * q_cols + col
+            q_data.append(host_Q_full[idx_full])
+    var reduced_Q = create_dynamic_tensor_from_data[dtype](
+        ctx,
+        q_data,
+        List[Int](m, reduced_cols)
+    )
+
+    var host_R_full = ctx.enqueue_create_host_buffer[dtype](R_full.size)
+    ctx.enqueue_copy(host_R_full, R_full.storage)
+    ctx.synchronize()
+
+    var r_data = List[Scalar[dtype]](capacity=reduced_cols * r_cols)
+    for row in range(reduced_cols):
+        for col in range(r_cols):
+            var idx_full = row * r_cols + col
+            r_data.append(host_R_full[idx_full])
+    var reduced_R = create_dynamic_tensor_from_data[dtype](
+        ctx,
+        r_data,
+        List[Int](reduced_cols, r_cols)
+    )
+
+    var site_shape = List[Int](left_dim, phys_dim, reduced_cols)
+    var site_tensor = reduced_Q.reshape(site_shape^)
+    var site = MPSSite[dtype](site_tensor^)
+
+    var next_shape = List[Int](capacity=len(tail_shape) + 1)
+    next_shape.append(reduced_cols)
+    for idx in range(len(tail_shape)):
+        next_shape.append(tail_shape[idx])
+    var next_remainder = reduced_R.reshape(next_shape^)
+
+    return (site, next_remainder)
+
+
+fn mps_orthogonalize_qr[dtype: DType = DType.float32](
     ctx: DeviceContext,
     var full_state: DynamicTensor[dtype],
 ) raises -> MatrixProductState[dtype]:
@@ -341,45 +422,11 @@ fn create_mps_from_dense_state[dtype: DType = DType.float32](
     for dim in dims:
         augmented_shape.append(dim)
     var remainder = full_state.reshape(augmented_shape^)
-    var left_dim = 1
 
-
-    if num_sites == 1:
-        var single_shape = List[Int](left_dim, physical_dim, 1)
-        var single_site = remainder.reshape(single_shape^)
-        var single_norm = single_site.norm(ctx)
-        if single_norm > 0:
-            single_site.scale_in_place(Scalar[dtype](1.0 / single_norm), ctx)
-        sites.append(MPSSite[dtype](single_site^))
-        return MatrixProductState[dtype](sites^)
-
-    for site_idx in range(num_sites - 1):
-        var phys_dim_site = dims[site_idx]
-        var right_dim = 1
-        for rest_idx in range(site_idx + 1, num_sites):
-            right_dim *= dims[rest_idx]
-
-        var mat = remainder.reshape(List[Int](left_dim * phys_dim_site, right_dim))
-        var qr_result = dense_tensor_qr[dtype](mat^, ctx)
-        var Q = qr_result[0]
-        var R = qr_result[1]
-
-        var q_norm = Q.norm(ctx)
-        if q_norm > 0:
-            Q.scale_in_place(Scalar[dtype](1.0 / q_norm), ctx)
-            R.scale_in_place(Scalar[dtype](q_norm), ctx)
-
-        var new_right_dim = Q.shape[1]
-        var site_shape = List[Int](left_dim, phys_dim_site, new_right_dim)
-        var site_tensor = Q.reshape(site_shape^)
-        sites.append(MPSSite[dtype](site_tensor^))
-
-        var next_shape = List[Int](capacity=(num_sites - site_idx))
-        next_shape.append(new_right_dim)
-        for rest_idx in range(site_idx + 1, num_sites):
-            next_shape.append(dims[rest_idx])
-        remainder = R.reshape(next_shape^)
-        left_dim = new_right_dim
+    for _ in range(num_sites - 1):
+        var ortho = mps_local_orthonormalize_qr[dtype](ctx, remainder^)
+        sites.append(ortho[0])
+        remainder = ortho[1]
 
     if len(remainder.shape) != 2:
         raise Error(
