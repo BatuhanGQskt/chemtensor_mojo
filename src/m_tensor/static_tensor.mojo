@@ -16,7 +16,7 @@ struct StaticTensor[
     data_layout: Layout, 
 ](Writable):
     var data: LayoutTensor[
-        mut=True, dtype, data_layout, MutableAnyOrigin
+        mut=True, dtype, data_layout, MutAnyOrigin
     ]  # Data array for tensor elements
     var dims: DimList  # Dynamic array of dimensions (runtime)
     var storage: DeviceBuffer[dtype]  # Dynamic GPU storage
@@ -48,9 +48,9 @@ struct StaticTensor[
 
 ## GPU-optimized dot product for dense tensors (device-friendly view)
 fn static_tensor_dot[layout: Layout](
-    first: LayoutTensor[mut=False, dtype, layout, MutableAnyOrigin],
-    other: LayoutTensor[mut=False, dtype, layout, MutableAnyOrigin],
-    result: LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin],
+    first: LayoutTensor[mut=False, dtype, layout, MutAnyOrigin],
+    other: LayoutTensor[mut=False, dtype, layout, MutAnyOrigin],
+    result: LayoutTensor[mut=True, dtype, layout, MutAnyOrigin],
     M: Int, N: Int, K: Int,
 ) -> None:
     # TODO: Make this more general for N number of ranks if possible dynamic(not static 5)
@@ -112,7 +112,7 @@ fn create_static_tensor_with_stride[layout: Layout](ctx: DeviceContext, dims: Di
     var rt_stride = RuntimeTuple[layout.stride](sx, sy)
     var rt_layout = RuntimeLayout[layout](shape=rt_shape, stride=rt_stride)
 
-    var tensor = LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin](device_storage, runtime_layout=rt_layout)
+    var tensor = LayoutTensor[mut=True, dtype, layout, MutAnyOrigin](device_storage, runtime_layout=rt_layout)
     return StaticTensor[layout](tensor, dims, device_storage)
 
 fn create_static_tensor[layout: Layout](ctx: DeviceContext, dims: List[Int], rank: Int) raises -> StaticTensor[layout]:
