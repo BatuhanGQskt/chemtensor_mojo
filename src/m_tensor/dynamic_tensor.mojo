@@ -912,18 +912,16 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     ctx.synchronize()
     
     # Allocate sigma vector for Householder scaling factors
-    var sigma_shape = List[Int](k, 1)
+    var sigma_shape = List[Int](k)
     var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
     
     # Create LayoutTensor views needed by MAX APIs
     # 2 Dimensional Row Major Layouts shape = 2 with stride = 1
     alias matrix_layout = Layout.row_major(2)
-    alias sigma_layout = Layout.row_major(2)
+    alias sigma_layout = Layout.row_major(1)
     
-    var sigma_shape_idx = IndexList[2](k, 1)
-    var sigma_shape_rt = RuntimeTuple[sigma_layout.shape](sigma_shape_idx)
-    var sigma_stride_idx = IndexList[2](sigma.stride[0], sigma.stride[1])
-    var sigma_stride_rt = RuntimeTuple[sigma_layout.stride](sigma_stride_idx)
+    var sigma_shape_rt = RuntimeTuple[sigma_layout.shape](k)
+    var sigma_stride_rt = RuntimeTuple[sigma_layout.stride](sigma.stride[0])
     var sigma_runtime_layout = RuntimeLayout[sigma_layout](
         shape=sigma_shape_rt,
         stride=sigma_stride_rt
