@@ -8,6 +8,7 @@ from layout.layout import DimList
 from buffer.buffer import NDBuffer
 from memory.unsafe_pointer import UnsafePointer
 import linalg
+from linalg.qr_factorization import qr_factorization, form_q
 
 ## Fully dynamic tensor with runtime-determined rank, shape, and stride
 @fieldwise_init
@@ -913,22 +914,51 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     var sigma_shape = List[Int](k, 1)
     var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
     
-    # Convert DynamicTensor to NDBuffer for MAX API
-    # The MAX API expects NDBuffer views with IndexList shapes
-    var shape_2d = IndexList[2](m, n)
-    var A_ndbuf = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](
-        A_factorized.storage.unsafe_ptr(), shape_2d
+    # Create LayoutTensor views needed by MAX APIs
+    # 2 Dimensional Row Major Layouts shape = 2 with stride = 1
+    alias matrix_layout = Layout.row_major(2)
+    alias sigma_layout = Layout.row_major(2)
+    
+    var sigma_shape_idx = IndexList[2](k, 1)
+    var sigma_shape_rt = RuntimeTuple[sigma_layout.shape](sigma_shape_idx)
+    var sigma_stride_idx = IndexList[2](sigma.stride[0], sigma.stride[1])
+    var sigma_stride_rt = RuntimeTuple[sigma_layout.stride](sigma_stride_idx)
+    var sigma_runtime_layout = RuntimeLayout[sigma_layout](
+        shape=sigma_shape_rt,
+        stride=sigma_stride_rt
+    )
+    var sigma_tensor = LayoutTensor[
+        mut=True, 
+        dtype, 
+        sigma_layout, 
+        MutableAnyOrigin,
+        layout_int_type=_,
+        linear_idx_type=_,
+        masked=_,
+        ](
+        sigma.storage,
+        runtime_layout=sigma_runtime_layout
     )
     
-    var sigma_shape_2d = IndexList[2](k, 1)
-    var sigma_ndbuf = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](
-        sigma.storage.unsafe_ptr(), sigma_shape_2d
+    var A_shape_rt = RuntimeTuple[matrix_layout.shape](m, n)
+    var A_stride_rt = RuntimeTuple[matrix_layout.stride](A_factorized.stride[0], A_factorized.stride[1])
+    var A_layout = RuntimeLayout[matrix_layout](shape=A_shape_rt, stride=A_stride_rt)
+    var A_tensor = LayoutTensor[
+        mut=True, 
+        dtype, 
+        matrix_layout, 
+        MutableAnyOrigin,
+        layout_int_type=_,
+        linear_idx_type=_,
+        masked=_,](
+        A_factorized.storage,
+        runtime_layout=A_layout
     )
     
     # Step 1: Compute QR factorization in-place (Householder reflectors)
-    # The function modifies A_ndbuf in-place to store Householder reflectors
-    # and stores scaling factors in sigma_ndbuf
-    linalg.qr_factorization(sigma_ndbuf, A_ndbuf)
+    # The function modifies A_tensor in-place to store Householder reflectors
+    # and stores scaling factors in sigma_tensor
+    qr_factorization[dtype, matrix_layout](sigma_tensor, A_tensor)
     ctx.synchronize()
     
     # Step 2: Extract R from upper triangular part of A_factorized
@@ -957,24 +987,18 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     # Step 3: Form Q matrix from Householder reflectors
     var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=0.0)
     
-    # Create immutable NDBuffer views for sigma and A (inputs to form_q)
-    var sigma_read = NDBuffer[dtype, 2, MutableAnyOrigin](
-        sigma.storage.unsafe_ptr(), sigma_shape_2d
-    )
-    var A_read = NDBuffer[dtype, 2, MutableAnyOrigin](
-        A_factorized.storage.unsafe_ptr(), shape_2d
-    )
-    
-    # Create mutable NDBuffer view for Q (output of form_q)
-    var Q_shape_2d = IndexList[2](m, m)
-    var Q_ndbuf = NDBuffer[mut=True, dtype, 2, MutableAnyOrigin](
-        Q.storage.unsafe_ptr(), Q_shape_2d
+    # Create LayoutTensor view for Q (output of form_q)
+    var Q_shape_rt = RuntimeTuple[matrix_layout.shape](m, m)
+    var Q_stride_rt = RuntimeTuple[matrix_layout.stride](Q.stride[0], Q.stride[1])
+    var Q_layout = RuntimeLayout[matrix_layout](shape=Q_shape_rt, stride=Q_stride_rt)
+    var Q_tensor = LayoutTensor[mut=True, dtype, matrix_layout, MutableAnyOrigin](
+        Q.storage,
+        runtime_layout=Q_layout
     )
     
     # Form the orthogonal matrix Q from the Householder reflectors in A and sigma
     # According to MAX API: form_q[dtype, element_layout](sigma, A, Q)
-    alias scalar_layout = Layout.row_major(1)
-    linalg.qr_factorization.form_q[dtype, scalar_layout](sigma_read, A_read, Q_ndbuf)
+    form_q[dtype, matrix_layout, sigma_layout.layout_int_type](sigma_tensor, A_tensor, Q_tensor)
     ctx.synchronize()
     
     return (Q, R)
