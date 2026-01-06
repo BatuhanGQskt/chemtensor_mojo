@@ -850,151 +850,324 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
 
 
 
+# fn dense_tensor_qr[dtype: DType = DType.float32](
+#     var tensor: DynamicTensor[dtype],
+#     ctx: DeviceContext
+# ) raises -> Tuple[DynamicTensor[dtype], DynamicTensor[dtype]]:
+#     """Compute the QR decomposition of a dense tensor using MAX API.
+    
+#     Performs QR factorization where a matrix A is decomposed into:
+#     - Q: An orthogonal matrix (Q^T @ Q = I)
+#     - R: An upper triangular matrix
+#     Such that A = Q @ R
+    
+#     Uses the Householder reflector method via MAX's linalg.qr_factorization,
+#     which is equivalent to LAPACK's geqrf + orgqr/ungqr approach.
+    
+#     Parameters:
+#         dtype: The data type of the tensor elements (default: DType.float32).
+    
+#     Args:
+#         tensor: Input dense tensor to decompose (must be 2D matrix).
+#         ctx: Device context for GPU operations.
+    
+#     Returns:
+#         A tuple (Q, R) where:
+#         - Q is the orthogonal matrix (m × m for full QR)
+#         - R is the upper triangular matrix (m × n)
+    
+#     Raises:
+#         Error: If the input tensor is not a 2D matrix.
+    
+#     Note:
+#         The input tensor must be a 2D matrix. QR decomposition is not
+#         defined for higher-rank tensors in this implementation.
+    
+#     Algorithm:
+#         1. Copy input matrix A (to preserve original)
+#         2. Call linalg.qr_factorization to compute Householder reflectors in-place
+#         3. Extract R from upper triangular part of factorized matrix
+#         4. Call linalg.form_q to generate orthogonal matrix Q
+    
+#     References:
+#         MAX API: https://docs.modular.com/mojo/kernels/linalg/qr_factorization/qr_factorization/
+#         https://docs.modular.com/mojo/kernels/linalg/qr_factorization/form_q/
+#     """
+#     # Require 2D matrix
+#     var rank = len(tensor.shape)
+#     if rank != 2:
+#         raise Error("QR decomposition requires a 2D matrix, got rank " + String(rank))
+    
+#     var m = tensor.shape[0]  # rows
+#     var n = tensor.shape[1]  # columns
+#     var k = min(m, n)
+    
+#     var tensor_shape_copy = tensor.shape.copy()
+#     # Create a copy of input tensor for in-place factorization
+#     # (to preserve original tensor)
+#     var A_factorized = create_dynamic_tensor[dtype](ctx, tensor_shape_copy^, init_value=0.0)
+    
+#     # Copy data from input tensor to A_factorized
+#     ctx.enqueue_copy(A_factorized.storage, tensor.storage)
+#     ctx.synchronize()
+    
+#     # Allocate sigma vector for Householder scaling factors
+#     var sigma_shape = List[Int](k)
+#     var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
+    
+#     # Create LayoutTensor views needed by MAX APIs
+#     # 2 Dimensional Row Major Layouts shape = 2 with stride = 1
+#     alias matrix_layout = Layout.row_major(1, 1)
+#     alias sigma_layout = Layout.row_major(1)
+    
+#     var sigma_shape_rt = RuntimeTuple[sigma_layout.shape](k)
+#     var sigma_stride_rt = RuntimeTuple[sigma_layout.stride](sigma.stride[0])
+#     var sigma_runtime_layout = RuntimeLayout[sigma_layout](
+#         shape=sigma_shape_rt,
+#         stride=sigma_stride_rt
+#     )
+#     # sigma tensor
+#     var sigma_tensor = LayoutTensor[
+#         mut=True,
+#         dtype,
+#         sigma_layout,
+#         MutAnyOrigin
+#     ](
+#         sigma.storage,
+#         runtime_layout=sigma_runtime_layout
+#     )
+    
+#     var A_shape_rt = RuntimeTuple[matrix_layout.shape](m, n)
+#     var A_stride_rt = RuntimeTuple[matrix_layout.stride](A_factorized.stride[0], A_factorized.stride[1])
+#     var A_layout = RuntimeLayout[matrix_layout, linear_idx_type=_](shape=A_shape_rt, stride=A_stride_rt)
+#     # A tensor
+#     var A_tensor = LayoutTensor[
+#         mut=True,
+#         dtype,
+#         matrix_layout,
+#         MutAnyOrigin
+#     ](
+#         A_factorized.storage,
+#         runtime_layout=A_layout
+#     )
+    
+#     # Step 1: Compute QR factorization in-place (Householder reflectors)
+#     # The function modifies A_tensor in-place to store Householder reflectors
+#     # and stores scaling factors in sigma_tensor
+#     qr_factorization(sigma_tensor, A_tensor)
+#     ctx.synchronize()
+    
+#     # Step 2: Extract R from upper triangular part of A_factorized
+#     # After qr_factorization, the upper triangular part of A_factorized contains R
+#     var R = create_dynamic_tensor[dtype](ctx, List[Int](m, n), init_value=0.0)
+    
+#     # Copy the upper triangular part via host memory
+#     var host_A = ctx.enqueue_create_host_buffer[dtype](m * n)
+#     ctx.enqueue_copy(host_A, A_factorized.storage)
+#     ctx.synchronize()
+    
+#     var host_R = ctx.enqueue_create_host_buffer[dtype](m * n)
+#     for i in range(m):
+#         for j in range(n):
+#             var idx = i * n + j
+#             if i <= j:
+#                 # Upper triangular part (including diagonal)
+#                 host_R[idx] = host_A[idx]
+#             else:
+#                 # Lower triangular part - set to zero
+#                 host_R[idx] = Scalar[dtype](0.0)
+    
+#     ctx.enqueue_copy(R.storage, host_R)
+#     ctx.synchronize()
+    
+#     # Step 3: Form Q matrix from Householder reflectors
+#     var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=0.0)
+    
+#     # Create LayoutTensor view for Q (output of form_q)
+#     var Q_shape_rt = RuntimeTuple[matrix_layout.shape](m, m)
+#     var Q_stride_rt = RuntimeTuple[matrix_layout.stride](Q.stride[0], Q.stride[1])
+#     var Q_layout = RuntimeLayout[matrix_layout](shape=Q_shape_rt, stride=Q_stride_rt)
+#     var Q_tensor = LayoutTensor[mut=True, dtype, matrix_layout, MutAnyOrigin](
+#         Q.storage,
+#         runtime_layout=Q_layout
+#     )
+    
+#     # Form the orthogonal matrix Q from the Householder reflectors in A and sigma
+#     # According to MAX API: form_q[dtype, element_layout](sigma, A, Q)
+#     form_q(sigma_tensor, A_tensor, Q_tensor)
+#     ctx.synchronize()
+    
+#     return (Q, R)
+
 fn dense_tensor_qr[dtype: DType = DType.float32](
-    var tensor: DynamicTensor[dtype],
-    ctx: DeviceContext
-) raises -> Tuple[DynamicTensor[dtype], DynamicTensor[dtype]]:
-    """Compute the QR decomposition of a dense tensor using MAX API.
-    
-    Performs QR factorization where a matrix A is decomposed into:
-    - Q: An orthogonal matrix (Q^T @ Q = I)
-    - R: An upper triangular matrix
-    Such that A = Q @ R
-    
-    Uses the Householder reflector method via MAX's linalg.qr_factorization,
-    which is equivalent to LAPACK's geqrf + orgqr/ungqr approach.
-    
-    Parameters:
-        dtype: The data type of the tensor elements (default: DType.float32).
-    
-    Args:
-        tensor: Input dense tensor to decompose (must be 2D matrix).
-        ctx: Device context for GPU operations.
-    
-    Returns:
-        A tuple (Q, R) where:
-        - Q is the orthogonal matrix (m × m for full QR)
-        - R is the upper triangular matrix (m × n)
-    
-    Raises:
-        Error: If the input tensor is not a 2D matrix.
-    
-    Note:
-        The input tensor must be a 2D matrix. QR decomposition is not
-        defined for higher-rank tensors in this implementation.
-    
-    Algorithm:
-        1. Copy input matrix A (to preserve original)
-        2. Call linalg.qr_factorization to compute Householder reflectors in-place
-        3. Extract R from upper triangular part of factorized matrix
-        4. Call linalg.form_q to generate orthogonal matrix Q
-    
-    References:
-        MAX API: https://docs.modular.com/mojo/kernels/linalg/qr_factorization/qr_factorization/
-        https://docs.modular.com/mojo/kernels/linalg/qr_factorization/form_q/
-    """
+        var tensor: DynamicTensor[dtype],
+        ctx: DeviceContext
+    ) raises -> Tuple[DynamicTensor[dtype], DynamicTensor[dtype]]:
     # Require 2D matrix
     var rank = len(tensor.shape)
+    print("[QR DEBUG] Starting dense_tensor_qr invocation")
+    print("[QR DEBUG] Input rank:", rank)
+    print("[QR DEBUG] Input shape: [", end="")
+    for idx in range(len(tensor.shape)):
+        if idx > 0:
+            print(", ", end="")
+        print(tensor.shape[idx], end="")
+    print("]")
+    print("[QR DEBUG] Input stride: [", end="")
+    for idx in range(len(tensor.stride)):
+        if idx > 0:
+            print(", ", end="")
+        print(tensor.stride[idx], end="")
+    print("]")
+    print("[QR DEBUG] Input size:", tensor.size)
+    print("[QR DEBUG] Input contiguous:", tensor.is_contiguous())
     if rank != 2:
         raise Error("QR decomposition requires a 2D matrix, got rank " + String(rank))
-    
-    var m = tensor.shape[0]  # rows
-    var n = tensor.shape[1]  # columns
+
+    var m = tensor.shape[0] # rows
+    var n = tensor.shape[1] # columns
     var k = min(m, n)
-    
-    var tensor_shape_copy = tensor.shape.copy()
+
     # Create a copy of input tensor for in-place factorization
-    # (to preserve original tensor)
-    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor_shape_copy^, init_value=0.0)
-    
+    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor.shape.copy(), init_value=0.0)
+    print("[QR DEBUG] A_factorized shape: [", end="")
+    for idx in range(len(A_factorized.shape)):
+        if idx > 0: 
+            print(", ", end="")
+        print(A_factorized.shape[idx], end="")
+    print("]")
+    print("[QR DEBUG] A_factorized stride: [", end="")
+    for idx in range(len(A_factorized.stride)):
+        if idx > 0:
+            print(", ", end="")
+        print(A_factorized.stride[idx], end="")
+    print("]")
+
     # Copy data from input tensor to A_factorized
     ctx.enqueue_copy(A_factorized.storage, tensor.storage)
     ctx.synchronize()
-    
-    # Allocate sigma vector for Householder scaling factors
-    var sigma_shape = List[Int](k)
-    var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
-    
-    # Create LayoutTensor views needed by MAX APIs
-    # 2 Dimensional Row Major Layouts shape = 2 with stride = 1
-    alias matrix_layout = Layout.row_major(2)
-    alias sigma_layout = Layout.row_major(1)
-    
-    var sigma_shape_rt = RuntimeTuple[sigma_layout.shape](k)
-    var sigma_stride_rt = RuntimeTuple[sigma_layout.stride](sigma.stride[0])
-    var sigma_runtime_layout = RuntimeLayout[sigma_layout](
-        shape=sigma_shape_rt,
-        stride=sigma_stride_rt
-    )
-    # sigma tensor
-    var sigma_tensor = LayoutTensor[
-        mut=True,
-        dtype,
-        sigma_layout,
-        MutAnyOrigin
-    ](
-        sigma.storage,
-        runtime_layout=sigma_runtime_layout
-    )
-    
+    print("[QR DEBUG] Copied data into A_factorized buffer")
+
+    # === LayoutTensor views for MAX APIs =====================================
+
+    # 2D row-major layout with runtime dimensions
+    comptime matrix_layout = Layout.row_major[2]()
+
+    # --- A tensor (m x n) ----------------------------------------------------
     var A_shape_rt = RuntimeTuple[matrix_layout.shape](m, n)
     var A_stride_rt = RuntimeTuple[matrix_layout.stride](A_factorized.stride[0], A_factorized.stride[1])
-    var A_layout = RuntimeLayout[matrix_layout, linear_idx_type=_](shape=A_shape_rt, stride=A_stride_rt)
-    # A tensor
-    var A_tensor = LayoutTensor[
-        mut=True,
-        dtype,
-        matrix_layout,
-        MutAnyOrigin
-    ](
-        A_factorized.storage,
-        runtime_layout=A_layout
+    var A_runtime_layout = RuntimeLayout[matrix_layout](
+        shape = A_shape_rt,
+        stride = A_stride_rt
     )
-    
-    # Step 1: Compute QR factorization in-place (Householder reflectors)
-    # The function modifies A_tensor in-place to store Householder reflectors
-    # and stores scaling factors in sigma_tensor
+    var A_tensor = LayoutTensor[dtype, matrix_layout](
+        A_factorized.storage,
+        runtime_layout = A_runtime_layout
+    )
+
+    # --- sigma tensor (k entries) -------------------------------------------
+    var sigma = create_dynamic_tensor[dtype](ctx, List[Int](k), init_value=0.0)
+    comptime sigma_layout = Layout.row_major[1]()
+
+    var sigma_shape_rt = RuntimeTuple[sigma_layout.shape](k)
+    var sigma_stride_rt = RuntimeTuple[sigma_layout.stride](sigma.stride[0])
+
+    var sigma_runtime_layout = RuntimeLayout[sigma_layout](
+        shape = sigma_shape_rt,
+        stride = sigma_stride_rt
+    )
+    var sigma_tensor = LayoutTensor[dtype, sigma_layout](
+        sigma.storage,
+        runtime_layout = sigma_runtime_layout
+    )
+    print("[QR DEBUG] Sigma stride: [", end="")
+    for idx in range(len(sigma.stride)):
+        if idx > 0:
+            print(", ", end="")
+        print(sigma.stride[idx], end="")
+    print("]")
+    print("[QR DEBUG] Allocated sigma buffer with length:", k)
+
+    # === Step 1: in-place QR factorization (Householder reflectors) ==========
+    print("[QR DEBUG] Launching qr_factorization kernel")
     qr_factorization(sigma_tensor, A_tensor)
     ctx.synchronize()
-    
-    # Step 2: Extract R from upper triangular part of A_factorized
-    # After qr_factorization, the upper triangular part of A_factorized contains R
+    print("[QR DEBUG] qr_factorization completed, capturing sigma and A previews")
+    var sigma_debug = ctx.enqueue_create_host_buffer[dtype](k)
+    ctx.enqueue_copy(sigma_debug, sigma.storage)
+    ctx.synchronize()
+    var sigma_preview = min(k, 8)
+    print("[QR DEBUG] sigma preview:", end=" ")
+    for i in range(sigma_preview):
+        print(sigma_debug[i], end=" ")
+    if k > sigma_preview:
+        print("... (truncated)", end="")
+    print("")
+
+    var host_after_qr = ctx.enqueue_create_host_buffer[dtype](m * n)
+    ctx.enqueue_copy(host_after_qr, A_factorized.storage)
+    ctx.synchronize()
+    var elem_preview = min(m * n, 12)
+    print("[QR DEBUG] A_factorized preview (first", elem_preview, "elements):", end=" ")
+    for i in range(elem_preview):
+        print(host_after_qr[i], end=" ")
+    if m * n > elem_preview:
+        print("... (truncated)", end="")
+    print("")
+
+    # === Step 2: Extract R (upper triangular part of A_factorized) ===========
     var R = create_dynamic_tensor[dtype](ctx, List[Int](m, n), init_value=0.0)
-    
-    # Copy the upper triangular part via host memory
+
     var host_A = ctx.enqueue_create_host_buffer[dtype](m * n)
     ctx.enqueue_copy(host_A, A_factorized.storage)
     ctx.synchronize()
-    
+
     var host_R = ctx.enqueue_create_host_buffer[dtype](m * n)
     for i in range(m):
         for j in range(n):
             var idx = i * n + j
             if i <= j:
-                # Upper triangular part (including diagonal)
                 host_R[idx] = host_A[idx]
             else:
-                # Lower triangular part - set to zero
                 host_R[idx] = Scalar[dtype](0.0)
-    
+
     ctx.enqueue_copy(R.storage, host_R)
     ctx.synchronize()
-    
-    # Step 3: Form Q matrix from Householder reflectors
+    var r_preview = min(m * n, 12)
+    print("[QR DEBUG] R preview (first", r_preview, "elements):", end=" ")
+    for i in range(r_preview):
+        print(host_R[i], end=" ")
+    if m * n > r_preview:
+        print("... (truncated)", end="")
+    print("")
+
+    # === Step 3: Form Q from Householder reflectors ==========================
     var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=0.0)
-    
-    # Create LayoutTensor view for Q (output of form_q)
+
     var Q_shape_rt = RuntimeTuple[matrix_layout.shape](m, m)
     var Q_stride_rt = RuntimeTuple[matrix_layout.stride](Q.stride[0], Q.stride[1])
-    var Q_layout = RuntimeLayout[matrix_layout](shape=Q_shape_rt, stride=Q_stride_rt)
-    var Q_tensor = LayoutTensor[mut=True, dtype, matrix_layout, MutAnyOrigin](
-        Q.storage,
-        runtime_layout=Q_layout
+    var Q_runtime_layout = RuntimeLayout[matrix_layout](
+        shape = Q_shape_rt,
+        stride = Q_stride_rt
     )
-    
-    # Form the orthogonal matrix Q from the Householder reflectors in A and sigma
-    # According to MAX API: form_q[dtype, element_layout](sigma, A, Q)
+    var Q_tensor = LayoutTensor[dtype, matrix_layout](
+        Q.storage,
+        runtime_layout = Q_runtime_layout
+    )
+
+    # Generate Q on device
     form_q(sigma_tensor, A_tensor, Q_tensor)
     ctx.synchronize()
-    
+    print("[QR DEBUG] form_q completed, capturing Q preview")
+    var Q_host = ctx.enqueue_create_host_buffer[dtype](m * m)
+    ctx.enqueue_copy(Q_host, Q.storage)
+    ctx.synchronize()
+    var q_preview = min(m * m, 12)
+    print("[QR DEBUG] Q preview (first", q_preview, "elements):", end=" ")
+    for i in range(q_preview):
+        print(Q_host[i], end=" ")
+    if m * m > q_preview:
+        print("... (truncated)", end="")
+    print("")
+
     return (Q, R)
