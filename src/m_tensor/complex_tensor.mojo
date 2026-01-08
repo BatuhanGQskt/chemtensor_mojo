@@ -348,10 +348,10 @@ fn complex_matmul[dtype: DType = DType.float32](
     var C_shape_bc = C.real.shape.copy()
     
     # Allocate temporary storage for intermediate results
-    var ac = create_dynamic_tensor[dtype](ctx, C_shape^, init_value=0.0)
-    var bd = create_dynamic_tensor[dtype](ctx, C_shape_bd^, init_value=0.0)
-    var ad = create_dynamic_tensor[dtype](ctx, C_shape_ad^, init_value=0.0)
-    var bc = create_dynamic_tensor[dtype](ctx, C_shape_bc^, init_value=0.0)
+    var ac = create_dynamic_tensor[dtype](ctx, C_shape^, init_value=Scalar[dtype](0.0))
+    var bd = create_dynamic_tensor[dtype](ctx, C_shape_bd^, init_value=Scalar[dtype](0.0))
+    var ad = create_dynamic_tensor[dtype](ctx, C_shape_ad^, init_value=Scalar[dtype](0.0))
+    var bc = create_dynamic_tensor[dtype](ctx, C_shape_bc^, init_value=Scalar[dtype](0.0))
     
     # Perform 4 real matrix multiplications
     # ac = A.real @ B.real

@@ -42,6 +42,9 @@ struct MPSSite[dtype: DType](Writable, Movable, ImplicitlyCopyable):
                 + String(rank)
             )
 
+    fn write_to[W: Writer](self, mut writer: W) -> None:
+        self.tensor.write_to(writer)
+
 
 struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     """Matrix Product State built on top of DynamicTensor.
@@ -90,6 +93,12 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         self.length = len(self.sites)
         self.bond_dims = bonds^
 
+    fn __copyinit__(out self, existing: Self):
+        self.sites = existing.sites.copy()
+        self.physical_dim = existing.physical_dim
+        self.length = existing.length
+        self.bond_dims = existing.bond_dims.copy()
+
     fn num_sites(self) -> Int:
         return self.length
 
@@ -107,16 +116,17 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             self.physical_dim,
             ")",
         )
-
-        print("  bond dims = [", end="")
+        
+        var bond_str = String("  bond dims = [")
         for i in range(len(self.bond_dims)):
             if i > 0:
-                print(", ", end="")
-            print(self.bond_dims[i], end="")
-        print("]")
-
+                bond_str += ", "
+            bond_str += String(self.bond_dims[i])
+        bond_str += "]"
+        print(bond_str)
+        
         for idx in range(self.length):
-            var shape = self.sites[idx].tensor.shape
+            var shape = self.sites[idx].shape()
             print(
                 "  site ",
                 idx,
@@ -128,7 +138,32 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
                 shape[2],
                 "]",
             )
-    
+
+    fn write_to[W: Writer](self, mut writer: W) -> None:
+        writer.write("MatrixProductState(length=")
+        writer.write(self.length)
+        writer.write(", physical_dim=")
+        writer.write(self.physical_dim)
+        writer.write(", bond_dims=[")
+        for i in range(len(self.bond_dims)):
+            if i > 0:
+                writer.write(", ")
+            writer.write(self.bond_dims[i])
+        writer.write("], sites=[")
+        for idx in range(self.length):
+            if idx > 0:
+                writer.write(", ")
+            var shape = self.sites[idx].shape()
+            writer.write("(")
+            writer.write(shape[0])
+            writer.write(", ")
+            writer.write(shape[1])
+            writer.write(", ")
+            writer.write(shape[2])
+            writer.write(")")
+        writer.write("])")
+
+    # TODO: Review this function
     fn left_canonicalize(inout self) raises:
         """Bring the MPS to left-canonical form using QR decomposition.
         
@@ -182,7 +217,7 @@ fn create_uniform_mps[dtype: DType = DType.float32](
     num_sites: Int,
     physical_dim: Int,
     bond_dims: List[Int],
-    init_value: Scalar[dtype] = 0.0,
+    init_value: Optional[Scalar[dtype]] = None,
 ) raises -> MatrixProductState[dtype]:
     """Allocate an MPS with constant entries in every site tensor."""
     if num_sites < 1:
@@ -200,9 +235,13 @@ fn create_uniform_mps[dtype: DType = DType.float32](
             raise Error("Bond dimensions must be >= 1")
 
         var shape = List[Int](left_dim, physical_dim, right_dim)
-        var site_tensor = create_dynamic_tensor[dtype](
-            ctx, shape^, row_major=True, init_value=init_value
-        )
+        var site_tensor: DynamicTensor[dtype]
+        if init_value is None:
+            site_tensor = DynamicTensor[dtype].random(ctx, shape^)  # Assume random factory
+        else:
+            site_tensor = create_dynamic_tensor[dtype](
+                ctx, shape^, row_major=True, init_value=init_value.value()
+            )
         sites.append(MPSSite[dtype](site_tensor^))
     return MatrixProductState[dtype](sites^)
 

@@ -9,6 +9,7 @@ from buffer.buffer import NDBuffer
 from memory.unsafe_pointer import UnsafePointer
 import linalg
 from linalg.qr_factorization import qr_factorization, form_q
+from random import random_float64
 
 ## Fully dynamic tensor with runtime-determined rank, shape, and stride
 @fieldwise_init
@@ -369,6 +370,15 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         # Return a view with updated shape/stride (no data copy)
         return DynamicTensor[dtype](self.storage^, new_shape^, new_strides^)
 
+    @staticmethod
+    fn random(
+        ctx: DeviceContext,
+        var shape: List[Int],
+        row_major: Bool = True
+    ) raises -> DynamicTensor[dtype]:
+        """Create a tensor filled with random values in [0, 1)."""
+        return create_dynamic_tensor[dtype](ctx, shape^, row_major=row_major)
+
 
 
 fn compute_row_major_strides(shape: List[Int], rank: Int) -> List[Int]:
@@ -423,24 +433,18 @@ fn create_dynamic_tensor[dtype: DType = DType.float32](
     ctx: DeviceContext, 
     var shape: List[Int], 
     row_major: Bool = True,
-    init_value: Scalar[dtype] = 0.0
+    init_value: Optional[Scalar[dtype]] = None  # None for random init
 ) raises -> DynamicTensor[dtype]:
     """Create a dynamic tensor with runtime-determined rank, shape, and stride.
     
     Args:
         ctx: Device context for GPU operations.
         shape: List of dimensions (length should be rank).
-        rank: Number of dimensions.
         row_major: If True, use row-major stride; otherwise column-major.
-        init_value: Initial value to fill the tensor.
+        init_value: Initial value to fill the tensor. If None, initialize with random values in [0,1).
     
     Returns:
         DynamicTensor with allocated GPU storage.
-    
-    Example:
-        var shape = List[Int](3, 4, 5)  # 3D tensor
-        var tensor = create_dynamic_tensor(ctx, shape, 3)
-        # Creates a 3x4x5 tensor with row-major layout.
     """
     # Compute total size
     var total_size = 1
@@ -457,8 +461,13 @@ fn create_dynamic_tensor[dtype: DType = DType.float32](
     
     # Allocate and initialize host buffer
     var host_storage = ctx.enqueue_create_host_buffer[dtype](total_size)
-    for i in range(total_size):
-        host_storage[i] = init_value
+    if init_value is None:
+        for i in range(total_size):
+            host_storage[i] = Scalar[dtype](random_float64())  # Random in [0,1)
+    else:
+        var value = init_value.value()
+        for i in range(total_size):
+            host_storage[i] = value
     
     # Copy to device
     var device_storage = ctx.enqueue_create_buffer[dtype](total_size)
@@ -834,7 +843,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     var tensor_shape_copy = tensor.shape.copy()
     # Create a copy of input tensor for in-place factorization
     # (to preserve original tensor)
-    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor_shape_copy^, init_value=0.0)
+    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor_shape_copy^, init_value=Scalar[dtype](0.0))
     print("[QR DEBUG] A_factorized shape: [", end="")
     for idx in range(len(A_factorized.shape)):
         if idx > 0:
@@ -860,7 +869,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
 
     # Allocate sigma vector for Householder scaling factors
     var sigma_shape = List[Int](k)
-    var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
+    var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=Scalar[dtype](0.0))
     var host_sigma = ctx.enqueue_create_host_buffer[dtype](k)
     for i in range(k):
         host_sigma[i] = Scalar[dtype](0.0)
@@ -942,7 +951,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
 
     # Step 2: Extract R from upper triangular part of A_factorized
     # After qr_factorization, the upper triangular part of A_factorized contains R
-    var R = create_dynamic_tensor[dtype](ctx, List[Int](m, n), init_value=0.0)
+    var R = create_dynamic_tensor[dtype](ctx, List[Int](m, n), init_value=Scalar[dtype](0.0))
 
     # Copy the upper triangular part via host memory
     var host_A = host_A_factorized
@@ -969,7 +978,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     print("")
 
     # Step 3: Form Q matrix from Householder reflectors
-    var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=0.0)
+    var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=Scalar[dtype](0.0))
     var host_Q = ctx.enqueue_create_host_buffer[dtype](m * m)
     for i in range(m * m):
         host_Q[i] = Scalar[dtype](0.0)
