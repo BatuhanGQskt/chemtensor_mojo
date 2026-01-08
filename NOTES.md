@@ -40,3 +40,13 @@ ptxas fatal   : Ptx assembly aborted due to errors
 - Intro(what is thesis about) -> Preliminary (explain your method what is chemtensor, dense sparse mojo) -> Method (Explain exactly what I did, explain decisions why did you implement them, experiments) -> Conclusion ( what you did ) -> Future Work [ This can be splitted up. ]
 
 Skip intro for now. -> Focus on Preliminary (explain what is tensor network, GPU programming MOJO, chemtensor (sparse, dense and logic behind reason))
+
+## State module scaffolding (Nov 2025)
+- Added `state/mps_state.mojo` with `MPSSite`, `MatrixProductState`, and helpers for zero/product states.
+- Example usage:
+```mojo
+with DeviceContext() as ctx:
+    var basis = List[Int](0, 1, 0)
+    var psi = create_product_mps(ctx, 2, basis)
+    psi.describe()
+```
