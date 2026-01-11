@@ -2,7 +2,7 @@ from memory import Pointer, AddressSpace, OwnedPointer
 from collections.list import List
 from gpu.host import DeviceContext, DeviceBuffer
 from complex import ComplexSIMD
-from .dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, compute_row_major_strides, dense_tensor_dot
+from src.m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, compute_row_major_strides, dense_tensor_dot
 
 struct ComplexDynamicTensor[dtype: DType](Writable, Movable):
     """A tensor for complex-valued data, stored as separate real and imaginary tensors.
@@ -14,8 +14,7 @@ struct ComplexDynamicTensor[dtype: DType](Writable, Movable):
         dtype: The underlying real data type (e.g., DType.float32, DType.float64).
                The complex values will be represented as pairs of this type.
     
-    Example:
-        ```mojo
+    Example:mojo
         with DeviceContext() as ctx:
             # Create a 2×2 complex matrix
             var data = List[ComplexSIMD[DType.float32, 1]]()
@@ -26,7 +25,7 @@ struct ComplexDynamicTensor[dtype: DType](Writable, Movable):
             var tensor = create_complex_tensor_from_data[DType.float32](
                 ctx, data, List[Int](2, 2)^
             )
-        ```
+        
     """
     var real: DynamicTensor[dtype]  # Real part of the tensor
     var imag: DynamicTensor[dtype]  # Imaginary part of the tensor
@@ -201,7 +200,7 @@ fn create_complex_tensor[dtype: DType = DType.float32](
         A new ComplexDynamicTensor.
     
     Example:
-        ```mojo
+        mojo
         with DeviceContext() as ctx:
             # Create 3x3 zero matrix
             var zeros = create_complex_tensor[DType.float32](
@@ -212,7 +211,6 @@ fn create_complex_tensor[dtype: DType = DType.float32](
             var tensor = create_complex_tensor[DType.float32](
                 ctx, List[Int](2, 2), real_init=1.0, imag_init=0.5
             )
-        ```
     """
     var shape_copy = shape.copy()
     var real = create_dynamic_tensor[dtype](ctx, shape^, row_major, real_init)
@@ -244,7 +242,7 @@ fn create_complex_tensor_from_data[dtype: DType = DType.float32](
         Error: If data size doesn't match the shape.
     
     Example:
-        ```mojo
+        mojo
         # Create a 2×2 complex matrix
         var data = List[ComplexSIMD[DType.float32, 1]]()
         data.append(ComplexSIMD[DType.float32, 1](1.0, 0.5))  # 1.0 + 0.5i
@@ -255,7 +253,6 @@ fn create_complex_tensor_from_data[dtype: DType = DType.float32](
         var tensor = create_complex_tensor_from_data[DType.float32](
             ctx, data, List[Int](2, 2)^
         )
-        ```
     """
     # Verify data size matches shape
     var expected_size = 1
@@ -314,7 +311,7 @@ fn complex_matmul[dtype: DType = DType.float32](
         Error: If tensor shapes are incompatible.
     
     Example:
-        ```mojo
+        mojo
         with DeviceContext() as ctx:
             var A = create_complex_tensor[DType.float32](ctx, List[Int](3, 4)^)
             var B = create_complex_tensor[DType.float32](ctx, List[Int](4, 5)^)
@@ -322,7 +319,6 @@ fn complex_matmul[dtype: DType = DType.float32](
             
             complex_matmul[DType.float32](C, A^, B^, ctx)
             # C now contains A @ B for complex matrices
-        ```
     
     Performance Note:
         This operation requires 4 real matrix multiplications plus 2 additions/subtractions.
@@ -412,11 +408,10 @@ fn create_complex_identity[dtype: DType = DType.float32](
         An n×n identity matrix with 1+0i on the diagonal and 0+0i elsewhere.
     
     Example:
-        ```mojo
+        mojo
         with DeviceContext() as ctx:
             var I = create_complex_identity[DType.float32](ctx, 4)
             # Creates a 4×4 identity matrix
-        ```
     """
     var shape = List[Int](n, n)
     var data = List[ComplexSIMD[dtype, 1]]()

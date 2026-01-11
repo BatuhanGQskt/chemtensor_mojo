@@ -8,7 +8,7 @@ from layout.layout import DimList
 from math import ceildiv
 from main import MAX_RANK, list_to_dimlist
 
-alias dtype = DType.float32
+alias dtype = DType.float64
 
 ## General dense tensor structure for block sparse tensor networks
 @fieldwise_init

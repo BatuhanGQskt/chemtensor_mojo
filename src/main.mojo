@@ -1,18 +1,21 @@
 from sys import has_accelerator
-from m_tensor.static_tensor import create_static_tensor, create_static_tensor_with_stride
-from m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot, dense_tensor_qr
-from m_tensor.complex_tensor import ComplexDynamicTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
+from src.m_tensor.static_tensor import create_static_tensor, create_static_tensor_with_stride
+from src.m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot, dense_tensor_qr, dense_tensor_svd_trunc_lapack_f64
+from src.m_tensor.complex_tensor import ComplexDynamicTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
 from layout.layout import DimList, Layout
 from gpu import thread_idx, block_idx, block_dim
 from gpu.host import DeviceContext
 from math import ceildiv
 from time import perf_counter_ns
-from collections import optional, List
+from collections.optional import Optional
+from collections.list import List
 from python import Python
 from layout import IntTuple, LayoutTensor, RuntimeTuple
 from layout.runtime_layout import RuntimeLayout, make_layout
 from complex import ComplexSIMD
-from state.mps_state import create_product_mps, create_uniform_mps, mps_orthogonalize_qr
+from src.state.mps_state import create_product_mps, create_uniform_mps, mps_orthogonalize_qr
+from src.state.hamiltonians import create_ising_1d_mpo, create_transverse_ising_mpo
+from src.algorithms.dmrg import DMRGParams, dmrg_two_site
 
 alias dtype = DType.float32
 
@@ -502,13 +505,169 @@ fn test_mps_creation() raises:
     print("="*60 + "\n")
 
 
+fn test_dense_svd_trunc() raises:
+    """Test truncated SVD implementation using NuMojo's optimized SVD."""
+    print("\\n" + "="*60)
+    print("TESTING TRUNCATED SVD (Lapack-based)")
+    print("="*60 + "\\n")
+    
+    with DeviceContext() as ctx:
+        print("Test 1: SVD of 4x3 matrix...")
+        
+        # Create a simple test matrix with known structure
+        var data = List[Float64]()
+        # Matrix with rank 2 (two non-zero singular values)
+        # [2, 0, 0]
+        # [0, 3, 0] 
+        # [0, 0, 0]
+        # [0, 0, 0]
+        data.append(2.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(3.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        
+        var shape = List[Int](4, 3)
+        var A = create_dynamic_tensor_from_data[DType.float64](ctx, data, shape^)
+        
+        print("Matrix A:")
+        A.print_tensor(ctx)
+        
+        # Compute truncated SVD using Lapack
+        print("\nComputing truncated SVD with Lapack (chi_max=2, eps_trunc=1e-10)...")
+        var svd_result = dense_tensor_svd_trunc_lapack_f64[DType.float64](A^, ctx, chi_max=2, eps_trunc=1e-10)
+        var U = svd_result[0]
+        var S = svd_result[1] 
+        var Vt = svd_result[2]
+        var chi_kept = svd_result[3]
+        
+        print("\nNumber of singular values kept:", chi_kept)
+        
+        print("\nSingular values S:")
+        S.print_tensor(ctx)
+        
+        print("\nLeft singular vectors U:")
+        U.print_tensor(ctx)
+        
+        print("\nRight singular vectors Vt:")
+        Vt.print_tensor(ctx)
+        
+        print("\n✓ Lapack-based truncated SVD test completed")
+
+
+fn run_dmrg_tfim_comparison() raises:
+    """Run a Python-like TFIM DMRG example to compare outputs.
+    
+    Matches the user's Python example as closely as the current Mojo API allows.
+    
+    Note:
+    - `state.hamiltonians.create_transverse_ising_mpo` implements:
+        H = -J * Σ Z_i Z_{i+1} - h * Σ X_i
+      which corresponds to the *transverse* field only.
+    - The Python example also has a longitudinal field term (`h`) and a separate
+      transverse-field strength (`g`). Here we map `g -> h` and ignore the
+      longitudinal field since it's not implemented yet.
+    - Entropy output is not implemented in this Mojo codebase yet.
+    """
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found - skipping DMRG TFIM comparison run")
+        return
+
+    # IMPORTANT: Use float32 so MAX can compile GPU matmul on your setup.
+    # (Float64 GPU matmul/GEMV currently fails in your MAX nightly with an offload error.)
+    alias dmrg_dtype = DType.float32
+
+    test_dmrg[dmrg_dtype](10, 1.0, 0.0, 1.0)
+    test_dmrg[dmrg_dtype](5, 1.0, 0.0, 1.0)
+
+
+fn test_dmrg[dmrg_dtype: DType](nsites: Int, J: Float64, h_longitudinal: Float64, g_transverse: Float64):
+    # Model parameters (same as the Python snippet)
+    var num_sweeps = 6
+    var max_vdim = 64
+    var tol_split: Float64 = 1e-10
+
+    print("\n" + "=" * 60)
+    print("DMRG TFIM COMPARISON RUN (Mojo)")
+    print("=" * 60)
+    print("nsites=", nsites, ", J=", J, ", h(longitudinal)=", h_longitudinal, ", g(transverse)=", g_transverse)
+    print("num_sweeps=", num_sweeps, ", max_vdim=", max_vdim, ", tol_split=", tol_split)
+
+    try:
+        with DeviceContext() as ctx:
+            # Build Hamiltonian MPO template (we'll copy it per sweep because dmrg_two_site consumes its args)
+            var H_template = create_ising_1d_mpo[dmrg_dtype](
+                ctx,
+                nsites,
+                J=J,
+                h_longitudinal=h_longitudinal,
+                g_transverse=g_transverse,
+            )
+
+            # Initial product state |000...0>
+            var basis = List[Int](capacity=nsites)
+            for _ in range(nsites):
+                basis.append(0)
+            var psi = create_product_mps[dmrg_dtype](ctx, 2, basis^)
+
+            var en_sweeps = List[Float64](capacity=num_sweeps)
+
+            # Run one sweep at a time so we can collect energies per sweep.
+            for sweep in range(num_sweeps):
+                var params = DMRGParams(
+                    num_sweeps=1,
+                    chi_max=max_vdim,
+                    eps_trunc=tol_split,
+                    max_krylov_iter=20,
+                    krylov_tol=1e-10,
+                    energy_tol=0.0,          # disable early stopping; user wants fixed sweep count
+                    two_site=True,
+                    reorthogonalize=True,
+                    verbose=False,
+                )
+
+                var H = H_template  # copy so we can move it into dmrg_two_site
+                print("H: ", H)
+                var res = dmrg_two_site[dmrg_dtype](ctx, H^, psi^, params)
+                var E = res[0]
+                psi = res[1]
+
+                en_sweeps.append(E)
+                print("Sweep ", sweep + 1, " energy: ", E)
+
+            print("\nEnergies per sweep:", end=" ")
+            print("[", end="")
+            for i in range(len(en_sweeps)):
+                if i > 0:
+                    print(", ", end="")
+                print(en_sweeps[i], end="")
+            print("]")
+
+            print("Final energy:", en_sweeps[len(en_sweeps) - 1])
+            print("Sites:", psi.num_sites())
+            print("Bond dimensions:", end=" ")
+            print("[", end="")
+            for i in range(len(psi.bond_dims)):
+                if i > 0:
+                    print(", ", end="")
+                print(psi.bond_dims[i], end="")
+            print("]")
+            print("Entropies: (not implemented in Mojo yet)")
+    except e:
+        print("Error during DMRG test: " + String(e))
+
+
 def main():
-    print("Testing...")
-    test_mps_creation()
-    test_dense_qr()
-    # test_complex_tensors()
-    # test_nd_tensor_dot()
-    print("Test done.")
+    # Keep the tensor/unit demos available, but run the DMRG comparison by default.
+    run_dmrg_tfim_comparison()
     return
 
 

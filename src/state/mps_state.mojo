@@ -1,6 +1,6 @@
 from collections.list import List
 from gpu.host import DeviceContext
-from m_tensor.dynamic_tensor import (
+from src.m_tensor.dynamic_tensor import (
     DynamicTensor,
     create_dynamic_tensor,
     create_dynamic_tensor_from_data,
