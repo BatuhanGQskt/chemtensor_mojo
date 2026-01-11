@@ -11,6 +11,10 @@ import linalg
 from linalg.qr_factorization import qr_factorization, form_q
 from random import random_float64
 from math import sqrt
+from src.mylinalg.backend import SVDBackend
+from src.mylinalg.matrix import MatrixF64
+from src.mylinalg.svd import svd_f64
+from src.mylinalg.types import Layout as LapackLayout
 
 ## Fully dynamic tensor with runtime-determined rank, shape, and stride
 @fieldwise_init
@@ -140,7 +144,9 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             True if the tensor is contiguous in row-major order, False otherwise.
         
         Example:
-            ```mojo
+            ```
+            
+            mojo
             # Contiguous tensor
             var shape = List[Int](3, 4)
             var tensor = create_dynamic_tensor(ctx, shape^)
@@ -149,7 +155,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             # Non-contiguous after slicing or view operations
             var transposed = tensor^.transpose(List[Int](1, 0), ctx)
             print(transposed.is_contiguous())  # Might be False
-            ```
+            
         """
         var expected_stride = 1
         for i in range(len(self.shape) - 1, -1, -1):
@@ -184,8 +190,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             (e.g., after advanced slicing), a more complex reorganization kernel
             would be needed.
         
-        Example:
-            ```mojo
+        Example:mojo
             # Create a tensor and transpose it (may become non-contiguous)
             var tensor = create_dynamic_tensor(ctx, List[Int](4, 3)^)
             var perm = List[Int](1, 0)
@@ -194,7 +199,6 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             # Make it contiguous for efficient operations
             var contiguous = transposed^.copy_to_contiguous(ctx)
             print(contiguous.is_contiguous())  # True
-            ```
         """
         if self.is_contiguous():
             return self^  # No copy needed, transfer ownership
@@ -234,8 +238,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         Raises:
             Error: If perm length doesn't match tensor rank.
         
-        Example:
-            ```mojo
+        Example:mojo
             # 2D matrix transpose (standard transpose)
             var matrix = create_dynamic_tensor_from_data(
                 ctx,
@@ -258,7 +261,6 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             var transposed_3d = tensor_3d^.transpose(perm_3d, ctx)
             # Original shape: [2, 3, 4]
             # Result shape:   [4, 2, 3]
-            ```
         """
         var rank = len(self.shape)
         if len(perm) != rank:
@@ -328,8 +330,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             This creates a view with recomputed strides. No data is copied.
             The underlying storage is shared with the original tensor.
         
-        Example:
-            ```mojo
+        Example:mojo
             # Flatten middle dimensions of a 4D tensor
             var tensor_4d = create_dynamic_tensor(ctx, List[Int](2, 3, 4, 5)^)
             # Original shape: [2, 3, 4, 5]
@@ -349,7 +350,6 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             var flat_batch = batched^.flatten_dims(1, 3, ctx)
             # Original shape: [8, 5, 10]  (batch of 8 matrices)
             # Result shape:   [8, 50]     (batch of 8 vectors)
-            ```
         """
         if start < 0 or end > len(self.shape) or start >= end:
             raise Error("Invalid flatten range")
@@ -626,8 +626,7 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
         Error: If contracted dimensions don't match in size.
         Error: If C doesn't have the correct shape for the result.
     
-    Examples:
-        ```mojo
+    Examples:mojo
         # Example 1: Standard 2D matrix multiplication
         # A[3, 4] @ B[4, 5] = C[3, 5]
         with DeviceContext() as ctx:
@@ -693,7 +692,6 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
             var C_tn2 = create_dynamic_tensor(ctx, List[Int](3, 5)^)
             dense_tensor_dot(C_tn2, A_tn2^, B_tn2^, ctx, ndim_mult=1,
                            axrange_A=True, axrange_B=False)
-        ```
     
     Performance Notes:
         - Uses GPU-accelerated matrix multiplication (linalg.matmul)
@@ -862,7 +860,20 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     # Call matmul (tiled shared mem kernel)
     # Result is written to C_flat, which shares storage with C
     # So C automatically gets the result in the correct ND shape
-    linalg.matmul.matmul[target="gpu"](ndbuf_C, ndbuf_A, ndbuf_B, Optional(ctx))
+    #
+    # IMPORTANT:
+    # In some MAX nightlies/environments, Float64 GPU matmul/GEMV offload can fail
+    # with a compiler error ("unhandled shuffle dtype"). To keep GPU execution
+    # reliable, we currently restrict this path to float32.
+    @parameter
+    if dtype == DType.float32:
+        linalg.matmul.matmul[target="gpu"](ndbuf_C, ndbuf_A, ndbuf_B, Optional(ctx))
+    else:
+        raise Error(
+            "dense_tensor_dot GPU matmul supports only DType.float32 on this setup. "
+            + "Use float32 for GPU execution (DMRG) or update MAX to a build that supports "
+            + "your dtype."
+        )
 
     # Grid: 2D (ceildiv(n, tile), ceildiv(m, tile)); Blocks: 2D (tile, tile) threads; Warps: tile/32 per dim, load tiles to shared, accumulate; Threads: each owns C element, loops over k/tilesize.
     # Tile typically 16/32 for float32.
@@ -1072,3 +1083,271 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     print("")
 
     return (Q, R)
+
+fn ensure_contiguous_2d[dtype: DType](
+    var tensor: DynamicTensor[dtype], 
+    ctx: DeviceContext
+) raises -> DynamicTensor[dtype]:
+    """Ensure tensor is contiguous 2D matrix with row-major layout.
+    
+    Args:
+        tensor: Input tensor (ownership transferred).
+        ctx: Device context.
+    
+    Returns:
+        Contiguous 2D tensor (may be original or a copy).
+    """
+    if len(tensor.shape) != 2:
+        raise Error("Expected 2D tensor, got rank " + String(len(tensor.shape)))
+    
+    # Check if already contiguous with row-major stride [n, 1]
+    var m = tensor.shape[0]
+    var n = tensor.shape[1]
+    
+    if tensor.is_contiguous() and tensor.stride[0] == n and tensor.stride[1] == 1:
+        return tensor^  # Already contiguous row-major
+    
+    # Create contiguous copy
+    var shape_copy = tensor.shape.copy()
+    var contiguous = create_dynamic_tensor[dtype](ctx, shape_copy^, init_value=Scalar[dtype](0.0))
+    
+    # Copy data element by element (could be optimized with GPU kernel)
+    var host_src = ctx.enqueue_create_host_buffer[dtype](tensor.size)
+    var host_dst = ctx.enqueue_create_host_buffer[dtype](tensor.size)
+    
+    ctx.enqueue_copy(host_src, tensor.storage)
+    ctx.synchronize()
+    
+    # Copy with proper stride handling
+    for i in range(m):
+        for j in range(n):
+            var src_idx = i * tensor.stride[0] + j * tensor.stride[1]
+            var dst_idx = i * n + j  # Row-major
+            host_dst[dst_idx] = host_src[src_idx]
+    
+    ctx.enqueue_copy(contiguous.storage, host_dst)
+    ctx.synchronize()
+    
+    return contiguous^
+
+fn dense_tensor_svd_trunc_lapack_f64[dtype: DType](
+    var tensor: DynamicTensor[dtype],
+    ctx: DeviceContext,
+    chi_max: Int,
+    eps_trunc: Float64 = 1e-12,
+    so_path: String = "native/libsvd_shim.so",
+) raises -> Tuple[
+    DynamicTensor[dtype],
+    DynamicTensor[dtype],
+    DynamicTensor[dtype],
+    Int,
+]:
+    """Truncated SVD using LAPACK (dgesdd) for Float64 tensors.
+
+    This is a CPU (host) SVD: data is copied GPU->host, factorized with LAPACK,
+    then copied back host->GPU.
+    """
+    @parameter
+    if dtype != DType.float64:
+        raise Error("dense_tensor_svd_trunc_lapack_f64 only supports DType.float64")
+
+    var A = ensure_contiguous_2d[dtype](tensor^, ctx)
+
+    var m = A.shape[0]
+    var n = A.shape[1]
+    if m == 0 or n == 0:
+        var U_empty = create_dynamic_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+        var S_empty = create_dynamic_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+        var Vt_empty = create_dynamic_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+        return (U_empty^, S_empty^, Vt_empty^, 0)
+
+    # Copy A to host (row-major contiguous)
+    var host_A = ctx.enqueue_create_host_buffer[dtype](m * n)
+    ctx.enqueue_copy(host_A, A.storage)
+    ctx.synchronize()
+
+    # Build LAPACK input matrix (ROW_MAJOR) and copy data over
+    var A_mat = MatrixF64(Int32(m), Int32(n), LapackLayout.ROW_MAJOR())
+    for idx in range(m * n):
+        A_mat.data[idx] = Float64(host_A[idx])
+
+    var backend = SVDBackend(so_path)
+    var jobz = Int8(ord('S'))  # thin U, thin VT
+    var svd_res = svd_f64(backend, A_mat^, jobz)
+
+    var k = Int(svd_res.k)  # min(m, n)
+    var chi_kept = min(k, chi_max)
+    if eps_trunc > 0.0 and k > 0:
+        var total_norm_sq: Float64 = 0.0
+        for i in range(k):
+            var s = Float64(svd_res.S[i])
+            total_norm_sq += s * s
+        if total_norm_sq <= 0.0:
+            chi_kept = 0
+        else:
+            # Find smallest chi (<= chi_max) such that discarded_weight <= eps_trunc
+            var kept_norm_sq: Float64 = 0.0
+            var limit = min(k, chi_max)
+            chi_kept = limit  # default fallback
+            for trial_chi in range(1, limit + 1):
+                var s = Float64(svd_res.S[trial_chi - 1])
+                kept_norm_sq += s * s
+                var discarded_weight = (total_norm_sq - kept_norm_sq) / total_norm_sq
+                if discarded_weight <= eps_trunc:
+                    chi_kept = trial_chi
+                    break
+
+    if chi_kept == 0:
+        var U_zero = create_dynamic_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+        var S_zero = create_dynamic_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+        var Vt_zero = create_dynamic_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+        return (U_zero^, S_zero^, Vt_zero^, 0)
+
+    # Allocate output tensors
+    var U_out = create_dynamic_tensor[dtype](
+        ctx, List[Int](m, chi_kept)^, init_value=Scalar[dtype](0.0)
+    )
+    var S_out = create_dynamic_tensor[dtype](
+        ctx, List[Int](chi_kept)^, init_value=Scalar[dtype](0.0)
+    )
+    var Vt_out = create_dynamic_tensor[dtype](
+        ctx, List[Int](chi_kept, n)^, init_value=Scalar[dtype](0.0)
+    )
+
+    # Fill host buffers from LAPACK output
+    var host_U = ctx.enqueue_create_host_buffer[dtype](m * chi_kept)
+    var host_S = ctx.enqueue_create_host_buffer[dtype](chi_kept)
+    var host_Vt = ctx.enqueue_create_host_buffer[dtype](chi_kept * n)
+
+    for i in range(chi_kept):
+        host_S[i] = Scalar[dtype](Float64(svd_res.S[i]))
+
+    var u_cols_full = Int(svd_res.u_cols)  # = k for jobz='S'
+    var vt_cols_full = Int(svd_res.vt_cols)  # = n for jobz='S'
+
+    for i in range(m):
+        for j in range(chi_kept):
+            host_U[i * chi_kept + j] = Scalar[dtype](Float64(svd_res.U[i * u_cols_full + j]))
+
+    for i in range(chi_kept):
+        for j in range(n):
+            host_Vt[i * n + j] = Scalar[dtype](Float64(svd_res.VT[i * vt_cols_full + j]))
+
+    # Copy back to device
+    ctx.enqueue_copy(U_out.storage, host_U)
+    ctx.enqueue_copy(S_out.storage, host_S)
+    ctx.enqueue_copy(Vt_out.storage, host_Vt)
+    ctx.synchronize()
+
+    return (U_out^, S_out^, Vt_out^, chi_kept)
+
+
+fn dense_tensor_svd_trunc[dtype: DType](
+    var tensor: DynamicTensor[dtype],
+    ctx: DeviceContext,
+    chi_max: Int,
+    eps_trunc: Float64 = 1e-12,
+) raises -> Tuple[
+    DynamicTensor[dtype],
+    DynamicTensor[dtype],
+    DynamicTensor[dtype],
+    Int,
+]:
+    """Truncated SVD helper used across the codebase.
+    
+    Backends:
+    - Float64: LAPACK via `dense_tensor_svd_trunc_lapack_f64`
+    - Float32: LAPACK in Float64 internally, then cast back to Float32
+    """
+    @parameter
+    if dtype == DType.float64:
+        return dense_tensor_svd_trunc_lapack_f64[dtype](
+            tensor^,
+            ctx,
+            chi_max=chi_max,
+            eps_trunc=eps_trunc,
+        )
+    elif dtype == DType.float32:
+        # Float32 path: copy to host, run LAPACK in Float64, cast results back.
+        var A32 = ensure_contiguous_2d[dtype](tensor^, ctx)
+
+        var m = A32.shape[0]
+        var n = A32.shape[1]
+        if m == 0 or n == 0:
+            var U_empty = create_dynamic_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+            var S_empty = create_dynamic_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+            var Vt_empty = create_dynamic_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+            return (U_empty^, S_empty^, Vt_empty^, 0)
+
+        var host_A32 = ctx.enqueue_create_host_buffer[dtype](m * n)
+        ctx.enqueue_copy(host_A32, A32.storage)
+        ctx.synchronize()
+
+        # Build LAPACK input as Float64
+        var A_mat = MatrixF64(Int32(m), Int32(n), LapackLayout.ROW_MAJOR())
+        for idx in range(m * n):
+            A_mat.data[idx] = Float64(host_A32[idx])
+
+        var backend = SVDBackend("native/libsvd_shim.so")
+        var jobz = Int8(ord('S'))  # thin U, thin VT
+        var svd_res = svd_f64(backend, A_mat^, jobz)
+
+        var k = Int(svd_res.k)
+        var chi_kept = min(k, chi_max)
+        if eps_trunc > 0.0 and k > 0:
+            var total_norm_sq: Float64 = 0.0
+            for i in range(k):
+                var s = Float64(svd_res.S[i])
+                total_norm_sq += s * s
+            if total_norm_sq <= 0.0:
+                chi_kept = 0
+            else:
+                var kept_norm_sq: Float64 = 0.0
+                var limit = min(k, chi_max)
+                chi_kept = limit
+                for trial_chi in range(1, limit + 1):
+                    var s = Float64(svd_res.S[trial_chi - 1])
+                    kept_norm_sq += s * s
+                    var discarded_weight = (total_norm_sq - kept_norm_sq) / total_norm_sq
+                    if discarded_weight <= eps_trunc:
+                        chi_kept = trial_chi
+                        break
+
+        if chi_kept == 0:
+            var U_zero = create_dynamic_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+            var S_zero = create_dynamic_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+            var Vt_zero = create_dynamic_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+            return (U_zero^, S_zero^, Vt_zero^, 0)
+
+        var U_out = create_dynamic_tensor[dtype](ctx, List[Int](m, chi_kept)^, init_value=Scalar[dtype](0.0))
+        var S_out = create_dynamic_tensor[dtype](ctx, List[Int](chi_kept)^, init_value=Scalar[dtype](0.0))
+        var Vt_out = create_dynamic_tensor[dtype](ctx, List[Int](chi_kept, n)^, init_value=Scalar[dtype](0.0))
+
+        var host_U = ctx.enqueue_create_host_buffer[dtype](m * chi_kept)
+        var host_S = ctx.enqueue_create_host_buffer[dtype](chi_kept)
+        var host_Vt = ctx.enqueue_create_host_buffer[dtype](chi_kept * n)
+
+        for i in range(chi_kept):
+            host_S[i] = Scalar[dtype](Float32(Float64(svd_res.S[i])))
+
+        var u_cols_full = Int(svd_res.u_cols)
+        var vt_cols_full = Int(svd_res.vt_cols)
+
+        for i in range(m):
+            for j in range(chi_kept):
+                host_U[i * chi_kept + j] = Scalar[dtype](Float32(Float64(svd_res.U[i * u_cols_full + j])))
+
+        for i in range(chi_kept):
+            for j in range(n):
+                host_Vt[i * n + j] = Scalar[dtype](Float32(Float64(svd_res.VT[i * vt_cols_full + j])))
+
+        ctx.enqueue_copy(U_out.storage, host_U)
+        ctx.enqueue_copy(S_out.storage, host_S)
+        ctx.enqueue_copy(Vt_out.storage, host_Vt)
+        ctx.synchronize()
+
+        return (U_out^, S_out^, Vt_out^, chi_kept)
+    else:
+        raise Error(
+            "dense_tensor_svd_trunc supports only DType.float32/float64 currently."
+        )
