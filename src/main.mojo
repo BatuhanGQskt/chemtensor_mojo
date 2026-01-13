@@ -12,7 +12,7 @@ from python import Python
 from layout import IntTuple, LayoutTensor, RuntimeTuple
 from layout.runtime_layout import RuntimeLayout, make_layout
 from complex import ComplexSIMD
-from state.mps_state import create_product_mps, create_uniform_mps
+from state.mps_state import create_product_mps, create_uniform_mps, create_mps_from_dense_state
 
 alias dtype = DType.float32
 
@@ -467,6 +467,35 @@ fn test_mps_creation() raises:
             raise Error("Product MPS final bond dimension must be 1")
 
         print("Product-state MPS creation passed bond checks.\n")
+
+        print("Test 3: create_mps_from_dense_state via QR sweep...")
+        var dense_shape = List[Int](physical_dim, physical_dim, physical_dim)
+        var dense_state = create_dynamic_tensor[dtype](ctx, dense_shape.copy())
+        var sweep_mps = create_mps_from_dense_state[dtype](ctx, dense_state^)
+        sweep_mps.describe()
+
+        if sweep_mps.num_sites() != len(dense_shape):
+            raise Error(
+                "Dense-to-MPS conversion length mismatch: expected "
+                + String(len(dense_shape))
+                + ", got "
+                + String(sweep_mps.num_sites())
+            )
+
+        if sweep_mps.bond_dimension(0) != 1 or sweep_mps.bond_dimension(sweep_mps.num_sites()) != 1:
+            raise Error("Dense-to-MPS conversion must keep dummy bonds of size 1")
+
+        for idx in range(sweep_mps.num_sites()):
+            var site_shape = sweep_mps.site_shape(idx)
+            if site_shape[1] != physical_dim:
+                raise Error(
+                    "Dense-to-MPS site "
+                    + String(idx)
+                    + " expected physical dimension "
+                    + String(physical_dim)
+                )
+
+        print("Dense tensor sweep decomposition passed structural checks.\n")
 
     print("="*60)
     print("MPS CREATION TEST COMPLETED")

@@ -4,6 +4,7 @@ from m_tensor.dynamic_tensor import (
     DynamicTensor,
     create_dynamic_tensor,
     create_dynamic_tensor_from_data,
+    dense_tensor_qr,
 )
 
 
@@ -164,7 +165,7 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         writer.write("])")
 
     # TODO: Review this function
-    fn left_canonicalize(inout self) raises:
+    fn left_canonicalize(inout self, ctx: DeviceContext) raises:
         """Bring the MPS to left-canonical form using QR decomposition.
         
         Sweeps from left to right, orthogonalizing each site and absorbing the R factor to the next.
@@ -181,12 +182,14 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             var mat = site.tensor.reshape(List[Int](left_dim * phys_dim, right_dim))
             
             # QR decomposition
-            var Q, R = mat.qr()
+            var qr_result = dense_tensor_qr[dtype](mat^, ctx)
+            var Q = qr_result[0]
+            var R = qr_result[1]
             
             # Normalize Q if needed (optional, but ensures unit norm)
-            var q_norm = Q.norm()
+            var q_norm = Q.norm(ctx)
             if q_norm > 0:
-                Q /= q_norm  # Assume DynamicTensor supports in-place scalar divide
+                Q.scale_in_place(Scalar[dtype](1.0 / q_norm), ctx)  # Normalize columns
             
             # Reshape Q back to [left, phys, right] (right dim from Q cols)
             var new_right_dim = Q.shape[1]  # May truncate if QR does
@@ -206,9 +209,9 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         
         # Final norm absorption (scale last site)
         var last_site = self.sites[self.length - 1]
-        var last_norm = last_site.tensor.norm()
+        var last_norm = last_site.tensor.norm(ctx)
         if last_norm > 0:
-            last_site.tensor /= last_norm
+            last_site.tensor.scale_in_place(Scalar[dtype](1.0 / last_norm), ctx)
         self.sites[self.length - 1] = last_site
 
 
@@ -291,6 +294,106 @@ fn create_product_mps[dtype: DType = DType.float32](
 
         var site_tensor = create_dynamic_tensor_from_data[dtype](ctx, data, shape^)
         sites.append(MPSSite[dtype](site_tensor^))
+
+    return MatrixProductState[dtype](sites^)
+
+
+fn create_mps_from_dense_state[dtype: DType = DType.float32](
+    ctx: DeviceContext,
+    var full_state: DynamicTensor[dtype],
+) raises -> MatrixProductState[dtype]:
+    """Decompose a dense rank-N tensor into an MPS via successive QR sweeps.
+    
+    We iteratively reshape the remaining tensor into a matrix, run a QR, keep the Q
+    part as the current site, and absorb R into the remaining block.
+
+    TODO: We can add RQ sweeps to implement the right-canonicalization.
+    
+    Args:
+        full_state: Dense tensor of shape [d, d, ..., d] (rank = num_sites).
+                    All physical dimensions must be identical because the current
+                    MatrixProductState assumes uniform local Hilbert spaces.
+    
+    Returns:
+        Left-canonical MPS representing the same many-body vector.
+    """
+    var dims = full_state.shape.copy()
+    var num_sites = len(dims)
+    if num_sites == 0:
+        raise Error("full_state must have rank >= 1 to build an MPS")
+
+    var physical_dim = dims[0]
+    for idx in range(num_sites):
+        if dims[idx] != physical_dim:
+            raise Error(
+                "All physical dimensions must match the first axis ("
+                + String(physical_dim)
+                + "), but axis "
+                + String(idx)
+                + " has size "
+                + String(dims[idx])
+            )
+
+    var sites = List[MPSSite[dtype]](capacity=num_sites)
+
+    var augmented_shape = List[Int](capacity=num_sites + 1)
+    augmented_shape.append(1)
+    for dim in dims:
+        augmented_shape.append(dim)
+    var remainder = full_state.reshape(augmented_shape^)
+    var left_dim = 1
+
+
+    if num_sites == 1:
+        var single_shape = List[Int](left_dim, physical_dim, 1)
+        var single_site = remainder.reshape(single_shape^)
+        var single_norm = single_site.norm(ctx)
+        if single_norm > 0:
+            single_site.scale_in_place(Scalar[dtype](1.0 / single_norm), ctx)
+        sites.append(MPSSite[dtype](single_site^))
+        return MatrixProductState[dtype](sites^)
+
+    for site_idx in range(num_sites - 1):
+        var phys_dim_site = dims[site_idx]
+        var right_dim = 1
+        for rest_idx in range(site_idx + 1, num_sites):
+            right_dim *= dims[rest_idx]
+
+        var mat = remainder.reshape(List[Int](left_dim * phys_dim_site, right_dim))
+        var qr_result = dense_tensor_qr[dtype](mat^, ctx)
+        var Q = qr_result[0]
+        var R = qr_result[1]
+
+        var q_norm = Q.norm(ctx)
+        if q_norm > 0:
+            Q.scale_in_place(Scalar[dtype](1.0 / q_norm), ctx)
+            R.scale_in_place(Scalar[dtype](q_norm), ctx)
+
+        var new_right_dim = Q.shape[1]
+        var site_shape = List[Int](left_dim, phys_dim_site, new_right_dim)
+        var site_tensor = Q.reshape(site_shape^)
+        sites.append(MPSSite[dtype](site_tensor^))
+
+        var next_shape = List[Int](capacity=(num_sites - site_idx))
+        next_shape.append(new_right_dim)
+        for rest_idx in range(site_idx + 1, num_sites):
+            next_shape.append(dims[rest_idx])
+        remainder = R.reshape(next_shape^)
+        left_dim = new_right_dim
+
+    if len(remainder.shape) != 2:
+        raise Error(
+            "Unexpected remainder rank "
+            + String(len(remainder.shape))
+            + " while constructing final MPS site"
+        )
+
+    var final_shape = List[Int](remainder.shape[0], remainder.shape[1], 1)
+    var final_site = remainder.reshape(final_shape^)
+    var final_norm = final_site.norm(ctx)
+    if final_norm > 0:
+        final_site.scale_in_place(Scalar[dtype](1.0 / final_norm), ctx)
+    sites.append(MPSSite[dtype](final_site^))
 
     return MatrixProductState[dtype](sites^)
 

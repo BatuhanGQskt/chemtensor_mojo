@@ -10,6 +10,7 @@ from memory.unsafe_pointer import UnsafePointer
 import linalg
 from linalg.qr_factorization import qr_factorization, form_q
 from random import random_float64
+from math import sqrt
 
 ## Fully dynamic tensor with runtime-determined rank, shape, and stride
 @fieldwise_init
@@ -369,6 +370,61 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         
         # Return a view with updated shape/stride (no data copy)
         return DynamicTensor[dtype](self.storage^, new_shape^, new_strides^)
+
+    fn reshape(var self, var new_shape: List[Int]) raises -> DynamicTensor[dtype]:
+        """Return a tensor view with a different shape but identical storage."""
+        if len(new_shape) == 0:
+            raise Error("Reshape requires rank >= 1")
+
+        var total = 1
+        for dim in new_shape:
+            if dim < 1:
+                raise Error("Reshape dimensions must be positive, got " + String(dim))
+            total *= dim
+
+        if total != self.size:
+            raise Error(
+                "Reshape size mismatch: original "
+                + String(self.size)
+                + " vs new "
+                + String(total)
+            )
+
+        var rank = len(new_shape)
+        var new_strides = compute_row_major_strides(new_shape, rank)
+        return DynamicTensor[dtype](self.storage^, new_shape^, new_strides^)
+
+    fn norm(self, ctx: DeviceContext) raises -> Float64:
+        """Compute the Frobenius norm by copying data to host memory."""
+        if self.size == 0:
+            return 0.0
+
+        var host_copy = ctx.enqueue_create_host_buffer[Self.dtype](self.size)
+        ctx.enqueue_copy(host_copy, self.storage)
+        ctx.synchronize()
+
+        var accum = 0.0
+        for i in range(self.size):
+            var value = Float64(host_copy[i])
+            accum += value * value
+
+        return sqrt(accum)
+
+    fn scale_in_place(var self, scale: Scalar[dtype], ctx: DeviceContext) raises -> None:
+        """Scale tensor entries by a scalar factor in-place."""
+        # TODO: Implement in-place scaling for GPU kernels or maybe SIMD handles it already search?
+        if self.size == 0:
+            return
+
+        var host_copy = ctx.enqueue_create_host_buffer[Self.dtype](self.size)
+        ctx.enqueue_copy(host_copy, self.storage)
+        ctx.synchronize()
+
+        for i in range(self.size):
+            host_copy[i] *= scale
+
+        ctx.enqueue_copy(self.storage, host_copy)
+        ctx.synchronize()
 
     @staticmethod
     fn random(
