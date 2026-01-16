@@ -2,11 +2,11 @@
 
 ## Overview
 
-The `dynamic_tensor.mojo` module provides a fully dynamic tensor implementation with GPU acceleration for arbitrary-rank tensor operations. Unlike compile-time tensor libraries, this allows complete flexibility at runtime for shape, rank, and stride operations.
+The `dense_tensor.mojo` module provides a fully dynamic tensor implementation with GPU acceleration for arbitrary-rank tensor operations. Unlike compile-time tensor libraries, this allows complete flexibility at runtime for shape, rank, and stride operations.
 
 ## Core Features
 
-### 1. DynamicTensor Struct
+### 1. DenseTensor Struct
 
 A runtime-flexible tensor that supports:
 - **Arbitrary rank** (1D, 2D, 3D, 4D, ..., ND)
@@ -18,7 +18,7 @@ A runtime-flexible tensor that supports:
 
 ### 2. Generalized Tensor Dot Product (`dense_tensor_dot`)
 
-**File**: `src/m_tensor/dynamic_tensor.mojo`
+**File**: `src/m_tensor/dense_tensor.mojo`
 
 #### Key Capabilities:
 - **ND × ND tensor contractions** (not limited to 2D!)
@@ -31,9 +31,9 @@ A runtime-flexible tensor that supports:
 #### Algorithm Overview:
 ```mojo
 fn dense_tensor_dot(
-    C: DynamicTensor,           # Output (pre-allocated)
-    var A: DynamicTensor,        # First input
-    var B: DynamicTensor,        # Second input
+    C: DenseTensor,           # Output (pre-allocated)
+    var A: DenseTensor,        # First input
+    var B: DenseTensor,        # Second input
     ctx: DeviceContext,          # GPU context
     ndim_mult: Int = 1,          # Number of axes to contract
     axrange_A: Bool = False,     # False=trailing, True=leading
@@ -64,9 +64,9 @@ For **tensor network conventions** (leading × trailing), explicitly set:
 ```mojo
 with DeviceContext() as ctx:
     # A[3, 4] @ B[4, 5] = C[3, 5]
-    var A = create_dynamic_tensor(ctx, List[Int](3, 4)^, init_value=2.0)
-    var B = create_dynamic_tensor(ctx, List[Int](4, 5)^, init_value=3.0)
-    var C = create_dynamic_tensor(ctx, List[Int](3, 5)^, init_value=0.0)
+    var A = create_dense_tensor(ctx, List[Int](3, 4)^, init_value=2.0)
+    var B = create_dense_tensor(ctx, List[Int](4, 5)^, init_value=3.0)
+    var C = create_dense_tensor(ctx, List[Int](3, 5)^, init_value=0.0)
     
     dense_tensor_dot(C, A^, B^, ctx)
     # Result: Each C[i,j] = sum_k A[i,k] * B[k,j] = 4 * (2.0 * 3.0) = 24.0
@@ -77,9 +77,9 @@ with DeviceContext() as ctx:
 with DeviceContext() as ctx:
     # A[2, 3, 4] @ B[4, 5, 6] = C[2, 3, 5, 6]
     # Contracts A's last axis (4) with B's first axis (4)
-    var A = create_dynamic_tensor(ctx, List[Int](2, 3, 4)^, init_value=1.5)
-    var B = create_dynamic_tensor(ctx, List[Int](4, 5, 6)^, init_value=2.0)
-    var C = create_dynamic_tensor(ctx, List[Int](2, 3, 5, 6)^, init_value=0.0)
+    var A = create_dense_tensor(ctx, List[Int](2, 3, 4)^, init_value=1.5)
+    var B = create_dense_tensor(ctx, List[Int](4, 5, 6)^, init_value=2.0)
+    var C = create_dense_tensor(ctx, List[Int](2, 3, 5, 6)^, init_value=0.0)
     
     dense_tensor_dot(C, A^, B^, ctx, ndim_mult=1)
     # Result shape: (2, 3, 5, 6) with 360 elements
@@ -91,9 +91,9 @@ with DeviceContext() as ctx:
 with DeviceContext() as ctx:
     # A[4, 3, 2, 1] @ B[1, 2, 5, 7] = C[4, 3, 5, 7]
     # Contracts A's last 2 axes (2,1) with B's first 2 axes (1,2)
-    var A = create_dynamic_tensor(ctx, List[Int](4, 3, 2, 1)^, init_value=2.0)
-    var B = create_dynamic_tensor(ctx, List[Int](1, 2, 5, 7)^, init_value=3.0)
-    var C = create_dynamic_tensor(ctx, List[Int](4, 3, 5, 7)^, init_value=0.0)
+    var A = create_dense_tensor(ctx, List[Int](4, 3, 2, 1)^, init_value=2.0)
+    var B = create_dense_tensor(ctx, List[Int](1, 2, 5, 7)^, init_value=3.0)
+    var C = create_dense_tensor(ctx, List[Int](4, 3, 5, 7)^, init_value=0.0)
     
     dense_tensor_dot(C, A^, B^, ctx, ndim_mult=2)
     # Contracts: A.shape[2,3]=(2,1) with B.shape[0,1]=(1,2) [reversed order!]
@@ -105,9 +105,9 @@ with DeviceContext() as ctx:
 with DeviceContext() as ctx:
     # A[k, m, n] @ B[p, q, k] = C[m, n, p, q]
     # Contract first axis of A with last axis of B
-    var A = create_dynamic_tensor(ctx, List[Int](3, 4, 5)^)
-    var B = create_dynamic_tensor(ctx, List[Int](6, 7, 3)^)
-    var C = create_dynamic_tensor(ctx, List[Int](4, 5, 6, 7)^)
+    var A = create_dense_tensor(ctx, List[Int](3, 4, 5)^)
+    var B = create_dense_tensor(ctx, List[Int](6, 7, 3)^)
+    var C = create_dense_tensor(ctx, List[Int](4, 5, 6, 7)^)
     
     dense_tensor_dot(C, A^, B^, ctx, ndim_mult=1, 
                    axrange_A=True,   # Contract A's leading axis
@@ -151,20 +151,20 @@ with DeviceContext() as ctx:
 
 ```mojo
 # Create tensor with automatic stride calculation
-fn create_dynamic_tensor(
+fn create_dense_tensor(
     ctx: DeviceContext, 
     var shape: List[Int], 
     row_major: Bool = True,
     init_value: Float32 = 0.0
-) raises -> DynamicTensor
+) raises -> DenseTensor
 
 # Create from existing data
-fn create_dynamic_tensor_from_data(
+fn create_dense_tensor_from_data(
     ctx: DeviceContext, 
     data: List[Float32],
     var shape: List[Int], 
     row_major: Bool = True
-) raises -> DynamicTensor
+) raises -> DenseTensor
 ```
 
 **Row-major** (default) means the last dimension changes fastest:
@@ -177,14 +177,14 @@ fn create_dynamic_tensor_from_data(
 
 #### Transpose
 ```mojo
-fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DynamicTensor
+fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DenseTensor
 ```
 - For 2D tensors: Performs physical transpose (copies data)
 - For ND tensors: Creates stride-based view (no copy)
 
 #### Flatten Dimensions
 ```mojo
-fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DynamicTensor
+fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DenseTensor
 ```
 - Combines consecutive dimensions: `[2, 3, 4, 5]` → flatten `[1,3)` → `[2, 12, 5]`
 - Creates a view (no data copy)
@@ -192,14 +192,14 @@ fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> Dy
 
 #### Check Contiguity
 ```mojo
-fn is_contiguous(self: DynamicTensor) -> Bool
+fn is_contiguous(self: DenseTensor) -> Bool
 ```
 - Verifies row-major contiguous layout
 - Important for GPU performance
 
 #### Make Contiguous
 ```mojo
-fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> DynamicTensor
+fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> DenseTensor
 ```
 - Returns self if already contiguous (no copy)
 - Otherwise allocates and copies to contiguous layout
@@ -237,7 +237,7 @@ The implementation carefully manages GPU memory ownership:
 
 ```mojo
 # 1. Original tensors own their DeviceBuffer storage
-var A = create_dynamic_tensor(ctx, shape_A^)  # A owns storage
+var A = create_dense_tensor(ctx, shape_A^)  # A owns storage
 
 # 2. Get non-owning pointer for NDBuffer creation
 var ptr_A = A_flat.storage.unsafe_ptr()  # Non-owning pointer
@@ -246,14 +246,14 @@ var ptr_A = A_flat.storage.unsafe_ptr()  # Non-owning pointer
 var shape_Af = IndexList[2](A_flat.shape[0], A_flat.shape[1])
 var ndbuf_A = NDBuffer[dtype, 2, MutableAnyOrigin](ptr_A, shape_Af)
 
-# 4. NDBuffer is dropped after matmul, but storage remains in DynamicTensor
-# 5. DynamicTensor cleans up GPU memory when it goes out of scope
+# 4. NDBuffer is dropped after matmul, but storage remains in DenseTensor
+# 5. DenseTensor cleans up GPU memory when it goes out of scope
 ```
 
 **Key Points**:
 - Use `unsafe_ptr()` for non-owning pointers (not `take_ptr()`)
 - `NDBuffer` is a view that doesn't manage memory lifetime
-- Original `DynamicTensor` retains ownership via RAII
+- Original `DenseTensor` retains ownership via RAII
 - No use-after-free or double-free issues
 
 ### Two-Stage Flattening Algorithm

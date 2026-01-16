@@ -9,10 +9,16 @@ from buffer.buffer import NDBuffer
 from memory.unsafe_pointer import UnsafePointer
 import linalg
 from linalg.qr_factorization import qr_factorization, form_q
+from random import random_float64
+from math import sqrt
+from src.mylinalg.backend import SVDBackend
+from src.mylinalg.matrix import MatrixF64
+from src.mylinalg.svd import svd_f64
+from src.mylinalg.types import Layout as LapackLayout
 
-## Fully dynamic tensor with runtime-determined rank, shape, and stride
+## Fully dense tensor with runtime-determined rank, shape, and stride
 @fieldwise_init
-struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
+struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     """A tensor where rank, shape, and stride are all determined at runtime.
     
     Unlike DenseTensor which requires compile-time Layout parameter, this tensor
@@ -27,7 +33,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     var size: Int  # Total number of elements
 
     fn __init__(out self, storage: DeviceBuffer[dtype], var shape: List[Int], var stride: List[Int]):
-        """Initialize a dynamic tensor with runtime parameters.
+        """Initialize a dense tensor with runtime parameters.
         
         Args:
             storage: Device buffer containing the tensor data.
@@ -45,7 +51,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         self.size = total_size
 
     fn __copyinit__(out self, existing: Self):
-        """Copy constructor for DynamicTensor.
+        """Copy constructor for DenseTensor.
         
         Creates a new tensor that shares the same GPU storage but has independent
         shape, stride, and size metadata. This is a shallow copy - the underlying
@@ -62,7 +68,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     fn write_to[W: Writer](self, mut writer: W) -> None:
         """Write tensor information to a writer."""
         var rank = len(self.shape)
-        writer.write("DynamicTensor[rank=")
+        writer.write("DenseTensor[rank=")
         writer.write(rank)
         writer.write(", shape=(")
         for i in range(rank):
@@ -80,7 +86,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         ctx.synchronize()
 
         var rank = len(self.shape)
-        print("DynamicTensor with rank ", rank, " and shape ", end="")
+        print("DenseTensor with rank ", rank, " and shape ", end="")
         print("(", end="")
         for i, elem in enumerate(self.shape):
             if i > 0:
@@ -121,7 +127,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             flat_idx += indices[i] * self.stride[i]
         return flat_idx
 
-    fn is_contiguous(self: DynamicTensor) -> Bool:
+    fn is_contiguous(self: DenseTensor) -> Bool:
         """Check if tensor memory layout is contiguous in row-major order.
         
         A contiguous tensor means elements are stored sequentially in memory without gaps.
@@ -138,16 +144,18 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             True if the tensor is contiguous in row-major order, False otherwise.
         
         Example:
-            ```mojo
+            ```
+            
+            mojo
             # Contiguous tensor
             var shape = List[Int](3, 4)
-            var tensor = create_dynamic_tensor(ctx, shape^)
+            var tensor = create_dense_tensor(ctx, shape^)
             print(tensor.is_contiguous())  # True, strides are [4, 1]
             
             # Non-contiguous after slicing or view operations
             var transposed = tensor^.transpose(List[Int](1, 0), ctx)
             print(transposed.is_contiguous())  # Might be False
-            ```
+            
         """
         var expected_stride = 1
         for i in range(len(self.shape) - 1, -1, -1):
@@ -156,7 +164,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             expected_stride *= self.shape[i]
         return True
 
-    fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> DynamicTensor[dtype]:
+    fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> DenseTensor[dtype]:
         """Create a contiguous copy of the tensor in row-major order.
         
         If the tensor is already contiguous, transfers ownership without copying.
@@ -172,7 +180,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             ctx: Device context for GPU memory operations.
         
         Returns:
-            A new DynamicTensor with contiguous row-major layout.
+            A new DenseTensor with contiguous row-major layout.
         
         Raises:
             Error: If GPU memory allocation or copy fails.
@@ -182,17 +190,15 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             (e.g., after advanced slicing), a more complex reorganization kernel
             would be needed.
         
-        Example:
-            ```mojo
+        Example:mojo
             # Create a tensor and transpose it (may become non-contiguous)
-            var tensor = create_dynamic_tensor(ctx, List[Int](4, 3)^)
+            var tensor = create_dense_tensor(ctx, List[Int](4, 3)^)
             var perm = List[Int](1, 0)
             var transposed = tensor^.transpose(perm, ctx)
             
             # Make it contiguous for efficient operations
             var contiguous = transposed^.copy_to_contiguous(ctx)
             print(contiguous.is_contiguous())  # True
-            ```
         """
         if self.is_contiguous():
             return self^  # No copy needed, transfer ownership
@@ -207,9 +213,9 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         ctx.enqueue_copy(new_storage, self.storage)
         ctx.synchronize()
 
-        return DynamicTensor[dtype](new_storage, new_shape^, new_strides^)
+        return DenseTensor[dtype](new_storage, new_shape^, new_strides^)
 
-    fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DynamicTensor[dtype]:
+    fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DenseTensor[dtype]:
         """Transpose tensor dimensions according to a permutation.
         
         Reorders the dimensions of the tensor according to the permutation list.
@@ -227,15 +233,14 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             ctx: Device context for GPU operations (used for 2D transpose copy).
         
         Returns:
-            A new DynamicTensor with transposed dimensions.
+            A new DenseTensor with transposed dimensions.
         
         Raises:
             Error: If perm length doesn't match tensor rank.
         
-        Example:
-            ```mojo
+        Example:mojo
             # 2D matrix transpose (standard transpose)
-            var matrix = create_dynamic_tensor_from_data(
+            var matrix = create_dense_tensor_from_data(
                 ctx,
                 List[Float32](1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
                 List[Int](2, 3)^  # Shape: [2, 3]
@@ -251,12 +256,11 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             #          [3, 6]]
             
             # 3D tensor transpose
-            var tensor_3d = create_dynamic_tensor(ctx, List[Int](2, 3, 4)^)
+            var tensor_3d = create_dense_tensor(ctx, List[Int](2, 3, 4)^)
             var perm_3d = List[Int](2, 0, 1)  # Move last dim to front
             var transposed_3d = tensor_3d^.transpose(perm_3d, ctx)
             # Original shape: [2, 3, 4]
             # Result shape:   [4, 2, 3]
-            ```
         """
         var rank = len(self.shape)
         if len(perm) != rank:
@@ -288,7 +292,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             ctx.enqueue_copy(new_storage, host_dst)
             ctx.synchronize()
             
-            return DynamicTensor[dtype](new_storage, new_shape^, new_strides^)
+            return DenseTensor[dtype](new_storage, new_shape^, new_strides^)
         else:
             # For other permutations, create a view (stride-based)
             # This doesn't copy data, just reinterprets layout
@@ -298,9 +302,9 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
                 new_shape.append(self.shape[perm[i]])
                 new_stride.append(self.stride[perm[i]])
             
-            return DynamicTensor[dtype](self.storage^, new_shape^, new_stride^)
+            return DenseTensor[dtype](self.storage^, new_shape^, new_stride^)
 
-    fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DynamicTensor[dtype]:
+    fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DenseTensor[dtype]:
         """Flatten a contiguous range of dimensions into a single dimension.
         
         Combines multiple consecutive dimensions into one by multiplying their sizes.
@@ -317,7 +321,7 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             ctx: Device context (currently unused but kept for API consistency).
         
         Returns:
-            A new DynamicTensor with the specified dimensions flattened.
+            A new DenseTensor with the specified dimensions flattened.
         
         Raises:
             Error: If start < 0, end > rank, or start >= end.
@@ -326,10 +330,9 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             This creates a view with recomputed strides. No data is copied.
             The underlying storage is shared with the original tensor.
         
-        Example:
-            ```mojo
+        Example:mojo
             # Flatten middle dimensions of a 4D tensor
-            var tensor_4d = create_dynamic_tensor(ctx, List[Int](2, 3, 4, 5)^)
+            var tensor_4d = create_dense_tensor(ctx, List[Int](2, 3, 4, 5)^)
             # Original shape: [2, 3, 4, 5]
             
             # Flatten dimensions 1 and 2 (indices 1 and 2, i.e., 3 and 4)
@@ -337,17 +340,16 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             # Result shape: [2, 12, 5]  (3*4=12)
             
             # Flatten all dimensions (convert to 1D vector)
-            var tensor_3d = create_dynamic_tensor(ctx, List[Int](2, 3, 4)^)
+            var tensor_3d = create_dense_tensor(ctx, List[Int](2, 3, 4)^)
             var vector = tensor_3d^.flatten_dims(0, 3, ctx)
             # Original shape: [2, 3, 4]
             # Result shape:   [24]  (2*3*4=24)
             
             # Flatten last two dimensions (useful for batched matrix ops)
-            var batched = create_dynamic_tensor(ctx, List[Int](8, 5, 10)^)
+            var batched = create_dense_tensor(ctx, List[Int](8, 5, 10)^)
             var flat_batch = batched^.flatten_dims(1, 3, ctx)
             # Original shape: [8, 5, 10]  (batch of 8 matrices)
             # Result shape:   [8, 50]     (batch of 8 vectors)
-            ```
         """
         if start < 0 or end > len(self.shape) or start >= end:
             raise Error("Invalid flatten range")
@@ -367,7 +369,71 @@ struct DynamicTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         var new_strides = compute_row_major_strides(new_shape, len(new_shape))
         
         # Return a view with updated shape/stride (no data copy)
-        return DynamicTensor[dtype](self.storage^, new_shape^, new_strides^)
+        return DenseTensor[dtype](self.storage^, new_shape^, new_strides^)
+
+    fn reshape(var self, var new_shape: List[Int]) raises -> DenseTensor[dtype]:
+        """Return a tensor view with a different shape but identical storage."""
+        if len(new_shape) == 0:
+            raise Error("Reshape requires rank >= 1")
+
+        var total = 1
+        for dim in new_shape:
+            if dim < 1:
+                raise Error("Reshape dimensions must be positive, got " + String(dim))
+            total *= dim
+
+        if total != self.size:
+            raise Error(
+                "Reshape size mismatch: original "
+                + String(self.size)
+                + " vs new "
+                + String(total)
+            )
+
+        var rank = len(new_shape)
+        var new_strides = compute_row_major_strides(new_shape, rank)
+        return DenseTensor[dtype](self.storage^, new_shape^, new_strides^)
+
+    fn norm(self, ctx: DeviceContext) raises -> Float64:
+        """Compute the Frobenius norm by copying data to host memory."""
+        if self.size == 0:
+            return 0.0
+
+        var host_copy = ctx.enqueue_create_host_buffer[Self.dtype](self.size)
+        ctx.enqueue_copy(host_copy, self.storage)
+        ctx.synchronize()
+
+        var accum = 0.0
+        for i in range(self.size):
+            var value = Float64(host_copy[i])
+            accum += value * value
+
+        return sqrt(accum)
+
+    fn scale_in_place(var self, scale: Scalar[dtype], ctx: DeviceContext) raises -> None:
+        """Scale tensor entries by a scalar factor in-place."""
+        # TODO: Implement in-place scaling for GPU kernels or maybe SIMD handles it already search?
+        if self.size == 0:
+            return
+
+        var host_copy = ctx.enqueue_create_host_buffer[Self.dtype](self.size)
+        ctx.enqueue_copy(host_copy, self.storage)
+        ctx.synchronize()
+
+        for i in range(self.size):
+            host_copy[i] *= scale
+
+        ctx.enqueue_copy(self.storage, host_copy)
+        ctx.synchronize()
+
+    @staticmethod
+    fn random(
+        ctx: DeviceContext,
+        var shape: List[Int],
+        row_major: Bool = True
+    ) raises -> DenseTensor[dtype]:
+        """Create a tensor filled with random values in [0, 1)."""
+        return create_dense_tensor[dtype](ctx, shape^, row_major=row_major)
 
 
 
@@ -419,28 +485,22 @@ fn compute_column_major_strides(shape: List[Int], rank: Int) -> List[Int]:
     return strides.copy()
 
 
-fn create_dynamic_tensor[dtype: DType = DType.float32](
+fn create_dense_tensor[dtype: DType = DType.float32](
     ctx: DeviceContext, 
     var shape: List[Int], 
     row_major: Bool = True,
-    init_value: Scalar[dtype] = 0.0
-) raises -> DynamicTensor[dtype]:
-    """Create a dynamic tensor with runtime-determined rank, shape, and stride.
+    init_value: Optional[Scalar[dtype]] = None  # None for random init
+) raises -> DenseTensor[dtype]:
+    """Create a dense tensor with runtime-determined rank, shape, and stride.
     
     Args:
         ctx: Device context for GPU operations.
         shape: List of dimensions (length should be rank).
-        rank: Number of dimensions.
         row_major: If True, use row-major stride; otherwise column-major.
-        init_value: Initial value to fill the tensor.
+        init_value: Initial value to fill the tensor. If None, initialize with random values in [0,1).
     
     Returns:
-        DynamicTensor with allocated GPU storage.
-    
-    Example:
-        var shape = List[Int](3, 4, 5)  # 3D tensor
-        var tensor = create_dynamic_tensor(ctx, shape, 3)
-        # Creates a 3x4x5 tensor with row-major layout.
+        DenseTensor with allocated GPU storage.
     """
     # Compute total size
     var total_size = 1
@@ -457,23 +517,28 @@ fn create_dynamic_tensor[dtype: DType = DType.float32](
     
     # Allocate and initialize host buffer
     var host_storage = ctx.enqueue_create_host_buffer[dtype](total_size)
-    for i in range(total_size):
-        host_storage[i] = init_value
+    if init_value is None:
+        for i in range(total_size):
+            host_storage[i] = Scalar[dtype](random_float64())  # Random in [0,1)
+    else:
+        var value = init_value.value()
+        for i in range(total_size):
+            host_storage[i] = value
     
     # Copy to device
     var device_storage = ctx.enqueue_create_buffer[dtype](total_size)
     ctx.enqueue_copy(device_storage, host_storage)
     
-    return DynamicTensor[dtype](device_storage, shape^, strides^)
+    return DenseTensor[dtype](device_storage, shape^, strides^)
 
 
-fn create_dynamic_tensor_from_data[dtype: DType = DType.float32](
+fn create_dense_tensor_from_data[dtype: DType = DType.float32](
     ctx: DeviceContext, 
     data: List[Scalar[dtype]],
     var shape: List[Int], 
     row_major: Bool = True
-) raises -> DynamicTensor[dtype]:
-    """Create a dynamic tensor from existing data.
+) raises -> DenseTensor[dtype]:
+    """Create a dense tensor from existing data.
     
     Args:
         ctx: Device context for GPU operations.
@@ -483,12 +548,12 @@ fn create_dynamic_tensor_from_data[dtype: DType = DType.float32](
         row_major: If True, use row-major stride; otherwise column-major.
     
     Returns:
-        DynamicTensor with data copied to GPU.
+        DenseTensor with data copied to GPU.
     
     Example:
         var data = List[Float32](1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
         var shape = List[Int](2, 3)  # 2x3 matrix
-        var tensor = create_dynamic_tensor_from_data(ctx, data, shape, 2).
+        var tensor = create_dense_tensor_from_data(ctx, data, shape, 2).
     """
     # Verify data size matches shape
     var expected_size = 1
@@ -515,55 +580,9 @@ fn create_dynamic_tensor_from_data[dtype: DType = DType.float32](
     var device_storage = ctx.enqueue_create_buffer[dtype](data_size)
     ctx.enqueue_copy(device_storage, host_storage)
     
-    return DynamicTensor[dtype](device_storage, shape^, strides^)
+    return DenseTensor[dtype](device_storage, shape^, strides^)
 
-# fn dense_tensor_dot(C: DynamicTensor, A: DynamicTensor, B: DynamicTensor, ctx: Optional[DeviceContext]) raises:
-#     """Perform matrix multiplication C = A @ B using GPU acceleration.
-    
-#     Args:
-#         C: Output tensor (must be properly sized for result)
-#         A: Left input tensor 
-#         B: Right input tensor
-#         ctx: Device context for GPU operations
-        
-#     Note: Currently only supports rank-2 (matrix) operations.
-#     """
-#     if not ctx:
-#         raise Error("GPU context required for dense_tensor_dot")
-    
-#     var rank_A = len(A.shape)
-#     var rank_B = len(B.shape)
-#     var rank_C = len(C.shape)
-    
-#     # For now, only support 2D matrix multiplication
-#     if rank_A != 2 or rank_B != 2 or rank_C != 2:
-#         raise Error("Only 2D matrix multiplication is currently supported")
-    
-#     # Create NDBuffers from DynamicTensor storage
-#     # NDBuffer needs: pointer, dynamic_shape
-#     var shape_A = IndexList[2](A.shape[0], A.shape[1])
-#     var shape_B = IndexList[2](B.shape[0], B.shape[1])
-#     var shape_C = IndexList[2](C.shape[0], C.shape[1])
-    
-#     # Get non-owning pointers from DeviceBuffer using unsafe_ptr()
-#     # This follows RAII principles - the original DynamicTensor retains ownership
-#     var ptr_A = A.storage.unsafe_ptr()
-#     var ptr_B = B.storage.unsafe_ptr()
-#     var ptr_C = C.storage.unsafe_ptr()
-    
-#     # Create NDBuffers with rank=2
-#     # These NDBuffers are non-owning views - they don't free memory when dropped
-#     var ndbuf_A = NDBuffer[dtype, 2, MutAnyOrigin](ptr_A, shape_A)
-#     var ndbuf_B = NDBuffer[dtype, 2, MutAnyOrigin](ptr_B, shape_B)
-#     var ndbuf_C = NDBuffer[mut=True, dtype, 2, MutAnyOrigin](ptr_C, shape_C)
-    
-#     # Call matmul with NDBuffers
-#     # The inplace operation modifies C's underlying storage through the non-owning pointer
-#     linalg.matmul.matmul[target="gpu"](ndbuf_C, ndbuf_A, ndbuf_B, ctx)
-
-
-
-fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A: DynamicTensor[dtype], var B: DynamicTensor[dtype], ctx: DeviceContext, ndim_mult: Int = 1, axrange_A: Bool = False, axrange_B: Bool = False) raises:  # axrange False=trailing, True=leading
+fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: DenseTensor[dtype], var B: DenseTensor[dtype], ctx: DeviceContext, ndim_mult: Int = 1, axrange_A: Bool = False, axrange_B: Bool = False) raises:  # axrange False=trailing, True=leading
     """Perform generalized tensor dot product (contraction) on GPU.
     
     This function implements Einstein summation-style tensor contraction by:
@@ -607,14 +626,13 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
         Error: If contracted dimensions don't match in size.
         Error: If C doesn't have the correct shape for the result.
     
-    Examples:
-        ```mojo
+    Examples:mojo
         # Example 1: Standard 2D matrix multiplication
         # A[3, 4] @ B[4, 5] = C[3, 5]
         with DeviceContext() as ctx:
-            var A = create_dynamic_tensor(ctx, List[Int](3, 4)^, init_value=2.0)
-            var B = create_dynamic_tensor(ctx, List[Int](4, 5)^, init_value=3.0)
-            var C = create_dynamic_tensor(ctx, List[Int](3, 5)^, init_value=0.0)
+            var A = create_dense_tensor(ctx, List[Int](3, 4)^, init_value=2.0)
+            var B = create_dense_tensor(ctx, List[Int](4, 5)^, init_value=3.0)
+            var C = create_dense_tensor(ctx, List[Int](3, 5)^, init_value=0.0)
             
             dense_tensor_dot(C, A^, B^, ctx)
             # C now contains the result of A @ B
@@ -624,9 +642,9 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
         # A[2, 3, 4] @ B[4, 5, 6] = C[2, 3, 5, 6]
         # Contracts A's last axis (4) with B's first axis (4)
         with DeviceContext() as ctx:
-            var A_3d = create_dynamic_tensor(ctx, List[Int](2, 3, 4)^, init_value=1.5)
-            var B_3d = create_dynamic_tensor(ctx, List[Int](4, 5, 6)^, init_value=2.0)
-            var C_4d = create_dynamic_tensor(ctx, List[Int](2, 3, 5, 6)^, init_value=0.0)
+            var A_3d = create_dense_tensor(ctx, List[Int](2, 3, 4)^, init_value=1.5)
+            var B_3d = create_dense_tensor(ctx, List[Int](4, 5, 6)^, init_value=2.0)
+            var C_4d = create_dense_tensor(ctx, List[Int](2, 3, 5, 6)^, init_value=0.0)
             
             dense_tensor_dot(C_4d, A_3d^, B_3d^, ctx, ndim_mult=1)
             # C now contains the 4D result
@@ -638,9 +656,9 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
         # Result C[2, 3, 6, 7]
         # This contracts 2 dimensions (4 and 5) between A and B
         with DeviceContext() as ctx:
-            var A_4d = create_dynamic_tensor(ctx, List[Int](2, 3, 4, 5)^)
-            var B_4d = create_dynamic_tensor(ctx, List[Int](4, 5, 6, 7)^)
-            var C_4d = create_dynamic_tensor(ctx, List[Int](2, 3, 6, 7)^)
+            var A_4d = create_dense_tensor(ctx, List[Int](2, 3, 4, 5)^)
+            var B_4d = create_dense_tensor(ctx, List[Int](4, 5, 6, 7)^)
+            var C_4d = create_dense_tensor(ctx, List[Int](2, 3, 6, 7)^)
             
             # Contract last 2 dims of A with first 2 dims of B
             dense_tensor_dot(C_4d, A_4d^, B_4d^, ctx, ndim_mult=2)
@@ -650,9 +668,9 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
         # Contract leading axes of A with trailing axes of B (common in quantum chemistry)
         with DeviceContext() as ctx:
             # A[k, m, n] @ B[p, q, k] = C[m, n, p, q]
-            var A_tn = create_dynamic_tensor(ctx, List[Int](3, 4, 5)^)
-            var B_tn = create_dynamic_tensor(ctx, List[Int](6, 7, 3)^)
-            var C_tn = create_dynamic_tensor(ctx, List[Int](4, 5, 6, 7)^)
+            var A_tn = create_dense_tensor(ctx, List[Int](3, 4, 5)^)
+            var B_tn = create_dense_tensor(ctx, List[Int](6, 7, 3)^)
+            var C_tn = create_dense_tensor(ctx, List[Int](4, 5, 6, 7)^)
             
             # Contract first axis of A (size 3) with last axis of B (size 3)
             dense_tensor_dot(C_tn, A_tn^, B_tn^, ctx, ndim_mult=1, 
@@ -662,19 +680,18 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
         # Example 5: Standard vs Tensor Network notation comparison
         with DeviceContext() as ctx:
             # Standard linear algebra: A[m,k] @ B[k,n] (default)
-            var A_std = create_dynamic_tensor(ctx, List[Int](3, 4)^)
-            var B_std = create_dynamic_tensor(ctx, List[Int](4, 5)^)
-            var C_std = create_dynamic_tensor(ctx, List[Int](3, 5)^)
+            var A_std = create_dense_tensor(ctx, List[Int](3, 4)^)
+            var B_std = create_dense_tensor(ctx, List[Int](4, 5)^)
+            var C_std = create_dense_tensor(ctx, List[Int](3, 5)^)
             dense_tensor_dot(C_std, A_std^, B_std^, ctx)  # Uses defaults
             
             # Tensor network style: A[k,m] @ B[n,k] 
             # Need to explicitly set parameters:
-            var A_tn2 = create_dynamic_tensor(ctx, List[Int](4, 3)^)
-            var B_tn2 = create_dynamic_tensor(ctx, List[Int](5, 4)^)
-            var C_tn2 = create_dynamic_tensor(ctx, List[Int](3, 5)^)
+            var A_tn2 = create_dense_tensor(ctx, List[Int](4, 3)^)
+            var B_tn2 = create_dense_tensor(ctx, List[Int](5, 4)^)
+            var C_tn2 = create_dense_tensor(ctx, List[Int](3, 5)^)
             dense_tensor_dot(C_tn2, A_tn2^, B_tn2^, ctx, ndim_mult=1,
                            axrange_A=True, axrange_B=False)
-        ```
     
     Performance Notes:
         - Uses GPU-accelerated matrix multiplication (linalg.matmul)
@@ -767,27 +784,66 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     var A_contig = A^.copy_to_contiguous(ctx)
     var B_contig = B^.copy_to_contiguous(ctx)
 
-    # Flatten non-contracted dimensions first
-    var A_flat_step1 = A_contig^.flatten_dims(A_noncont_start, A_noncont_end, ctx)
-    var B_flat_step1 = B_contig^.flatten_dims(B_noncont_start, B_noncont_end, ctx)
+    # Flatten non-contracted dimensions first (skip if range is empty)
+    var A_flat_step1: DenseTensor[dtype]
+    if A_noncont_start < A_noncont_end:
+        A_flat_step1 = A_contig^.flatten_dims(A_noncont_start, A_noncont_end, ctx)
+    else:
+        # No non-contracted dims (all dims are contracted) - use as-is
+        A_flat_step1 = A_contig^
+    
+    var B_flat_step1: DenseTensor[dtype]
+    if B_noncont_start < B_noncont_end:
+        B_flat_step1 = B_contig^.flatten_dims(B_noncont_start, B_noncont_end, ctx)
+    else:
+        # No non-contracted dims (all dims are contracted) - use as-is
+        B_flat_step1 = B_contig^
     
     # Now flatten the contracted dimensions
     # For A: if axrange_A is False (trailing), non-contracted are [0, rank-ndim], contracted are [rank-ndim, rank]
     #        After flattening non-contracted [0, rank-ndim), contracted dims are now at [1, 1+ndim_mult)
     # For A: if axrange_A is True (leading), non-contracted are [ndim, rank], contracted are [0, ndim]
     #        After flattening non-contracted [ndim, rank), contracted dims are still at [0, ndim_mult)
-    var A_contract_start = 1 if not axrange_A else 0
-    var A_contract_end = A_contract_start + ndim_mult
+    var A_contract_start: Int
+    var A_contract_end: Int
+    if A_noncont_start < A_noncont_end:
+        # Had non-contracted dims, so contracted dims shifted
+        A_contract_start = 1 if not axrange_A else 0
+        A_contract_end = A_contract_start + ndim_mult
+    else:
+        # All dims are contracted, they're at [0, ndim_mult)
+        A_contract_start = 0
+        A_contract_end = ndim_mult
     
     # For B: if effective_axrange_B is True (leading), contracted are [0, ndim], non-contracted are [ndim, rank]
     #        After flattening non-contracted [ndim, rank), contracted dims are still at [0, ndim_mult)
     # For B: if effective_axrange_B is False (trailing), non-contracted are [0, rank-ndim], contracted are [rank-ndim, rank]
     #        After flattening non-contracted [0, rank-ndim), contracted dims are now at [1, 1+ndim_mult)
-    var B_contract_start = 0 if effective_axrange_B else 1
-    var B_contract_end = B_contract_start + ndim_mult
+    var B_contract_start: Int
+    var B_contract_end: Int
+    if B_noncont_start < B_noncont_end:
+        # Had non-contracted dims
+        B_contract_start = 0 if effective_axrange_B else 1
+        B_contract_end = B_contract_start + ndim_mult
+    else:
+        # All dims are contracted (e.g., 1D vector), they're at [0, ndim_mult)
+        B_contract_start = 0
+        B_contract_end = ndim_mult
     
     var A_flat = A_flat_step1^.flatten_dims(A_contract_start, A_contract_end, ctx)  # Now 2D: m x k or k x m
     var B_flat = B_flat_step1^.flatten_dims(B_contract_start, B_contract_end, ctx)  # Now 2D: k x n or n x k
+    
+    # Handle 1D tensors: if B_flat is still 1D after flattening, reshape to 2D column vector
+    if len(B_flat.shape) == 1:
+        # Reshape (k,) to (k, 1) for matrix multiplication
+        var B_flat_2d = B_flat^.reshape(List[Int](B_flat.shape[0], 1))
+        B_flat = B_flat_2d^
+    
+    # Handle 1D tensors: if A_flat is still 1D after flattening, reshape to 2D row vector
+    if len(A_flat.shape) == 1:
+        # Reshape (m,) to (1, m) for matrix multiplication
+        var A_flat_2d = A_flat^.reshape(List[Int](1, A_flat.shape[0]))
+        A_flat = A_flat_2d^
 
     # Transpose if leading (to make row-major inner contract)
     var trans_A = axrange_A
@@ -807,12 +863,39 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     for i in range(len(B_shape_for_C)):
         C_shape_expected.append(B_shape_for_C[i])
     
+    # Special case: scalar result (rank 0) can be represented as (1,) in Mojo
+    # This happens when both A and B are 1D and we contract their only axes
+    var is_scalar_result = len(C_shape_expected) == 0
+    var C_shape_actual = C.shape.copy()
+    
+    # Helper to format shape list as string
+    fn format_shape(shape: List[Int]) -> String:
+        var s = String("[")
+        for i in range(len(shape)):
+            if i > 0:
+                s += ", "
+            s += String(shape[i])
+        s += "]"
+        return s
+    
     # Verify C has the correct shape
-    if len(C.shape) != len(C_shape_expected):
-        raise Error("Output tensor C has wrong rank")
-    for i in range(len(C_shape_expected)):
-        if C.shape[i] != C_shape_expected[i]:
-            raise Error("Output tensor C has wrong shape")
+    if is_scalar_result:
+        # Accept either [] (rank 0) or [1] (rank 1) as scalar representation
+        if len(C_shape_actual) == 0:
+            # True scalar - reshape C to (1,) for matmul compatibility
+            C_shape_actual = List[Int](1)
+        elif len(C_shape_actual) == 1 and C_shape_actual[0] == 1:
+            # Already (1,) - this is fine
+            pass
+        else:
+            raise Error("Output tensor C for scalar result must be [] or [1], got " + format_shape(C_shape_actual))
+    else:
+        # Non-scalar result: shapes must match exactly
+        if len(C_shape_actual) != len(C_shape_expected):
+            raise Error("Output tensor C has wrong rank: expected " + String(len(C_shape_expected)) + " got " + String(len(C_shape_actual)))
+        for i in range(len(C_shape_expected)):
+            if C_shape_actual[i] != C_shape_expected[i]:
+                raise Error("Output tensor C has wrong shape: expected " + format_shape(C_shape_expected) + " got " + format_shape(C_shape_actual))
 
     # Calculate the 2D shape for matrix multiplication
     # m = product of A's non-contracted dimensions
@@ -825,7 +908,7 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     # For contiguous row-major 2D tensor (m, n), strides are [n, 1]
     var C_flat_shape = List[Int](m, n)
     var C_flat_stride = List[Int](n, 1)
-    var C_flat = DynamicTensor[dtype](
+    var C_flat = DenseTensor[dtype](
         storage=C.storage,
         shape=C_flat_shape^,
         stride=C_flat_stride^
@@ -843,164 +926,28 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     # Call matmul (tiled shared mem kernel)
     # Result is written to C_flat, which shares storage with C
     # So C automatically gets the result in the correct ND shape
-    linalg.matmul.matmul[target="gpu"](ndbuf_C, ndbuf_A, ndbuf_B, Optional(ctx))
+    #
+    # IMPORTANT:
+    # In some MAX nightlies/environments, Float64 GPU matmul/GEMV offload can fail
+    # with a compiler error ("unhandled shuffle dtype"). To keep GPU execution
+    # reliable, we currently restrict this path to float32.
+    @parameter
+    if dtype == DType.float32:
+        linalg.matmul.matmul[target="gpu"](ndbuf_C, ndbuf_A, ndbuf_B, Optional(ctx))
+    else:
+        raise Error(
+            "dense_tensor_dot GPU matmul supports only DType.float32 on this setup. "
+            + "Use float32 for GPU execution (DMRG) or update MAX to a build that supports "
+            + "your dtype."
+        )
 
     # Grid: 2D (ceildiv(n, tile), ceildiv(m, tile)); Blocks: 2D (tile, tile) threads; Warps: tile/32 per dim, load tiles to shared, accumulate; Threads: each owns C element, loops over k/tilesize.
     # Tile typically 16/32 for float32.
-
-
-
-# fn dense_tensor_qr[dtype: DType = DType.float32](
-#     var tensor: DynamicTensor[dtype],
-#     ctx: DeviceContext
-# ) raises -> Tuple[DynamicTensor[dtype], DynamicTensor[dtype]]:
-#     """Compute the QR decomposition of a dense tensor using MAX API.
-    
-#     Performs QR factorization where a matrix A is decomposed into:
-#     - Q: An orthogonal matrix (Q^T @ Q = I)
-#     - R: An upper triangular matrix
-#     Such that A = Q @ R
-    
-#     Uses the Householder reflector method via MAX's linalg.qr_factorization,
-#     which is equivalent to LAPACK's geqrf + orgqr/ungqr approach.
-    
-#     Parameters:
-#         dtype: The data type of the tensor elements (default: DType.float32).
-    
-#     Args:
-#         tensor: Input dense tensor to decompose (must be 2D matrix).
-#         ctx: Device context for GPU operations.
-    
-#     Returns:
-#         A tuple (Q, R) where:
-#         - Q is the orthogonal matrix (m × m for full QR)
-#         - R is the upper triangular matrix (m × n)
-    
-#     Raises:
-#         Error: If the input tensor is not a 2D matrix.
-    
-#     Note:
-#         The input tensor must be a 2D matrix. QR decomposition is not
-#         defined for higher-rank tensors in this implementation.
-    
-#     Algorithm:
-#         1. Copy input matrix A (to preserve original)
-#         2. Call linalg.qr_factorization to compute Householder reflectors in-place
-#         3. Extract R from upper triangular part of factorized matrix
-#         4. Call linalg.form_q to generate orthogonal matrix Q
-    
-#     References:
-#         MAX API: https://docs.modular.com/mojo/kernels/linalg/qr_factorization/qr_factorization/
-#         https://docs.modular.com/mojo/kernels/linalg/qr_factorization/form_q/
-#     """
-#     # Require 2D matrix
-#     var rank = len(tensor.shape)
-#     if rank != 2:
-#         raise Error("QR decomposition requires a 2D matrix, got rank " + String(rank))
-    
-#     var m = tensor.shape[0]  # rows
-#     var n = tensor.shape[1]  # columns
-#     var k = min(m, n)
-    
-#     var tensor_shape_copy = tensor.shape.copy()
-#     # Create a copy of input tensor for in-place factorization
-#     # (to preserve original tensor)
-#     var A_factorized = create_dynamic_tensor[dtype](ctx, tensor_shape_copy^, init_value=0.0)
-    
-#     # Copy data from input tensor to A_factorized
-#     ctx.enqueue_copy(A_factorized.storage, tensor.storage)
-#     ctx.synchronize()
-    
-#     # Allocate sigma vector for Householder scaling factors
-#     var sigma_shape = List[Int](k)
-#     var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
-    
-#     # Create LayoutTensor views needed by MAX APIs
-#     # 2 Dimensional Row Major Layouts shape = 2 with stride = 1
-#     alias matrix_layout = Layout.row_major(1, 1)
-#     alias sigma_layout = Layout.row_major(1)
-    
-#     var sigma_shape_rt = RuntimeTuple[sigma_layout.shape](k)
-#     var sigma_stride_rt = RuntimeTuple[sigma_layout.stride](sigma.stride[0])
-#     var sigma_runtime_layout = RuntimeLayout[sigma_layout](
-#         shape=sigma_shape_rt,
-#         stride=sigma_stride_rt
-#     )
-#     # sigma tensor
-#     var sigma_tensor = LayoutTensor[
-#         mut=True,
-#         dtype,
-#         sigma_layout,
-#         MutAnyOrigin
-#     ](
-#         sigma.storage,
-#         runtime_layout=sigma_runtime_layout
-#     )
-    
-#     var A_shape_rt = RuntimeTuple[matrix_layout.shape](m, n)
-#     var A_stride_rt = RuntimeTuple[matrix_layout.stride](A_factorized.stride[0], A_factorized.stride[1])
-#     var A_layout = RuntimeLayout[matrix_layout, linear_idx_type=_](shape=A_shape_rt, stride=A_stride_rt)
-#     # A tensor
-#     var A_tensor = LayoutTensor[
-#         mut=True,
-#         dtype,
-#         matrix_layout,
-#         MutAnyOrigin
-#     ](
-#         A_factorized.storage,
-#         runtime_layout=A_layout
-#     )
-    
-#     # Step 1: Compute QR factorization in-place (Householder reflectors)
-#     # The function modifies A_tensor in-place to store Householder reflectors
-#     # and stores scaling factors in sigma_tensor
-#     qr_factorization(sigma_tensor, A_tensor)
-#     ctx.synchronize()
-    
-#     # Step 2: Extract R from upper triangular part of A_factorized
-#     # After qr_factorization, the upper triangular part of A_factorized contains R
-#     var R = create_dynamic_tensor[dtype](ctx, List[Int](m, n), init_value=0.0)
-    
-#     # Copy the upper triangular part via host memory
-#     var host_A = ctx.enqueue_create_host_buffer[dtype](m * n)
-#     ctx.enqueue_copy(host_A, A_factorized.storage)
-#     ctx.synchronize()
-    
-#     var host_R = ctx.enqueue_create_host_buffer[dtype](m * n)
-#     for i in range(m):
-#         for j in range(n):
-#             var idx = i * n + j
-#             if i <= j:
-#                 # Upper triangular part (including diagonal)
-#                 host_R[idx] = host_A[idx]
-#             else:
-#                 # Lower triangular part - set to zero
-#                 host_R[idx] = Scalar[dtype](0.0)
-    
-#     ctx.enqueue_copy(R.storage, host_R)
-#     ctx.synchronize()
-    
-#     # Step 3: Form Q matrix from Householder reflectors
-#     var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=0.0)
-    
-#     # Create LayoutTensor view for Q (output of form_q)
-#     var Q_shape_rt = RuntimeTuple[matrix_layout.shape](m, m)
-#     var Q_stride_rt = RuntimeTuple[matrix_layout.stride](Q.stride[0], Q.stride[1])
-#     var Q_layout = RuntimeLayout[matrix_layout](shape=Q_shape_rt, stride=Q_stride_rt)
-#     var Q_tensor = LayoutTensor[mut=True, dtype, matrix_layout, MutAnyOrigin](
-#         Q.storage,
-#         runtime_layout=Q_layout
-#     )
-    
-#     # Form the orthogonal matrix Q from the Householder reflectors in A and sigma
-#     # According to MAX API: form_q[dtype, element_layout](sigma, A, Q)
-#     form_q(sigma_tensor, A_tensor, Q_tensor)
-#     ctx.synchronize()
     
 fn dense_tensor_qr[dtype: DType = DType.float32](
-        var tensor: DynamicTensor[dtype],
+        var tensor: DenseTensor[dtype],
         ctx: DeviceContext
-    ) raises -> Tuple[DynamicTensor[dtype], DynamicTensor[dtype]]:
+    ) raises -> Tuple[DenseTensor[dtype], DenseTensor[dtype]]:
     # Require 2D matrix
     var rank = len(tensor.shape)
     print("[QR DEBUG] Starting dense_tensor_qr invocation")
@@ -1029,7 +976,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     var tensor_shape_copy = tensor.shape.copy()
     # Create a copy of input tensor for in-place factorization
     # (to preserve original tensor)
-    var A_factorized = create_dynamic_tensor[dtype](ctx, tensor_shape_copy^, init_value=0.0)
+    var A_factorized = create_dense_tensor[dtype](ctx, tensor_shape_copy^, init_value=Scalar[dtype](0.0))
     print("[QR DEBUG] A_factorized shape: [", end="")
     for idx in range(len(A_factorized.shape)):
         if idx > 0:
@@ -1055,7 +1002,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
 
     # Allocate sigma vector for Householder scaling factors
     var sigma_shape = List[Int](k)
-    var sigma = create_dynamic_tensor[dtype](ctx, sigma_shape^, init_value=0.0)
+    var sigma = create_dense_tensor[dtype](ctx, sigma_shape^, init_value=Scalar[dtype](0.0))
     var host_sigma = ctx.enqueue_create_host_buffer[dtype](k)
     for i in range(k):
         host_sigma[i] = Scalar[dtype](0.0)
@@ -1137,7 +1084,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
 
     # Step 2: Extract R from upper triangular part of A_factorized
     # After qr_factorization, the upper triangular part of A_factorized contains R
-    var R = create_dynamic_tensor[dtype](ctx, List[Int](m, n), init_value=0.0)
+    var R = create_dense_tensor[dtype](ctx, List[Int](m, n), init_value=Scalar[dtype](0.0))
 
     # Copy the upper triangular part via host memory
     var host_A = host_A_factorized
@@ -1164,7 +1111,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     print("")
 
     # Step 3: Form Q matrix from Householder reflectors
-    var Q = create_dynamic_tensor[dtype](ctx, List[Int](m, m), init_value=0.0)
+    var Q = create_dense_tensor[dtype](ctx, List[Int](m, m), init_value=Scalar[dtype](0.0))
     var host_Q = ctx.enqueue_create_host_buffer[dtype](m * m)
     for i in range(m * m):
         host_Q[i] = Scalar[dtype](0.0)
@@ -1202,3 +1149,271 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
     print("")
 
     return (Q, R)
+
+fn ensure_contiguous_2d[dtype: DType](
+    var tensor: DenseTensor[dtype], 
+    ctx: DeviceContext
+) raises -> DenseTensor[dtype]:
+    """Ensure tensor is contiguous 2D matrix with row-major layout.
+    
+    Args:
+        tensor: Input tensor (ownership transferred).
+        ctx: Device context.
+    
+    Returns:
+        Contiguous 2D tensor (may be original or a copy).
+    """
+    if len(tensor.shape) != 2:
+        raise Error("Expected 2D tensor, got rank " + String(len(tensor.shape)))
+    
+    # Check if already contiguous with row-major stride [n, 1]
+    var m = tensor.shape[0]
+    var n = tensor.shape[1]
+    
+    if tensor.is_contiguous() and tensor.stride[0] == n and tensor.stride[1] == 1:
+        return tensor^  # Already contiguous row-major
+    
+    # Create contiguous copy
+    var shape_copy = tensor.shape.copy()
+    var contiguous = create_dense_tensor[dtype](ctx, shape_copy^, init_value=Scalar[dtype](0.0))
+    
+    # Copy data element by element (could be optimized with GPU kernel)
+    var host_src = ctx.enqueue_create_host_buffer[dtype](tensor.size)
+    var host_dst = ctx.enqueue_create_host_buffer[dtype](tensor.size)
+    
+    ctx.enqueue_copy(host_src, tensor.storage)
+    ctx.synchronize()
+    
+    # Copy with proper stride handling
+    for i in range(m):
+        for j in range(n):
+            var src_idx = i * tensor.stride[0] + j * tensor.stride[1]
+            var dst_idx = i * n + j  # Row-major
+            host_dst[dst_idx] = host_src[src_idx]
+    
+    ctx.enqueue_copy(contiguous.storage, host_dst)
+    ctx.synchronize()
+    
+    return contiguous^
+
+fn dense_tensor_svd_trunc_lapack_f64[dtype: DType](
+    var tensor: DenseTensor[dtype],
+    ctx: DeviceContext,
+    chi_max: Int,
+    eps_trunc: Float64 = 1e-12,
+    so_path: String = "native/libsvd_shim.so",
+) raises -> Tuple[
+    DenseTensor[dtype],
+    DenseTensor[dtype],
+    DenseTensor[dtype],
+    Int,
+]:
+    """Truncated SVD using LAPACK (dgesdd) for Float64 tensors.
+
+    This is a CPU (host) SVD: data is copied GPU->host, factorized with LAPACK,
+    then copied back host->GPU.
+    """
+    @parameter
+    if dtype != DType.float64:
+        raise Error("dense_tensor_svd_trunc_lapack_f64 only supports DType.float64")
+
+    var A = ensure_contiguous_2d[dtype](tensor^, ctx)
+
+    var m = A.shape[0]
+    var n = A.shape[1]
+    if m == 0 or n == 0:
+        var U_empty = create_dense_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+        var S_empty = create_dense_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+        var Vt_empty = create_dense_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+        return (U_empty^, S_empty^, Vt_empty^, 0)
+
+    # Copy A to host (row-major contiguous)
+    var host_A = ctx.enqueue_create_host_buffer[dtype](m * n)
+    ctx.enqueue_copy(host_A, A.storage)
+    ctx.synchronize()
+
+    # Build LAPACK input matrix (ROW_MAJOR) and copy data over
+    var A_mat = MatrixF64(Int32(m), Int32(n), LapackLayout.ROW_MAJOR())
+    for idx in range(m * n):
+        A_mat.data[idx] = Float64(host_A[idx])
+
+    var backend = SVDBackend(so_path)
+    var jobz = Int8(ord('S'))  # thin U, thin VT
+    var svd_res = svd_f64(backend, A_mat^, jobz)
+
+    var k = Int(svd_res.k)  # min(m, n)
+    var chi_kept = min(k, chi_max)
+    if eps_trunc > 0.0 and k > 0:
+        var total_norm_sq: Float64 = 0.0
+        for i in range(k):
+            var s = Float64(svd_res.S[i])
+            total_norm_sq += s * s
+        if total_norm_sq <= 0.0:
+            chi_kept = 0
+        else:
+            # Find smallest chi (<= chi_max) such that discarded_weight <= eps_trunc
+            var kept_norm_sq: Float64 = 0.0
+            var limit = min(k, chi_max)
+            chi_kept = limit  # default fallback
+            for trial_chi in range(1, limit + 1):
+                var s = Float64(svd_res.S[trial_chi - 1])
+                kept_norm_sq += s * s
+                var discarded_weight = (total_norm_sq - kept_norm_sq) / total_norm_sq
+                if discarded_weight <= eps_trunc:
+                    chi_kept = trial_chi
+                    break
+
+    if chi_kept == 0:
+        var U_zero = create_dense_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+        var S_zero = create_dense_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+        var Vt_zero = create_dense_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+        return (U_zero^, S_zero^, Vt_zero^, 0)
+
+    # Allocate output tensors
+    var U_out = create_dense_tensor[dtype](
+        ctx, List[Int](m, chi_kept)^, init_value=Scalar[dtype](0.0)
+    )
+    var S_out = create_dense_tensor[dtype](
+        ctx, List[Int](chi_kept)^, init_value=Scalar[dtype](0.0)
+    )
+    var Vt_out = create_dense_tensor[dtype](
+        ctx, List[Int](chi_kept, n)^, init_value=Scalar[dtype](0.0)
+    )
+
+    # Fill host buffers from LAPACK output
+    var host_U = ctx.enqueue_create_host_buffer[dtype](m * chi_kept)
+    var host_S = ctx.enqueue_create_host_buffer[dtype](chi_kept)
+    var host_Vt = ctx.enqueue_create_host_buffer[dtype](chi_kept * n)
+
+    for i in range(chi_kept):
+        host_S[i] = Scalar[dtype](Float64(svd_res.S[i]))
+
+    var u_cols_full = Int(svd_res.u_cols)  # = k for jobz='S'
+    var vt_cols_full = Int(svd_res.vt_cols)  # = n for jobz='S'
+
+    for i in range(m):
+        for j in range(chi_kept):
+            host_U[i * chi_kept + j] = Scalar[dtype](Float64(svd_res.U[i * u_cols_full + j]))
+
+    for i in range(chi_kept):
+        for j in range(n):
+            host_Vt[i * n + j] = Scalar[dtype](Float64(svd_res.VT[i * vt_cols_full + j]))
+
+    # Copy back to device
+    ctx.enqueue_copy(U_out.storage, host_U)
+    ctx.enqueue_copy(S_out.storage, host_S)
+    ctx.enqueue_copy(Vt_out.storage, host_Vt)
+    ctx.synchronize()
+
+    return (U_out^, S_out^, Vt_out^, chi_kept)
+
+
+fn dense_tensor_svd_trunc[dtype: DType](
+    var tensor: DenseTensor[dtype],
+    ctx: DeviceContext,
+    chi_max: Int,
+    eps_trunc: Float64 = 1e-12,
+) raises -> Tuple[
+    DenseTensor[dtype],
+    DenseTensor[dtype],
+    DenseTensor[dtype],
+    Int,
+]:
+    """Truncated SVD helper used across the codebase.
+    
+    Backends:
+    - Float64: LAPACK via `dense_tensor_svd_trunc_lapack_f64`
+    - Float32: LAPACK in Float64 internally, then cast back to Float32
+    """
+    @parameter
+    if dtype == DType.float64:
+        return dense_tensor_svd_trunc_lapack_f64[dtype](
+            tensor^,
+            ctx,
+            chi_max=chi_max,
+            eps_trunc=eps_trunc,
+        )
+    elif dtype == DType.float32:
+        # Float32 path: copy to host, run LAPACK in Float64, cast results back.
+        var A32 = ensure_contiguous_2d[dtype](tensor^, ctx)
+
+        var m = A32.shape[0]
+        var n = A32.shape[1]
+        if m == 0 or n == 0:
+            var U_empty = create_dense_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+            var S_empty = create_dense_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+            var Vt_empty = create_dense_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+            return (U_empty^, S_empty^, Vt_empty^, 0)
+
+        var host_A32 = ctx.enqueue_create_host_buffer[dtype](m * n)
+        ctx.enqueue_copy(host_A32, A32.storage)
+        ctx.synchronize()
+
+        # Build LAPACK input as Float64
+        var A_mat = MatrixF64(Int32(m), Int32(n), LapackLayout.ROW_MAJOR())
+        for idx in range(m * n):
+            A_mat.data[idx] = Float64(host_A32[idx])
+
+        var backend = SVDBackend("native/libsvd_shim.so")
+        var jobz = Int8(ord('S'))  # thin U, thin VT
+        var svd_res = svd_f64(backend, A_mat^, jobz)
+
+        var k = Int(svd_res.k)
+        var chi_kept = min(k, chi_max)
+        if eps_trunc > 0.0 and k > 0:
+            var total_norm_sq: Float64 = 0.0
+            for i in range(k):
+                var s = Float64(svd_res.S[i])
+                total_norm_sq += s * s
+            if total_norm_sq <= 0.0:
+                chi_kept = 0
+            else:
+                var kept_norm_sq: Float64 = 0.0
+                var limit = min(k, chi_max)
+                chi_kept = limit
+                for trial_chi in range(1, limit + 1):
+                    var s = Float64(svd_res.S[trial_chi - 1])
+                    kept_norm_sq += s * s
+                    var discarded_weight = (total_norm_sq - kept_norm_sq) / total_norm_sq
+                    if discarded_weight <= eps_trunc:
+                        chi_kept = trial_chi
+                        break
+
+        if chi_kept == 0:
+            var U_zero = create_dense_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
+            var S_zero = create_dense_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
+            var Vt_zero = create_dense_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
+            return (U_zero^, S_zero^, Vt_zero^, 0)
+
+        var U_out = create_dense_tensor[dtype](ctx, List[Int](m, chi_kept)^, init_value=Scalar[dtype](0.0))
+        var S_out = create_dense_tensor[dtype](ctx, List[Int](chi_kept)^, init_value=Scalar[dtype](0.0))
+        var Vt_out = create_dense_tensor[dtype](ctx, List[Int](chi_kept, n)^, init_value=Scalar[dtype](0.0))
+
+        var host_U = ctx.enqueue_create_host_buffer[dtype](m * chi_kept)
+        var host_S = ctx.enqueue_create_host_buffer[dtype](chi_kept)
+        var host_Vt = ctx.enqueue_create_host_buffer[dtype](chi_kept * n)
+
+        for i in range(chi_kept):
+            host_S[i] = Scalar[dtype](Float32(Float64(svd_res.S[i])))
+
+        var u_cols_full = Int(svd_res.u_cols)
+        var vt_cols_full = Int(svd_res.vt_cols)
+
+        for i in range(m):
+            for j in range(chi_kept):
+                host_U[i * chi_kept + j] = Scalar[dtype](Float32(Float64(svd_res.U[i * u_cols_full + j])))
+
+        for i in range(chi_kept):
+            for j in range(n):
+                host_Vt[i * n + j] = Scalar[dtype](Float32(Float64(svd_res.VT[i * vt_cols_full + j])))
+
+        ctx.enqueue_copy(U_out.storage, host_U)
+        ctx.enqueue_copy(S_out.storage, host_S)
+        ctx.enqueue_copy(Vt_out.storage, host_Vt)
+        ctx.synchronize()
+
+        return (U_out^, S_out^, Vt_out^, chi_kept)
+    else:
+        raise Error(
+            "dense_tensor_svd_trunc supports only DType.float32/float64 currently."
+        )

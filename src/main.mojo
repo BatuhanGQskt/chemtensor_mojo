@@ -1,17 +1,21 @@
 from sys import has_accelerator
-from m_tensor.static_tensor import create_static_tensor, create_static_tensor_with_stride
-from m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot, dense_tensor_qr
-from m_tensor.complex_tensor import ComplexDynamicTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
+from src.m_tensor.static_tensor import create_static_tensor, create_static_tensor_with_stride
+from src.m_tensor.dense_tensor import DenseTensor, create_dense_tensor, create_dense_tensor_from_data, dense_tensor_dot, dense_tensor_qr, dense_tensor_svd_trunc_lapack_f64
+from src.m_tensor.complex_tensor import ComplexDenseTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
 from layout.layout import DimList, Layout
 from gpu import thread_idx, block_idx, block_dim
 from gpu.host import DeviceContext
 from math import ceildiv
 from time import perf_counter_ns
-from collections import optional, List
+from collections.optional import Optional
+from collections.list import List
 from python import Python
 from layout import IntTuple, LayoutTensor, RuntimeTuple
 from layout.runtime_layout import RuntimeLayout, make_layout
 from complex import ComplexSIMD
+from src.state.mps_state import create_product_mps, create_uniform_mps, mps_orthogonalize_qr
+from src.state.hamiltonians import create_ising_1d_mpo, create_transverse_ising_mpo
+from src.algorithms.dmrg import DMRGParams, dmrg_two_site
 
 alias dtype = DType.float32
 
@@ -263,7 +267,7 @@ fn test_dense_qr() raises:
         data.append(-41.0)
         
         var shape = List[Int](3, 3)
-        var A = create_dynamic_tensor_from_data[DType.float32](ctx, data, shape^)
+        var A = create_dense_tensor_from_data[DType.float32](ctx, data, shape^)
         
         print("Matrix A:")
         A.print_tensor(ctx)
@@ -285,13 +289,13 @@ fn test_dense_qr() raises:
         print("Verification 1: Computing Q @ R (should equal A)...")
         
         # Need to create new QR for A since we moved it
-        var A2 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A2 = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         var result2 = dense_tensor_qr[DType.float32](A2, ctx)
         var Q2 = result2[0]
         var R2 = result2[1]
         
-        var A_reconstructed = create_dynamic_tensor[DType.float32](
-            ctx, List[Int](3, 3)^, init_value=0.0
+        var A_reconstructed = create_dense_tensor[DType.float32](
+            ctx, List[Int](3, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](A_reconstructed, Q2^, R2^, ctx)
         ctx.synchronize()
@@ -300,7 +304,7 @@ fn test_dense_qr() raises:
         A_reconstructed.print_tensor(ctx)
         
         print("\nOriginal A (for comparison):")
-        var A_original = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A_original = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         A_original.print_tensor(ctx)
         
         # Verification 2: Q^T @ Q ≈ I
@@ -308,7 +312,7 @@ fn test_dense_qr() raises:
         print("Verification 2: Computing Q^T @ Q (should be identity)...")
         
         # Need another copy of Q for transpose
-        var A3 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A3 = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         var result3 = dense_tensor_qr[DType.float32](A3, ctx)
         var Q3 = result3[0]
         var Q4 = result3[1]  # Not used, just to consume the tuple
@@ -318,12 +322,12 @@ fn test_dense_qr() raises:
         var Q_T = Q3^.transpose(perm, ctx)
         
         # Get another Q for the multiplication
-        var A4 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A4 = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         var result4 = dense_tensor_qr[DType.float32](A4, ctx)
         var Q5 = result4[0]
         
-        var Q_T_Q = create_dynamic_tensor[DType.float32](
-            ctx, List[Int](3, 3)^, init_value=0.0
+        var Q_T_Q = create_dense_tensor[DType.float32](
+            ctx, List[Int](3, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](Q_T_Q, Q_T^, Q5^, ctx)
         ctx.synchronize()
@@ -345,7 +349,7 @@ fn test_dense_qr() raises:
             data_rect.append(Float32(i + 1))
         
         var shape_rect = List[Int](4, 3)
-        var A_rect = create_dynamic_tensor_from_data[DType.float32](
+        var A_rect = create_dense_tensor_from_data[DType.float32](
             ctx, data_rect, shape_rect^
         )
         
@@ -363,8 +367,8 @@ fn test_dense_qr() raises:
         R_rect.print_tensor(ctx)
         
         # Verify reconstruction
-        var A_rect_recon = create_dynamic_tensor[DType.float32](
-            ctx, List[Int](4, 3)^, init_value=0.0
+        var A_rect_recon = create_dense_tensor[DType.float32](
+            ctx, List[Int](4, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](A_rect_recon, Q_rect^, R_rect^, ctx)
         
@@ -376,12 +380,294 @@ fn test_dense_qr() raises:
     print("="*60 + "\n")
 
 
+fn test_mps_creation() raises:
+    """Smoke-test the MPS helpers by building a few small states."""
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found - skipping MPS creation tests")
+        return
+
+    print("\n" + "="*60)
+    print("TESTING MPS CREATION HELPERS")
+    print("="*60 + "\n")
+
+    with DeviceContext() as ctx:
+        print("Test 1: create_uniform_mps with varying bond dimensions...")
+        var num_sites = 4
+        var physical_dim = 2
+        var expected_bonds = List[Int](1, 2, 3, 2, 1)
+
+        var uniform_mps = create_uniform_mps[dtype](
+            ctx,
+            num_sites,
+            physical_dim,
+            expected_bonds.copy()^,
+            init_value=Scalar[dtype](0.25),
+        )
+        uniform_mps.describe()
+
+        if uniform_mps.num_sites() != num_sites:
+            raise Error(
+                "Uniform MPS length mismatch: expected "
+                + String(num_sites)
+                + ", got "
+                + String(uniform_mps.num_sites())
+            )
+
+        for idx in range(num_sites):
+            var site_shape = uniform_mps.site_shape(idx)
+            if len(site_shape) != 3:
+                raise Error(
+                    "Uniform MPS site "
+                    + String(idx)
+                    + " expected rank-3 tensor, got rank "
+                    + String(len(site_shape))
+                )
+
+            if site_shape[0] != expected_bonds[idx] or site_shape[2] != expected_bonds[idx + 1]:
+                raise Error(
+                    "Uniform MPS bond mismatch at site "
+                    + String(idx)
+                    + ": expected ["
+                    + String(expected_bonds[idx])
+                    + ", "
+                    + String(expected_bonds[idx + 1])
+                    + "], got ["
+                    + String(site_shape[0])
+                    + ", "
+                    + String(site_shape[2])
+                    + "]"
+                )
+
+            if site_shape[1] != physical_dim:
+                raise Error(
+                    "Uniform MPS physical dim mismatch at site "
+                    + String(idx)
+                )
+
+        print("Uniform MPS creation passed all bond/shape checks.\n")
+
+        print("Test 2: create_product_mps from a local basis pattern...")
+        var basis = List[Int](0, 1, 0, 1)
+        var product_mps = create_product_mps[dtype](ctx, physical_dim, basis.copy()^)
+        product_mps.describe()
+
+        for idx in range(product_mps.num_sites()):
+            var site_shape = product_mps.site_shape(idx)
+            if site_shape[0] != 1 or site_shape[2] != 1:
+                raise Error(
+                    "Product MPS internal bonds must both be 1 at site "
+                    + String(idx)
+                )
+
+            if site_shape[1] != physical_dim:
+                raise Error(
+                    "Product MPS physical dim mismatch at site "
+                    + String(idx)
+                )
+
+        if product_mps.bond_dimension(product_mps.num_sites()) != 1:
+            raise Error("Product MPS final bond dimension must be 1")
+
+        print("Product-state MPS creation passed bond checks.\n")
+
+        print("Test 3: mps_orthogonalize_qr via QR sweep...")
+        var dense_shape = List[Int](physical_dim, physical_dim, physical_dim)
+        var dense_state = create_dense_tensor[dtype](ctx, dense_shape.copy())
+        var sweep_mps = mps_orthogonalize_qr[dtype](ctx, dense_state^)
+        sweep_mps.describe()
+
+        if sweep_mps.num_sites() != len(dense_shape):
+            raise Error(
+                "Dense-to-MPS conversion length mismatch: expected "
+                + String(len(dense_shape))
+                + ", got "
+                + String(sweep_mps.num_sites())
+            )
+
+        if sweep_mps.bond_dimension(0) != 1 or sweep_mps.bond_dimension(sweep_mps.num_sites()) != 1:
+            raise Error("Dense-to-MPS conversion must keep dummy bonds of size 1")
+
+        for idx in range(sweep_mps.num_sites()):
+            var site_shape = sweep_mps.site_shape(idx)
+            if site_shape[1] != physical_dim:
+                raise Error(
+                    "Dense-to-MPS site "
+                    + String(idx)
+                    + " expected physical dimension "
+                    + String(physical_dim)
+                )
+
+        print("Dense tensor sweep decomposition passed structural checks.\n")
+
+    print("="*60)
+    print("MPS CREATION TEST COMPLETED")
+    print("="*60 + "\n")
+
+
+fn test_dense_svd_trunc() raises:
+    """Test truncated SVD implementation using NuMojo's optimized SVD."""
+    print("\\n" + "="*60)
+    print("TESTING TRUNCATED SVD (Lapack-based)")
+    print("="*60 + "\\n")
+    
+    with DeviceContext() as ctx:
+        print("Test 1: SVD of 4x3 matrix...")
+        
+        # Create a simple test matrix with known structure
+        var data = List[Float64]()
+        # Matrix with rank 2 (two non-zero singular values)
+        # [2, 0, 0]
+        # [0, 3, 0] 
+        # [0, 0, 0]
+        # [0, 0, 0]
+        data.append(2.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(3.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        data.append(0.0)
+        
+        var shape = List[Int](4, 3)
+        var A = create_dense_tensor_from_data[DType.float64](ctx, data, shape^)
+        
+        print("Matrix A:")
+        A.print_tensor(ctx)
+        
+        # Compute truncated SVD using Lapack
+        print("\nComputing truncated SVD with Lapack (chi_max=2, eps_trunc=1e-10)...")
+        var svd_result = dense_tensor_svd_trunc_lapack_f64[DType.float64](A^, ctx, chi_max=2, eps_trunc=1e-10)
+        var U = svd_result[0]
+        var S = svd_result[1] 
+        var Vt = svd_result[2]
+        var chi_kept = svd_result[3]
+        
+        print("\nNumber of singular values kept:", chi_kept)
+        
+        print("\nSingular values S:")
+        S.print_tensor(ctx)
+        
+        print("\nLeft singular vectors U:")
+        U.print_tensor(ctx)
+        
+        print("\nRight singular vectors Vt:")
+        Vt.print_tensor(ctx)
+        
+        print("\n✓ Lapack-based truncated SVD test completed")
+
+
+fn run_dmrg_tfim_comparison() raises:
+    """Run a Python-like TFIM DMRG example to compare outputs.
+    
+    Matches the user's Python example as closely as the current Mojo API allows.
+    
+    Note:
+    - `state.hamiltonians.create_transverse_ising_mpo` implements:
+        H = -J * Σ Z_i Z_{i+1} - h * Σ X_i
+      which corresponds to the *transverse* field only.
+    - The Python example also has a longitudinal field term (`h`) and a separate
+      transverse-field strength (`g`). Here we map `g -> h` and ignore the
+      longitudinal field since it's not implemented yet.
+    - Entropy output is not implemented in this Mojo codebase yet.
+    """
+    @parameter
+    if not has_accelerator():
+        print("No compatible GPU found - skipping DMRG TFIM comparison run")
+        return
+
+    # IMPORTANT: Use float32 so MAX can compile GPU matmul on your setup.
+    # (Float64 GPU matmul/GEMV currently fails in your MAX nightly with an offload error.)
+    alias dmrg_dtype = DType.float32
+
+    test_dmrg[dmrg_dtype](10, 1.0, 0.0, 1.0)
+    test_dmrg[dmrg_dtype](5, 1.0, 0.0, 1.0)
+
+
+fn test_dmrg[dmrg_dtype: DType](nsites: Int, J: Float64, h_longitudinal: Float64, g_transverse: Float64):
+    # Model parameters (same as the Python snippet)
+    var num_sweeps = 6
+    var max_vdim = 64
+    var tol_split: Float64 = 1e-10
+
+    print("\n" + "=" * 60)
+    print("DMRG TFIM COMPARISON RUN (Mojo)")
+    print("=" * 60)
+    print("nsites=", nsites, ", J=", J, ", h(longitudinal)=", h_longitudinal, ", g(transverse)=", g_transverse)
+    print("num_sweeps=", num_sweeps, ", max_vdim=", max_vdim, ", tol_split=", tol_split)
+
+    try:
+        with DeviceContext() as ctx:
+            # Build Hamiltonian MPO template (we'll copy it per sweep because dmrg_two_site consumes its args)
+            var H_template = create_ising_1d_mpo[dmrg_dtype](
+                ctx,
+                nsites,
+                J=J,
+                h_longitudinal=h_longitudinal,
+                g_transverse=g_transverse,
+            )
+
+            # Initial product state |000...0>
+            var basis = List[Int](capacity=nsites)
+            for _ in range(nsites):
+                basis.append(0)
+            var psi = create_product_mps[dmrg_dtype](ctx, 2, basis^)
+
+            var en_sweeps = List[Float64](capacity=num_sweeps)
+
+            # Run one sweep at a time so we can collect energies per sweep.
+            for sweep in range(num_sweeps):
+                var params = DMRGParams(
+                    num_sweeps=1,
+                    chi_max=max_vdim,
+                    eps_trunc=tol_split,
+                    max_krylov_iter=20,
+                    krylov_tol=1e-10,
+                    energy_tol=0.0,          # disable early stopping; user wants fixed sweep count
+                    two_site=True,
+                    reorthogonalize=True,
+                    verbose=False,
+                )
+
+                var H = H_template  # copy so we can move it into dmrg_two_site
+                print("H: ", H)
+                var res = dmrg_two_site[dmrg_dtype](ctx, H^, psi^, params)
+                var E = res[0]
+                psi = res[1]
+
+                en_sweeps.append(E)
+                print("Sweep ", sweep + 1, " energy: ", E)
+
+            print("\nEnergies per sweep:", end=" ")
+            print("[", end="")
+            for i in range(len(en_sweeps)):
+                if i > 0:
+                    print(", ", end="")
+                print(en_sweeps[i], end="")
+            print("]")
+
+            print("Final energy:", en_sweeps[len(en_sweeps) - 1])
+            print("Sites:", psi.num_sites())
+            print("Bond dimensions:", end=" ")
+            print("[", end="")
+            for i in range(len(psi.bond_dims)):
+                if i > 0:
+                    print(", ", end="")
+                print(psi.bond_dims[i], end="")
+            print("]")
+            print("Entropies: (not implemented in Mojo yet)")
+    except e:
+        print("Error during DMRG test: " + String(e))
+
+
 def main():
-    print("Testing...")
-    test_dense_qr()
-    # test_complex_tensors()
-    # test_nd_tensor_dot()
-    print("Test done.")
+    # Keep the tensor/unit demos available, but run the DMRG comparison by default.
+    run_dmrg_tfim_comparison()
     return
 
 
@@ -453,9 +739,9 @@ def main():
 #                 data_B.append(Float32(i + 1) * 0.5)
             
 #             # Create dynamic tensors from data
-#             var tensor_A = create_dynamic_tensor_from_data[DType.float32](ctx, data_A, dims_A^)
-#             var tensor_B = create_dynamic_tensor_from_data[DType.float32](ctx, data_B, dims_B^)
-#             var tensor_C = create_dynamic_tensor[DType.float32](ctx, dims_C^, init_value=0.0)
+#             var tensor_A = create_dense_tensor_from_data[DType.float32](ctx, data_A, dims_A^)
+#             var tensor_B = create_dense_tensor_from_data[DType.float32](ctx, data_B, dims_B^)
+#             var tensor_C = create_dense_tensor[DType.float32](ctx, dims_C^, init_value=0.0)
             
 #             print("\nTensor A created: ", tensor_A)
 #             print("Tensor B created: ", tensor_B)
@@ -504,7 +790,7 @@ def main():
 #             var data_3d = List[Float32]()
 #             for i in range(24):
 #                 data_3d.append(Float32(i))
-#             var tensor_3d = create_dynamic_tensor_from_data[DType.float32](ctx, data_3d, shape_3d^)
+#             var tensor_3d = create_dense_tensor_from_data[DType.float32](ctx, data_3d, shape_3d^)
 #             print("3D Tensor: ", tensor_3d)
 #             print("Is contiguous: ", tensor_3d.is_contiguous())
             
@@ -554,9 +840,9 @@ def main():
 #         var shape_B = List[Int](1, 2, 5, 7)
 #         var shape_C = List[Int](4, 3, 5, 7)  # Result shape
         
-#         var A = create_dynamic_tensor[DType.float32](ctx, shape_A^, init_value=2.0)
-#         var B = create_dynamic_tensor[DType.float32](ctx, shape_B^, init_value=3.0)
-#         var C = create_dynamic_tensor[DType.float32](ctx, shape_C^, init_value=0.0)
+#         var A = create_dense_tensor[DType.float32](ctx, shape_A^, init_value=2.0)
+#         var B = create_dense_tensor[DType.float32](ctx, shape_B^, init_value=3.0)
+#         var C = create_dense_tensor[DType.float32](ctx, shape_C^, init_value=0.0)
         
 #         print("  A shape:", A)
 #         print("  B shape:", B)
@@ -582,9 +868,9 @@ def main():
 #         var shape_B2 = List[Int](4, 5, 6)
 #         var shape_C2 = List[Int](2, 3, 5, 6)
         
-#         var A2 = create_dynamic_tensor[DType.float32](ctx, shape_A2^, init_value=1.0)
-#         var B2 = create_dynamic_tensor[DType.float32](ctx, shape_B2^, init_value=0.5)
-#         var C2 = create_dynamic_tensor[DType.float32](ctx, shape_C2^, init_value=0.0)
+#         var A2 = create_dense_tensor[DType.float32](ctx, shape_A2^, init_value=1.0)
+#         var B2 = create_dense_tensor[DType.float32](ctx, shape_B2^, init_value=0.5)
+#         var C2 = create_dense_tensor[DType.float32](ctx, shape_C2^, init_value=0.0)
         
 #         print("  A2 shape:", A2)
 #         print("  B2 shape:", B2)
