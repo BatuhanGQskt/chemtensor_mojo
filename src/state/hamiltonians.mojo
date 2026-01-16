@@ -1,6 +1,6 @@
 from collections.list import List
 from gpu.host import DeviceContext
-from src.m_tensor.dynamic_tensor import create_dynamic_tensor_from_data, DynamicTensor
+from src.m_tensor.dense_tensor import create_dense_tensor_from_data, DenseTensor
 from src.state.mpo_state import MPOSite, MatrixProductOperator
 
 
@@ -113,7 +113,7 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
         var on_site = Scalar[dtype](-g_transverse) * X_data[idx] + Scalar[dtype](-h_longitudinal) * Z_data[idx]
         W0_data.append(on_site)
     
-    var W0_temp = create_dynamic_tensor_from_data[dtype](
+    var W0_temp = create_dense_tensor_from_data[dtype](
         ctx, W0_data^, List[Int](1, 3, d, d)
     )
     # Transpose to [Wl, d, d, Wr] = [1, 2, 2, 3]
@@ -139,7 +139,7 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
         for _ in range(8): W_bulk_data.append(Scalar[dtype](0.0))
         for val in I_data: W_bulk_data.append(val)
         
-        var W_bulk_temp = create_dynamic_tensor_from_data[dtype](
+        var W_bulk_temp = create_dense_tensor_from_data[dtype](
             ctx, W_bulk_data^, List[Int](3, 3, d, d)
         )
         # Transpose to [Wl, d, d, Wr] = [3, 2, 2, 3]
@@ -158,7 +158,7 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
     # Wl=2, Wr=0: I
     for val in I_data: WN_data.append(val)
     
-    var WN_temp = create_dynamic_tensor_from_data[dtype](
+    var WN_temp = create_dense_tensor_from_data[dtype](
         ctx, WN_data^, List[Int](3, 1, d, d)
     )
     # Transpose to [Wl, d, d, Wr] = [3, 2, 2, 1]
@@ -239,7 +239,7 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
     for val in Z_data: W0_data.append(val)
     for _ in range(4): W0_data.append(Scalar[dtype](0.0))
     
-    var W0_temp = create_dynamic_tensor_from_data[dtype](
+    var W0_temp = create_dense_tensor_from_data[dtype](
         ctx, W0_data^, List[Int](1, 5, d, d)
     )
     # Transpose to [Wl, d, d, Wr]
@@ -273,7 +273,7 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
         for _ in range(16): W_bulk_data.append(Scalar[dtype](0.0))
         for val in I_data: W_bulk_data.append(val)
         
-        var W_bulk_temp = create_dynamic_tensor_from_data[dtype](
+        var W_bulk_temp = create_dense_tensor_from_data[dtype](
             ctx, W_bulk_data^, List[Int](5, 5, d, d)
         )
         # Transpose to [Wl, d, d, Wr]
@@ -288,7 +288,7 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
     for val in Z_data: WN_data.append(Scalar[dtype](J) * val)
     for val in I_data: WN_data.append(val)
     
-    var WN_temp = create_dynamic_tensor_from_data[dtype](
+    var WN_temp = create_dense_tensor_from_data[dtype](
         ctx, WN_data^, List[Int](5, 1, d, d)
     )
     # Transpose to [Wl, d, d, Wr]

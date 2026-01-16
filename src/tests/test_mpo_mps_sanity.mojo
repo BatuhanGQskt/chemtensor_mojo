@@ -20,7 +20,7 @@ from gpu.host import DeviceContext
 from src.state.hamiltonians import create_ising_1d_mpo
 from src.state.mps_state import create_product_mps, MatrixProductState, MPSSite
 from src.state.mpo_state import MatrixProductOperator, MPOSite
-from src.m_tensor.dynamic_tensor import DynamicTensor
+from src.m_tensor.dense_tensor import DenseTensor
 
 
 @fieldwise_init
@@ -29,7 +29,7 @@ struct PackedRank4(Movable):
 
     We pack each site tensor's raw storage (flattened) into `data`, and keep:
     - offsets[site]: starting flat index of that site within `data`
-    - s0..s3[site]: strides for that site tensor (matching the original DynamicTensor.stride)
+    - s0..s3[site]: strides for that site tensor (matching the original DenseTensor.stride)
     """
     var data: List[Float64]
     var offsets: List[Int]

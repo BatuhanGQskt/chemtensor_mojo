@@ -1,9 +1,9 @@
 from collections.list import List
 from gpu.host import DeviceContext
-from src.m_tensor.dynamic_tensor import (
-    DynamicTensor,
-    create_dynamic_tensor,
-    create_dynamic_tensor_from_data,
+from src.m_tensor.dense_tensor import (
+    DenseTensor,
+    create_dense_tensor,
+    create_dense_tensor_from_data,
     dense_tensor_qr,
 )
 
@@ -12,10 +12,10 @@ from src.m_tensor.dynamic_tensor import (
 struct MPSSite[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     """Single site tensor inside an MPS.
 
-    Each site is stored as a rank-3 DynamicTensor with layout
+    Each site is stored as a rank-3 DenseTensor with layout
     [left_bond, physical, right_bond].
     """
-    var tensor: DynamicTensor[dtype]
+    var tensor: DenseTensor[dtype]
 
     fn rank(self) -> Int:
         return len(self.tensor.shape)
@@ -48,7 +48,7 @@ struct MPSSite[dtype: DType](Writable, Movable, ImplicitlyCopyable):
 
 
 struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
-    """Matrix Product State built on top of DynamicTensor.
+    """Matrix Product State built on top of DenseTensor.
 
     Typical usage:
         ```mojo
@@ -169,7 +169,7 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         """Bring the MPS to left-canonical form using QR decomposition.
         
         Sweeps from left to right, orthogonalizing each site and absorbing the R factor to the next.
-        Assumes DynamicTensor has qr() -> (Q, R), reshape, contract, and norm methods.
+        Assumes DenseTensor has qr() -> (Q, R), reshape, contract, and norm methods.
         """
         var ortho_center = 0
         while ortho_center < self.length - 1:
@@ -238,11 +238,11 @@ fn create_uniform_mps[dtype: DType = DType.float32](
             raise Error("Bond dimensions must be >= 1")
 
         var shape = List[Int](left_dim, physical_dim, right_dim)
-        var site_tensor: DynamicTensor[dtype]
+        var site_tensor: DenseTensor[dtype]
         if init_value is None:
-            site_tensor = DynamicTensor[dtype].random(ctx, shape^)  # Assume random factory
+            site_tensor = DenseTensor[dtype].random(ctx, shape^)  # Assume random factory
         else:
-            site_tensor = create_dynamic_tensor[dtype](
+            site_tensor = create_dense_tensor[dtype](
                 ctx, shape^, row_major=True, init_value=init_value.value()
             )
         sites.append(MPSSite[dtype](site_tensor^))
@@ -292,7 +292,7 @@ fn create_product_mps[dtype: DType = DType.float32](
             else:
                 data.append(Scalar[dtype](0.0))
 
-        var site_tensor = create_dynamic_tensor_from_data[dtype](ctx, data, shape^)
+        var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
         sites.append(MPSSite[dtype](site_tensor^))
 
     return MatrixProductState[dtype](sites^)
@@ -300,8 +300,8 @@ fn create_product_mps[dtype: DType = DType.float32](
 
 fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
     ctx: DeviceContext,
-    var block: DynamicTensor[dtype],
-) raises -> Tuple[MPSSite[dtype], DynamicTensor[dtype]]:
+    var block: DenseTensor[dtype],
+) raises -> Tuple[MPSSite[dtype], DenseTensor[dtype]]:
     """Left-orthonormalize a single site tensor and absorb R into the remainder.
 
     Mirrors the behavior of `mps_local_orthonormalize_qr` in the reference
@@ -345,7 +345,7 @@ fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
         for col in range(reduced_cols):
             var idx_full = row * q_cols + col
             q_data.append(host_Q_full[idx_full])
-    var reduced_Q = create_dynamic_tensor_from_data[dtype](
+    var reduced_Q = create_dense_tensor_from_data[dtype](
         ctx,
         q_data,
         List[Int](m, reduced_cols)
@@ -360,7 +360,7 @@ fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
         for col in range(r_cols):
             var idx_full = row * r_cols + col
             r_data.append(host_R_full[idx_full])
-    var reduced_R = create_dynamic_tensor_from_data[dtype](
+    var reduced_R = create_dense_tensor_from_data[dtype](
         ctx,
         r_data,
         List[Int](reduced_cols, r_cols)
@@ -381,7 +381,7 @@ fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
 
 fn mps_orthogonalize_qr[dtype: DType = DType.float32](
     ctx: DeviceContext,
-    var full_state: DynamicTensor[dtype],
+    var full_state: DenseTensor[dtype],
 ) raises -> MatrixProductState[dtype]:
     """Decompose a dense rank-N tensor into an MPS via successive QR sweeps.
     

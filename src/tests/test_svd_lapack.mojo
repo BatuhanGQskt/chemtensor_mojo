@@ -2,8 +2,8 @@ from sys import has_accelerator
 from gpu.host import DeviceContext
 from collections.list import List
 
-from src.m_tensor.dynamic_tensor import (
-    create_dynamic_tensor_from_data,
+from src.m_tensor.dense_tensor import (
+    create_dense_tensor_from_data,
     dense_tensor_svd_trunc,
 )
 
@@ -23,7 +23,7 @@ fn main() raises:
             0.0, 0.0, 0.0,
         )
         var shape = List[Int](4, 3)
-        var A = create_dynamic_tensor_from_data[DType.float64](ctx, data, shape^)
+        var A = create_dense_tensor_from_data[DType.float64](ctx, data, shape^)
 
         var svd_result = dense_tensor_svd_trunc[DType.float64](A^, ctx, chi_max=2, eps_trunc=1e-12)
         var S = svd_result[1]

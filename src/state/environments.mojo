@@ -1,8 +1,8 @@
 from collections.list import List
 from gpu.host import DeviceContext
-from src.m_tensor.dynamic_tensor import (
-    DynamicTensor,
-    create_dynamic_tensor,
+from src.m_tensor.dense_tensor import (
+    DenseTensor,
+    create_dense_tensor,
     dense_tensor_dot,
 )
 from src.state.mps_state import MPSSite, MatrixProductState
@@ -11,11 +11,11 @@ from src.state.mpo_state import create_identity_mpo
 
 
 fn update_left_environment[dtype: DType](
-    L_prev: DynamicTensor[dtype],
+    L_prev: DenseTensor[dtype],
     A_site: MPSSite[dtype],
     W_site: MPOSite[dtype],
     ctx: DeviceContext,
-) raises -> DynamicTensor[dtype]:
+) raises -> DenseTensor[dtype]:
     """Update left environment by contracting one site.
     
     Contracts the previous left environment with the current MPS site, MPO site,
@@ -63,7 +63,7 @@ fn update_left_environment[dtype: DType](
     var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
     var A_flat = A.reshape(List[Int](Dl_prev, s * Dr))
     
-    var temp1_contract = create_dynamic_tensor[dtype](ctx, List[Int](wL * Dl_prime, s * Dr), init_value=Scalar[dtype](0.0))
+    var temp1_contract = create_dense_tensor[dtype](ctx, List[Int](wL * Dl_prime, s * Dr), init_value=Scalar[dtype](0.0))
     # Contract leading axis of L_flat (Dl) with leading axis of A_flat (Dl).
     dense_tensor_dot(temp1_contract, L_flat^, A_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     
@@ -83,7 +83,7 @@ fn update_left_environment[dtype: DType](
     # W[wL, s, s', wR] -> reshape to [wL*s, s'*wR]
     var W_mat = W.reshape(List[Int](wL * s, s_out * wR))
     
-    var temp2_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR), init_value=Scalar[dtype](0.0))
+    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
     
     var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
@@ -104,7 +104,7 @@ fn update_left_environment[dtype: DType](
     # A is [Dl', s', Dr']. Reshape(Dl'*s', Dr'). Yes.
     var A_flat2 = A.reshape(List[Int](Dl_prime * s_out, Dr))
     
-    var L_next_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dr * wR, Dr), init_value=Scalar[dtype](0.0))
+    var L_next_mat = create_dense_tensor[dtype](ctx, List[Int](Dr * wR, Dr), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(L_next_mat, temp2_mat2^, A_flat2^, ctx)
     
     var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
@@ -116,11 +116,11 @@ fn update_left_environment[dtype: DType](
 
 
 fn update_right_environment[dtype: DType](
-    R_next: DynamicTensor[dtype],
+    R_next: DenseTensor[dtype],
     A_site: MPSSite[dtype],
     W_site: MPOSite[dtype],
     ctx: DeviceContext,
-) raises -> DynamicTensor[dtype]:
+) raises -> DenseTensor[dtype]:
     """Update right environment by contracting one site (propagating leftward).
     
     Contracts the next right environment with the current MPS site, MPO site,
@@ -174,7 +174,7 @@ fn update_right_environment[dtype: DType](
     var A_trans = A.transpose(List[Int](2, 0, 1), ctx)
     var A_flat = A_trans^.reshape(List[Int](Dr, Dl * s))
     
-    var temp1_mat = create_dynamic_tensor[dtype](ctx, List[Int](wR * Dr_prime, Dl * s), init_value=Scalar[dtype](0.0))
+    var temp1_mat = create_dense_tensor[dtype](ctx, List[Int](wR * Dr_prime, Dl * s), init_value=Scalar[dtype](0.0))
     # Contract leading axis of R_flat (Dr) with leading axis of A_flat (Dr).
     dense_tensor_dot(temp1_mat, R_flat^, A_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     
@@ -199,7 +199,7 @@ fn update_right_environment[dtype: DType](
     # Transpose W_mat for dot
     var W_mat_T = W_mat^.transpose(List[Int](1, 0), ctx) # [wR*s, wL*s']
     
-    var temp2_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dr_prime * Dl, wL * s_out), init_value=Scalar[dtype](0.0))
+    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dr_prime * Dl, wL * s_out), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(temp2_mat, temp1_mat2^, W_mat_T^, ctx)
     
     var temp2 = temp2_mat^.reshape(List[Int](Dr_prime, Dl, wL, s_out))
@@ -215,7 +215,7 @@ fn update_right_environment[dtype: DType](
     var A_trans2 = A.transpose(List[Int](2, 1, 0), ctx)
     var A_mat2 = A_trans2^.reshape(List[Int](Dr_prime * s_out, Dl))
     
-    var R_prev_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dl * wL, Dl), init_value=Scalar[dtype](0.0))
+    var R_prev_mat = create_dense_tensor[dtype](ctx, List[Int](Dl * wL, Dl), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(R_prev_mat, temp2_mat3^, A_mat2^, ctx)
     
     var R_prev_temp = R_prev_mat^.reshape(List[Int](Dl, wL, Dl))
@@ -230,7 +230,7 @@ fn build_right_environments[dtype: DType](
     mps: MatrixProductState[dtype],
     mpo: MatrixProductOperator[dtype],
     ctx: DeviceContext,
-) raises -> List[DynamicTensor[dtype]]:
+) raises -> List[DenseTensor[dtype]]:
     """Build all right environments from scratch (initialization for DMRG).
     
     Sweeps from right to left, building R[N], R[N-1], ..., R[0].
@@ -245,14 +245,14 @@ fn build_right_environments[dtype: DType](
         Length is N+1 (includes boundary at position N).
     """
     var N = mps.num_sites()
-    var envs = List[DynamicTensor[dtype]](capacity=N + 1)
+    var envs = List[DenseTensor[dtype]](capacity=N + 1)
     
     # Boundary condition: R[N] is identity (trivial environment at the right edge)
     var wR_boundary = mpo.bond_dimension(N)
     var Dr_boundary = mps.bond_dimension(N)
     
     var R_boundary_shape = List[Int](wR_boundary, Dr_boundary, Dr_boundary)
-    var R_boundary = create_dynamic_tensor[dtype](ctx, R_boundary_shape^, init_value=Scalar[dtype](0.0))
+    var R_boundary = create_dense_tensor[dtype](ctx, R_boundary_shape^, init_value=Scalar[dtype](0.0))
     
     # Set to identity in the (Dr, Dr) subspace
     var host_R = ctx.enqueue_create_host_buffer[dtype](wR_boundary * Dr_boundary * Dr_boundary)
@@ -301,7 +301,7 @@ fn expectation_value[dtype: DType](
     # Left boundary environment: shape [wL0, Dl0, Dl0] with identity in the bond space.
     var wL0 = mpo.bond_dimension(0)
     var Dl0 = mps.bond_dimension(0)
-    var L = create_dynamic_tensor[dtype](
+    var L = create_dense_tensor[dtype](
         ctx,
         List[Int](wL0, Dl0, Dl0)^,
         init_value=Scalar[dtype](0.0),

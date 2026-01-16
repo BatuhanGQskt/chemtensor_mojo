@@ -1,9 +1,9 @@
 from collections.list import List
 from gpu.host import DeviceContext
 from math import sqrt, atan2, sin, cos
-from src.m_tensor.dynamic_tensor import (
-    DynamicTensor,
-    create_dynamic_tensor,
+from src.m_tensor.dense_tensor import (
+    DenseTensor,
+    create_dense_tensor,
     dense_tensor_dot,
     dense_tensor_svd_trunc,
 )
@@ -42,8 +42,8 @@ struct DMRGWorkspace[dtype: DType]:
     Stores left and right environments that are updated incrementally
     during sweeps.
     """
-    var L_env: List[DynamicTensor[dtype]]  # Left environments, length N+1
-    var R_env: List[DynamicTensor[dtype]]  # Right environments, length N+1
+    var L_env: List[DenseTensor[dtype]]  # Left environments, length N+1
+    var R_env: List[DenseTensor[dtype]]  # Right environments, length N+1
     var num_sites: Int
     
     fn __init__(
@@ -65,14 +65,14 @@ struct DMRGWorkspace[dtype: DType]:
         self.R_env = build_right_environments[dtype](mps, mpo, ctx)
         
         # Initialize left environments (will be built during sweep)
-        self.L_env = List[DynamicTensor[dtype]](capacity=self.num_sites + 1)
+        self.L_env = List[DenseTensor[dtype]](capacity=self.num_sites + 1)
         
         # Left boundary: L[0] is identity
         var wL_boundary = mpo.bond_dimension(0)
         var Dl_boundary = mps.bond_dimension(0)
         
         var L_boundary_shape = List[Int](wL_boundary, Dl_boundary, Dl_boundary)
-        var L_boundary = create_dynamic_tensor[dtype](ctx, L_boundary_shape^, init_value=Scalar[dtype](0.0))
+        var L_boundary = create_dense_tensor[dtype](ctx, L_boundary_shape^, init_value=Scalar[dtype](0.0))
         
         # Set to identity
         var host_L = ctx.enqueue_create_host_buffer[dtype](wL_boundary * Dl_boundary * Dl_boundary)
@@ -94,7 +94,7 @@ fn build_two_site_theta[dtype: DType](
     A_i: MPSSite[dtype],
     A_ip1: MPSSite[dtype],
     ctx: DeviceContext,
-) raises -> DynamicTensor[dtype]:
+) raises -> DenseTensor[dtype]:
     """Build two-site wavefunction theta from adjacent MPS tensors.
     
     Contracts the middle bond to form theta[Dl, d_i, d_{i+1}, Dr].
@@ -131,7 +131,7 @@ fn build_two_site_theta[dtype: DType](
     var A_ip1_mat = A_ip1.tensor.reshape(List[Int](Dm, d * Dr))
     
     # Contract: [Dl*d, Dm] @ [Dm, d*Dr] -> [Dl*d, d*Dr]
-    var theta_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dl * d, d * Dr), init_value=Scalar[dtype](0.0))
+    var theta_mat = create_dense_tensor[dtype](ctx, List[Int](Dl * d, d * Dr), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(theta_mat, A_i_mat^, A_ip1_mat^, ctx)
     
     # Reshape to [Dl, d, d, Dr]
@@ -141,7 +141,7 @@ fn build_two_site_theta[dtype: DType](
 
 
 fn split_two_site_theta_svd[dtype: DType](
-    theta: DynamicTensor[dtype],
+    theta: DenseTensor[dtype],
     chi_max: Int,
     eps_trunc: Float64,
     ctx: DeviceContext,
@@ -199,8 +199,8 @@ fn split_two_site_theta_svd[dtype: DType](
         discarded_weight = (total_norm_sq - kept_norm_sq) / total_norm_sq
     
     # Distribute singular values based on sweep direction
-    var A_i_new: DynamicTensor[dtype]
-    var A_ip1_new: DynamicTensor[dtype]
+    var A_i_new: DenseTensor[dtype]
+    var A_ip1_new: DenseTensor[dtype]
     
     if left_to_right:
         # Left-to-right: absorb S into right tensor
@@ -221,7 +221,7 @@ fn split_two_site_theta_svd[dtype: DType](
                 var idx = i * (d * Dr) + j
                 host_Vt[idx] = host_Vt[idx] * s_val
         
-        var SVt = create_dynamic_tensor[dtype](ctx, List[Int](chi_kept, d * Dr), init_value=Scalar[dtype](0.0))
+        var SVt = create_dense_tensor[dtype](ctx, List[Int](chi_kept, d * Dr), init_value=Scalar[dtype](0.0))
         ctx.enqueue_copy(SVt.storage, host_Vt)
         ctx.synchronize()
         
@@ -241,7 +241,7 @@ fn split_two_site_theta_svd[dtype: DType](
                 var idx = i * chi_kept + j
                 host_U[idx] = host_U[idx] * host_S[j]
         
-        var US = create_dynamic_tensor[dtype](ctx, List[Int](Dl * d, chi_kept), init_value=Scalar[dtype](0.0))
+        var US = create_dense_tensor[dtype](ctx, List[Int](Dl * d, chi_kept), init_value=Scalar[dtype](0.0))
         ctx.enqueue_copy(US.storage, host_U)
         ctx.synchronize()
         
@@ -251,13 +251,13 @@ fn split_two_site_theta_svd[dtype: DType](
     return (MPSSite[dtype](A_i_new^), MPSSite[dtype](A_ip1_new^), discarded_weight)
 
 fn apply_two_site_heff[dtype: DType](
-    theta: DynamicTensor[dtype],
-    L_env: DynamicTensor[dtype],
-    R_env: DynamicTensor[dtype],
+    theta: DenseTensor[dtype],
+    L_env: DenseTensor[dtype],
+    R_env: DenseTensor[dtype],
     W_i: MPOSite[dtype],
     W_ip1: MPOSite[dtype],
     ctx: DeviceContext,
-) raises -> DynamicTensor[dtype]:
+) raises -> DenseTensor[dtype]:
     """Apply effective two-site Hamiltonian to theta without forming Heff explicitly.
     
     This is the matrix-free application H_eff|theta> used in Lanczos.
@@ -317,7 +317,7 @@ fn apply_two_site_heff[dtype: DType](
     var L_flat = L_trans^.reshape(List[Int](Dl, wL * Dl_bra))
     var theta_flat = theta.reshape(List[Int](Dl, d * d * Dr))
     
-    var temp1_contract = create_dynamic_tensor[dtype](ctx, List[Int](wL * Dl_bra, d * d * Dr), init_value=Scalar[dtype](0.0))
+    var temp1_contract = create_dense_tensor[dtype](ctx, List[Int](wL * Dl_bra, d * d * Dr), init_value=Scalar[dtype](0.0))
     # Contract leading axis of L_flat (Dl) with leading axis of theta_flat (Dl).
     dense_tensor_dot(temp1_contract, L_flat^, theta_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     
@@ -334,7 +334,7 @@ fn apply_two_site_heff[dtype: DType](
     # W_i [wL, d_i, d_i', wM] -> reshape [wL*d_i, d_i'*wM]
     var Wi_mat = W_i.tensor.reshape(List[Int](wL * d, d_out * wM))
     
-    var temp2_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dl_bra * d * Dr, d_out * wM), init_value=Scalar[dtype](0.0))
+    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_bra * d * Dr, d_out * wM), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(temp2_mat, temp1_mat2^, Wi_mat^, ctx)
     
     var temp2 = temp2_mat^.reshape(List[Int](Dl_bra, d, Dr, d_out, wM))
@@ -350,7 +350,7 @@ fn apply_two_site_heff[dtype: DType](
     # W_{i+1} [wM, d_{i+1}, d_{i+1}', wR] -> reshape [wM*d_{i+1}, d_{i+1}'*wR]
     var Wip1_mat = W_ip1.tensor.reshape(List[Int](wM * d, d_out * wR))
     
-    var temp3_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dl_bra * Dr * d_out, d_out * wR), init_value=Scalar[dtype](0.0))
+    var temp3_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_bra * Dr * d_out, d_out * wR), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(temp3_mat, temp2_mat3^, Wip1_mat^, ctx)
     
     var temp3 = temp3_mat^.reshape(List[Int](Dl_bra, Dr, d_out, d_out, wR))
@@ -366,7 +366,7 @@ fn apply_two_site_heff[dtype: DType](
     # Transpose R to [wR, Dr, Dr'] -> Reshape [wR*Dr, Dr']
     var R_mat = R_env.reshape(List[Int](wR * Dr, Dr_bra))
     
-    var result_mat = create_dynamic_tensor[dtype](ctx, List[Int](Dl_bra * d_out * d_out, Dr_bra), init_value=Scalar[dtype](0.0))
+    var result_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_bra * d_out * d_out, Dr_bra), init_value=Scalar[dtype](0.0))
     dense_tensor_dot(result_mat, temp3_mat4^, R_mat^, ctx)
     
     var result = result_mat^.reshape(List[Int](Dl_bra, d_out, d_out, Dr_bra))
@@ -484,16 +484,16 @@ fn dmrg_two_site[dtype: DType](
 
 
 fn lanczos_two_site_optimize[dtype: DType](
-    initial_theta: DynamicTensor[dtype],
-    L_env: DynamicTensor[dtype],
-    R_env: DynamicTensor[dtype],
+    initial_theta: DenseTensor[dtype],
+    L_env: DenseTensor[dtype],
+    R_env: DenseTensor[dtype],
     W_i: MPOSite[dtype],
     W_ip1: MPOSite[dtype],
     ctx: DeviceContext,
     max_iter: Int,
     tol: Float64,
     reorthogonalize: Bool = True,
-) raises -> Tuple[Float64, DynamicTensor[dtype]]:
+) raises -> Tuple[Float64, DenseTensor[dtype]]:
     """Specialized Lanczos for two-site DMRG optimization without closures.
     
     We build a Krylov subspace with repeated applications of the effective two-site
@@ -615,7 +615,7 @@ fn lanczos_two_site_optimize[dtype: DType](
         host_v0[i] = host_v0[i] / Scalar[dtype](norm0)
 
     # IMPORTANT: don't consume `shape` here; we need it again later.
-    var v_current = create_dynamic_tensor[dtype](ctx, shape.copy()^, init_value=Scalar[dtype](0.0))
+    var v_current = create_dense_tensor[dtype](ctx, shape.copy()^, init_value=Scalar[dtype](0.0))
     ctx.enqueue_copy(v_current.storage, host_v0)
     ctx.synchronize()
 
@@ -729,7 +729,7 @@ fn lanczos_two_site_optimize[dtype: DType](
         for j in range(dim):
             host_out[j] = host_out[j] / Scalar[dtype](out_norm)
 
-    var theta_opt = create_dynamic_tensor[dtype](ctx, shape^, init_value=Scalar[dtype](0.0))
+    var theta_opt = create_dense_tensor[dtype](ctx, shape^, init_value=Scalar[dtype](0.0))
     ctx.enqueue_copy(theta_opt.storage, host_out)
     ctx.synchronize()
 

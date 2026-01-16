@@ -1,17 +1,17 @@
 from collections.list import List
 from gpu.host import DeviceContext
-from m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor
+from m_tensor.dense_tensor import DenseTensor, create_dense_tensor
 from math import sqrt
 
 
 fn lanczos_ground_state[dtype: DType](
-    apply_H: fn(DynamicTensor[dtype], DeviceContext) raises -> DynamicTensor[dtype],
-    initial_vec: DynamicTensor[dtype],
+    apply_H: fn(DenseTensor[dtype], DeviceContext) raises -> DenseTensor[dtype],
+    initial_vec: DenseTensor[dtype],
     ctx: DeviceContext,
     max_iter: Int = 20,
     tol: Float64 = 1e-8,
     reorthogonalize: Bool = True,
-) raises -> Tuple[Float64, DynamicTensor[dtype]]:
+) raises -> Tuple[Float64, DenseTensor[dtype]]:
     """Find the ground state eigenvector and eigenvalue using Lanczos iteration.
     
     Implements the Lanczos algorithm for finding the smallest eigenvalue
@@ -25,7 +25,7 @@ fn lanczos_ground_state[dtype: DType](
     
     Args:
         apply_H: Function that applies the Hamiltonian to a vector.
-                 Takes a DynamicTensor and DeviceContext, returns H|v>.
+                 Takes a DenseTensor and DeviceContext, returns H|v>.
         initial_vec: Initial guess vector (will be normalized).
         ctx: Device context for GPU operations.
         max_iter: Maximum number of Lanczos iterations.
@@ -35,16 +35,16 @@ fn lanczos_ground_state[dtype: DType](
     
     Returns:
         Tuple of (eigenvalue, eigenvector) where eigenvalue is Float64
-        and eigenvector is a DynamicTensor with same shape as initial_vec.
+        and eigenvector is a DenseTensor with same shape as initial_vec.
     
     Example:
         ```mojo
         # Define effective Hamiltonian application
-        fn apply_heff(vec: DynamicTensor[dtype], ctx: DeviceContext) raises -> DynamicTensor[dtype]:
+        fn apply_heff(vec: DenseTensor[dtype], ctx: DeviceContext) raises -> DenseTensor[dtype]:
             # ... contract with environments and MPO ...
             return result
         
-        var initial = create_dynamic_tensor(ctx, shape^)
+        var initial = create_dense_tensor(ctx, shape^)
         var result = lanczos_ground_state(apply_heff, initial^, ctx, max_iter=30)
         var E0 = result[0]
         var psi0 = result[1]
@@ -83,7 +83,7 @@ fn lanczos_ground_state[dtype: DType](
     var beta = List[Float64](capacity=max_iter)
     
     var v_current_shape = initial_vec.shape.copy()
-    var v_current = create_dynamic_tensor[dtype](ctx, v_current_shape^, init_value=Scalar[dtype](0.0))
+    var v_current = create_dense_tensor[dtype](ctx, v_current_shape^, init_value=Scalar[dtype](0.0))
     ctx.enqueue_copy(v_current.storage, host_v0)
     ctx.synchronize()
     
@@ -269,7 +269,7 @@ fn reconstruct_eigenvector[dtype: DType](
     krylov_vectors: List[List[Scalar[dtype]]],
     dim: Int,
     ctx: DeviceContext,
-) raises -> DynamicTensor[dtype]:
+) raises -> DenseTensor[dtype]:
     """Reconstruct the eigenvector from Krylov subspace.
     
     Solves the small tridiagonal eigenproblem to get coefficients,
@@ -283,7 +283,7 @@ fn reconstruct_eigenvector[dtype: DType](
         ctx: Device context.
     
     Returns:
-        Ground state eigenvector as DynamicTensor.
+        Ground state eigenvector as DenseTensor.
     """
     var n = len(alpha)
     
@@ -335,7 +335,7 @@ fn reconstruct_eigenvector[dtype: DType](
     # Copy to device
     # Create 1D tensor with correct shape
     var shape_list = List[Int](dim)  # Assume 1D for now
-    var result_tensor = create_dynamic_tensor[dtype](ctx, shape_list^, init_value=Scalar[dtype](0.0))
+    var result_tensor = create_dense_tensor[dtype](ctx, shape_list^, init_value=Scalar[dtype](0.0))
     ctx.enqueue_copy(result_tensor.storage, host_result)
     ctx.synchronize()
     

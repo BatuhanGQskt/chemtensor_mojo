@@ -1,7 +1,7 @@
 from sys import has_accelerator
 from src.m_tensor.static_tensor import create_static_tensor, create_static_tensor_with_stride
-from src.m_tensor.dynamic_tensor import DynamicTensor, create_dynamic_tensor, create_dynamic_tensor_from_data, dense_tensor_dot, dense_tensor_qr, dense_tensor_svd_trunc_lapack_f64
-from src.m_tensor.complex_tensor import ComplexDynamicTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
+from src.m_tensor.dense_tensor import DenseTensor, create_dense_tensor, create_dense_tensor_from_data, dense_tensor_dot, dense_tensor_qr, dense_tensor_svd_trunc_lapack_f64
+from src.m_tensor.complex_tensor import ComplexDenseTensor, create_complex_tensor, create_complex_tensor_from_data, complex_matmul, create_complex_identity
 from layout.layout import DimList, Layout
 from gpu import thread_idx, block_idx, block_dim
 from gpu.host import DeviceContext
@@ -267,7 +267,7 @@ fn test_dense_qr() raises:
         data.append(-41.0)
         
         var shape = List[Int](3, 3)
-        var A = create_dynamic_tensor_from_data[DType.float32](ctx, data, shape^)
+        var A = create_dense_tensor_from_data[DType.float32](ctx, data, shape^)
         
         print("Matrix A:")
         A.print_tensor(ctx)
@@ -289,12 +289,12 @@ fn test_dense_qr() raises:
         print("Verification 1: Computing Q @ R (should equal A)...")
         
         # Need to create new QR for A since we moved it
-        var A2 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A2 = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         var result2 = dense_tensor_qr[DType.float32](A2, ctx)
         var Q2 = result2[0]
         var R2 = result2[1]
         
-        var A_reconstructed = create_dynamic_tensor[DType.float32](
+        var A_reconstructed = create_dense_tensor[DType.float32](
             ctx, List[Int](3, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](A_reconstructed, Q2^, R2^, ctx)
@@ -304,7 +304,7 @@ fn test_dense_qr() raises:
         A_reconstructed.print_tensor(ctx)
         
         print("\nOriginal A (for comparison):")
-        var A_original = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A_original = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         A_original.print_tensor(ctx)
         
         # Verification 2: Q^T @ Q ≈ I
@@ -312,7 +312,7 @@ fn test_dense_qr() raises:
         print("Verification 2: Computing Q^T @ Q (should be identity)...")
         
         # Need another copy of Q for transpose
-        var A3 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A3 = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         var result3 = dense_tensor_qr[DType.float32](A3, ctx)
         var Q3 = result3[0]
         var Q4 = result3[1]  # Not used, just to consume the tuple
@@ -322,11 +322,11 @@ fn test_dense_qr() raises:
         var Q_T = Q3^.transpose(perm, ctx)
         
         # Get another Q for the multiplication
-        var A4 = create_dynamic_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
+        var A4 = create_dense_tensor_from_data[DType.float32](ctx, data, List[Int](3, 3)^)
         var result4 = dense_tensor_qr[DType.float32](A4, ctx)
         var Q5 = result4[0]
         
-        var Q_T_Q = create_dynamic_tensor[DType.float32](
+        var Q_T_Q = create_dense_tensor[DType.float32](
             ctx, List[Int](3, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](Q_T_Q, Q_T^, Q5^, ctx)
@@ -349,7 +349,7 @@ fn test_dense_qr() raises:
             data_rect.append(Float32(i + 1))
         
         var shape_rect = List[Int](4, 3)
-        var A_rect = create_dynamic_tensor_from_data[DType.float32](
+        var A_rect = create_dense_tensor_from_data[DType.float32](
             ctx, data_rect, shape_rect^
         )
         
@@ -367,7 +367,7 @@ fn test_dense_qr() raises:
         R_rect.print_tensor(ctx)
         
         # Verify reconstruction
-        var A_rect_recon = create_dynamic_tensor[DType.float32](
+        var A_rect_recon = create_dense_tensor[DType.float32](
             ctx, List[Int](4, 3)^, init_value=Scalar[DType.float32](0.0)
         )
         dense_tensor_dot[DType.float32](A_rect_recon, Q_rect^, R_rect^, ctx)
@@ -473,7 +473,7 @@ fn test_mps_creation() raises:
 
         print("Test 3: mps_orthogonalize_qr via QR sweep...")
         var dense_shape = List[Int](physical_dim, physical_dim, physical_dim)
-        var dense_state = create_dynamic_tensor[dtype](ctx, dense_shape.copy())
+        var dense_state = create_dense_tensor[dtype](ctx, dense_shape.copy())
         var sweep_mps = mps_orthogonalize_qr[dtype](ctx, dense_state^)
         sweep_mps.describe()
 
@@ -535,7 +535,7 @@ fn test_dense_svd_trunc() raises:
         data.append(0.0)
         
         var shape = List[Int](4, 3)
-        var A = create_dynamic_tensor_from_data[DType.float64](ctx, data, shape^)
+        var A = create_dense_tensor_from_data[DType.float64](ctx, data, shape^)
         
         print("Matrix A:")
         A.print_tensor(ctx)
@@ -739,9 +739,9 @@ def main():
 #                 data_B.append(Float32(i + 1) * 0.5)
             
 #             # Create dynamic tensors from data
-#             var tensor_A = create_dynamic_tensor_from_data[DType.float32](ctx, data_A, dims_A^)
-#             var tensor_B = create_dynamic_tensor_from_data[DType.float32](ctx, data_B, dims_B^)
-#             var tensor_C = create_dynamic_tensor[DType.float32](ctx, dims_C^, init_value=0.0)
+#             var tensor_A = create_dense_tensor_from_data[DType.float32](ctx, data_A, dims_A^)
+#             var tensor_B = create_dense_tensor_from_data[DType.float32](ctx, data_B, dims_B^)
+#             var tensor_C = create_dense_tensor[DType.float32](ctx, dims_C^, init_value=0.0)
             
 #             print("\nTensor A created: ", tensor_A)
 #             print("Tensor B created: ", tensor_B)
@@ -790,7 +790,7 @@ def main():
 #             var data_3d = List[Float32]()
 #             for i in range(24):
 #                 data_3d.append(Float32(i))
-#             var tensor_3d = create_dynamic_tensor_from_data[DType.float32](ctx, data_3d, shape_3d^)
+#             var tensor_3d = create_dense_tensor_from_data[DType.float32](ctx, data_3d, shape_3d^)
 #             print("3D Tensor: ", tensor_3d)
 #             print("Is contiguous: ", tensor_3d.is_contiguous())
             
@@ -840,9 +840,9 @@ def main():
 #         var shape_B = List[Int](1, 2, 5, 7)
 #         var shape_C = List[Int](4, 3, 5, 7)  # Result shape
         
-#         var A = create_dynamic_tensor[DType.float32](ctx, shape_A^, init_value=2.0)
-#         var B = create_dynamic_tensor[DType.float32](ctx, shape_B^, init_value=3.0)
-#         var C = create_dynamic_tensor[DType.float32](ctx, shape_C^, init_value=0.0)
+#         var A = create_dense_tensor[DType.float32](ctx, shape_A^, init_value=2.0)
+#         var B = create_dense_tensor[DType.float32](ctx, shape_B^, init_value=3.0)
+#         var C = create_dense_tensor[DType.float32](ctx, shape_C^, init_value=0.0)
         
 #         print("  A shape:", A)
 #         print("  B shape:", B)
@@ -868,9 +868,9 @@ def main():
 #         var shape_B2 = List[Int](4, 5, 6)
 #         var shape_C2 = List[Int](2, 3, 5, 6)
         
-#         var A2 = create_dynamic_tensor[DType.float32](ctx, shape_A2^, init_value=1.0)
-#         var B2 = create_dynamic_tensor[DType.float32](ctx, shape_B2^, init_value=0.5)
-#         var C2 = create_dynamic_tensor[DType.float32](ctx, shape_C2^, init_value=0.0)
+#         var A2 = create_dense_tensor[DType.float32](ctx, shape_A2^, init_value=1.0)
+#         var B2 = create_dense_tensor[DType.float32](ctx, shape_B2^, init_value=0.5)
+#         var C2 = create_dense_tensor[DType.float32](ctx, shape_C2^, init_value=0.0)
         
 #         print("  A2 shape:", A2)
 #         print("  B2 shape:", B2)

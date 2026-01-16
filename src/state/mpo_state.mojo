@@ -1,9 +1,9 @@
 from collections.list import List
 from gpu.host import DeviceContext
-from src.m_tensor.dynamic_tensor import (
-    DynamicTensor,
-    create_dynamic_tensor,
-    create_dynamic_tensor_from_data,
+from src.m_tensor.dense_tensor import (
+    DenseTensor,
+    create_dense_tensor,
+    create_dense_tensor_from_data,
 )
 
 
@@ -11,14 +11,14 @@ from src.m_tensor.dynamic_tensor import (
 struct MPOSite[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     """Single site tensor inside an MPO (Matrix Product Operator).
     
-    Each site is stored as a rank-4 DynamicTensor with layout
+    Each site is stored as a rank-4 DenseTensor with layout
     [left_bond, phys_in, phys_out, right_bond] or [Wl, d_in, d_out, Wr].
     
     This convention matches the standard ChemTensor Python implementation:
     - Contract phys_in with ket physical index
     - phys_out becomes the new physical index
     """
-    var tensor: DynamicTensor[dtype]
+    var tensor: DenseTensor[dtype]
     
     fn rank(self) -> Int:
         return len(self.tensor.shape)
@@ -234,7 +234,7 @@ fn create_identity_mpo[dtype: DType = DType.float32](
                 else:
                     data.append(Scalar[dtype](0.0))
         
-        var site_tensor = create_dynamic_tensor_from_data[dtype](ctx, data, shape^)
+        var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
         sites.append(MPOSite[dtype](site_tensor^))
     
     return MatrixProductOperator[dtype](sites^)
