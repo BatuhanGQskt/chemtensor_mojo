@@ -784,27 +784,66 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     var A_contig = A^.copy_to_contiguous(ctx)
     var B_contig = B^.copy_to_contiguous(ctx)
 
-    # Flatten non-contracted dimensions first
-    var A_flat_step1 = A_contig^.flatten_dims(A_noncont_start, A_noncont_end, ctx)
-    var B_flat_step1 = B_contig^.flatten_dims(B_noncont_start, B_noncont_end, ctx)
+    # Flatten non-contracted dimensions first (skip if range is empty)
+    var A_flat_step1: DynamicTensor[dtype]
+    if A_noncont_start < A_noncont_end:
+        A_flat_step1 = A_contig^.flatten_dims(A_noncont_start, A_noncont_end, ctx)
+    else:
+        # No non-contracted dims (all dims are contracted) - use as-is
+        A_flat_step1 = A_contig^
+    
+    var B_flat_step1: DynamicTensor[dtype]
+    if B_noncont_start < B_noncont_end:
+        B_flat_step1 = B_contig^.flatten_dims(B_noncont_start, B_noncont_end, ctx)
+    else:
+        # No non-contracted dims (all dims are contracted) - use as-is
+        B_flat_step1 = B_contig^
     
     # Now flatten the contracted dimensions
     # For A: if axrange_A is False (trailing), non-contracted are [0, rank-ndim], contracted are [rank-ndim, rank]
     #        After flattening non-contracted [0, rank-ndim), contracted dims are now at [1, 1+ndim_mult)
     # For A: if axrange_A is True (leading), non-contracted are [ndim, rank], contracted are [0, ndim]
     #        After flattening non-contracted [ndim, rank), contracted dims are still at [0, ndim_mult)
-    var A_contract_start = 1 if not axrange_A else 0
-    var A_contract_end = A_contract_start + ndim_mult
+    var A_contract_start: Int
+    var A_contract_end: Int
+    if A_noncont_start < A_noncont_end:
+        # Had non-contracted dims, so contracted dims shifted
+        A_contract_start = 1 if not axrange_A else 0
+        A_contract_end = A_contract_start + ndim_mult
+    else:
+        # All dims are contracted, they're at [0, ndim_mult)
+        A_contract_start = 0
+        A_contract_end = ndim_mult
     
     # For B: if effective_axrange_B is True (leading), contracted are [0, ndim], non-contracted are [ndim, rank]
     #        After flattening non-contracted [ndim, rank), contracted dims are still at [0, ndim_mult)
     # For B: if effective_axrange_B is False (trailing), non-contracted are [0, rank-ndim], contracted are [rank-ndim, rank]
     #        After flattening non-contracted [0, rank-ndim), contracted dims are now at [1, 1+ndim_mult)
-    var B_contract_start = 0 if effective_axrange_B else 1
-    var B_contract_end = B_contract_start + ndim_mult
+    var B_contract_start: Int
+    var B_contract_end: Int
+    if B_noncont_start < B_noncont_end:
+        # Had non-contracted dims
+        B_contract_start = 0 if effective_axrange_B else 1
+        B_contract_end = B_contract_start + ndim_mult
+    else:
+        # All dims are contracted (e.g., 1D vector), they're at [0, ndim_mult)
+        B_contract_start = 0
+        B_contract_end = ndim_mult
     
     var A_flat = A_flat_step1^.flatten_dims(A_contract_start, A_contract_end, ctx)  # Now 2D: m x k or k x m
     var B_flat = B_flat_step1^.flatten_dims(B_contract_start, B_contract_end, ctx)  # Now 2D: k x n or n x k
+    
+    # Handle 1D tensors: if B_flat is still 1D after flattening, reshape to 2D column vector
+    if len(B_flat.shape) == 1:
+        # Reshape (k,) to (k, 1) for matrix multiplication
+        var B_flat_2d = B_flat^.reshape(List[Int](B_flat.shape[0], 1))
+        B_flat = B_flat_2d^
+    
+    # Handle 1D tensors: if A_flat is still 1D after flattening, reshape to 2D row vector
+    if len(A_flat.shape) == 1:
+        # Reshape (m,) to (1, m) for matrix multiplication
+        var A_flat_2d = A_flat^.reshape(List[Int](1, A_flat.shape[0]))
+        A_flat = A_flat_2d^
 
     # Transpose if leading (to make row-major inner contract)
     var trans_A = axrange_A
@@ -824,12 +863,39 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DynamicTensor[dtype], var A
     for i in range(len(B_shape_for_C)):
         C_shape_expected.append(B_shape_for_C[i])
     
+    # Special case: scalar result (rank 0) can be represented as (1,) in Mojo
+    # This happens when both A and B are 1D and we contract their only axes
+    var is_scalar_result = len(C_shape_expected) == 0
+    var C_shape_actual = C.shape.copy()
+    
+    # Helper to format shape list as string
+    fn format_shape(shape: List[Int]) -> String:
+        var s = String("[")
+        for i in range(len(shape)):
+            if i > 0:
+                s += ", "
+            s += String(shape[i])
+        s += "]"
+        return s
+    
     # Verify C has the correct shape
-    if len(C.shape) != len(C_shape_expected):
-        raise Error("Output tensor C has wrong rank")
-    for i in range(len(C_shape_expected)):
-        if C.shape[i] != C_shape_expected[i]:
-            raise Error("Output tensor C has wrong shape")
+    if is_scalar_result:
+        # Accept either [] (rank 0) or [1] (rank 1) as scalar representation
+        if len(C_shape_actual) == 0:
+            # True scalar - reshape C to (1,) for matmul compatibility
+            C_shape_actual = List[Int](1)
+        elif len(C_shape_actual) == 1 and C_shape_actual[0] == 1:
+            # Already (1,) - this is fine
+            pass
+        else:
+            raise Error("Output tensor C for scalar result must be [] or [1], got " + format_shape(C_shape_actual))
+    else:
+        # Non-scalar result: shapes must match exactly
+        if len(C_shape_actual) != len(C_shape_expected):
+            raise Error("Output tensor C has wrong rank: expected " + String(len(C_shape_expected)) + " got " + String(len(C_shape_actual)))
+        for i in range(len(C_shape_expected)):
+            if C_shape_actual[i] != C_shape_expected[i]:
+                raise Error("Output tensor C has wrong shape: expected " + format_shape(C_shape_expected) + " got " + format_shape(C_shape_actual))
 
     # Calculate the 2D shape for matrix multiplication
     # m = product of A's non-contracted dimensions
