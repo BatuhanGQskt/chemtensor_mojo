@@ -117,7 +117,8 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
         ctx, W0_data^, List[Int](1, 3, d, d)
     )
     # Transpose to [Wl, d, d, Wr] = [1, 2, 2, 3]
-    var W0_tensor = W0_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var W0_transposed = W0_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var W0_tensor = W0_transposed^.copy_to_contiguous(ctx)
     sites.append(MPOSite[dtype](W0_tensor^))
     
     # Bulk sites (middle) - shape [3, 3, 2, 2]
@@ -143,7 +144,8 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
             ctx, W_bulk_data^, List[Int](3, 3, d, d)
         )
         # Transpose to [Wl, d, d, Wr] = [3, 2, 2, 3]
-        var W_bulk_tensor = W_bulk_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+        var W_bulk_transposed = W_bulk_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+        var W_bulk_tensor = W_bulk_transposed^.copy_to_contiguous(ctx)
         sites.append(MPOSite[dtype](W_bulk_tensor^))
     
     # Last site (right edge) - shape [3, 1, 2, 2]
@@ -162,7 +164,8 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
         ctx, WN_data^, List[Int](3, 1, d, d)
     )
     # Transpose to [Wl, d, d, Wr] = [3, 2, 2, 1]
-    var WN_tensor = WN_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var WN_transposed = WN_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var WN_tensor = WN_transposed^.copy_to_contiguous(ctx)
     sites.append(MPOSite[dtype](WN_tensor^))
     
     return MatrixProductOperator[dtype](sites^)
@@ -243,7 +246,8 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
         ctx, W0_data^, List[Int](1, 5, d, d)
     )
     # Transpose to [Wl, d, d, Wr]
-    var W0_tensor = W0_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var W0_transposed = W0_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var W0_tensor = W0_transposed^.copy_to_contiguous(ctx)
     sites.append(MPOSite[dtype](W0_tensor^))
     
     # Bulk sites - shape [5, 5, 2, 2]
@@ -277,7 +281,8 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
             ctx, W_bulk_data^, List[Int](5, 5, d, d)
         )
         # Transpose to [Wl, d, d, Wr]
-        var W_bulk_tensor = W_bulk_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+        var W_bulk_transposed = W_bulk_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+        var W_bulk_tensor = W_bulk_transposed^.copy_to_contiguous(ctx)
         sites.append(MPOSite[dtype](W_bulk_tensor^))
     
     # Last site - shape [5, 1, 2, 2] -> [0, JX, JY, JZ, I]^T
@@ -292,7 +297,8 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
         ctx, WN_data^, List[Int](5, 1, d, d)
     )
     # Transpose to [Wl, d, d, Wr]
-    var WN_tensor = WN_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var WN_transposed = WN_temp.transpose(List[Int](0, 2, 3, 1), ctx)
+    var WN_tensor = WN_transposed^.copy_to_contiguous(ctx)
     sites.append(MPOSite[dtype](WN_tensor^))
     
     return MatrixProductOperator[dtype](sites^)
