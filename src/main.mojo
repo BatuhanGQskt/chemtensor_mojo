@@ -12,7 +12,7 @@ from python import Python
 from layout import IntTuple, LayoutTensor, RuntimeTuple
 from layout.runtime_layout import RuntimeLayout, make_layout
 from complex import ComplexSIMD
-from state.mps_state import create_product_mps, create_uniform_mps, create_mps_from_dense_state
+from state.mps_state import create_product_mps, create_uniform_mps, mps_orthogonalize_qr
 
 alias dtype = DType.float32
 
@@ -468,10 +468,10 @@ fn test_mps_creation() raises:
 
         print("Product-state MPS creation passed bond checks.\n")
 
-        print("Test 3: create_mps_from_dense_state via QR sweep...")
+        print("Test 3: mps_orthogonalize_qr via QR sweep...")
         var dense_shape = List[Int](physical_dim, physical_dim, physical_dim)
         var dense_state = create_dynamic_tensor[dtype](ctx, dense_shape.copy())
-        var sweep_mps = create_mps_from_dense_state[dtype](ctx, dense_state^)
+        var sweep_mps = mps_orthogonalize_qr[dtype](ctx, dense_state^)
         sweep_mps.describe()
 
         if sweep_mps.num_sites() != len(dense_shape):
