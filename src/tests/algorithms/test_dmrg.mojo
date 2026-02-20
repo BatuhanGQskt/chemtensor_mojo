@@ -118,7 +118,7 @@ fn test_dmrg_singlesite_proxy() raises:
             tol_split=-1.0,
         )
         save_dmrg_results_to_json(
-            "dmrg_results_mojo_singlesite.json",
+            "results/algorithms/dmrg/dmrg_results_mojo_singlesite.json",
             "mojo", "heisenberg_xxz",
             json_params,
             ground_energy,
@@ -127,7 +127,7 @@ fn test_dmrg_singlesite_proxy() raises:
             ground_state.bond_dims,
             1.0,
         )
-        print("Results written to dmrg_results_mojo_singlesite.json")
+        print("Results written to results/algorithms/dmrg/dmrg_results_mojo_singlesite.json")
 
         # Assertions (same style as MPS/MPO/dense tensor tests)
         var norm_mojo = mps_norm[DType.float32](ground_state, ctx)
@@ -228,7 +228,7 @@ fn test_dmrg_twosite_manual() raises:
             tol_split=1e-10,
         )
         save_dmrg_results_to_json(
-            "dmrg_results_mojo_twosite.json",
+            "results/algorithms/dmrg/dmrg_results_mojo_twosite.json",
             "mojo", "heisenberg_xxz",
             json_params,
             ground_energy,
@@ -237,7 +237,7 @@ fn test_dmrg_twosite_manual() raises:
             ground_state.bond_dims,
             1.0,
         )
-        print("Results written to dmrg_results_mojo_twosite.json")
+        print("Results written to results/algorithms/dmrg/dmrg_results_mojo_twosite.json")
 
         # Assertions
         var norm_mojo = mps_norm[DType.float32](ground_state, ctx)

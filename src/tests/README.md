@@ -58,8 +58,11 @@ From the Mojo project root (`chemtensor_mojo/chemtensor_mojo`):
 
 This discovers and runs all `test_*.mojo` files under `src/tests` (default). Options:
 
-- `./tools/run_tests.sh [-dw|--disable-warnings] [--quiet] [test_dir]`
+- `./tools/run_tests.sh [-dw|--disable-warnings] [-q|--quiet] [test_dir]`
 - Example: `./tools/run_tests.sh -dw src/tests/algorithms`
+- Use `--quiet` or `-q` to hide per-test output and only show PASSED/FAILED lines plus the final summary.
+
+At the end, a **test summary** is printed: results grouped by directory (e.g. `src/tests/state/mps/`), with per-file pass/fail and, when available, per-function status (from Mojo `TestSuite` output).
 
 To run a single test file:
 
