@@ -5,6 +5,7 @@ from src.m_tensor.dense_tensor import (
     create_dense_tensor,
     create_dense_tensor_from_data,
     dense_tensor_qr,
+    dense_tensor_dot,
 )
 
 
@@ -443,4 +444,61 @@ fn mps_orthogonalize_qr[dtype: DType = DType.float32](
     sites.append(MPSSite[dtype](final_site^))
 
     return MatrixProductState[dtype](sites^)
+
+
+fn mps_to_statevector[dtype: DType = DType.float32](
+    psi: MatrixProductState[dtype],
+    ctx: DeviceContext,
+) raises -> DenseTensor[dtype]:
+    """Contract MPS to full state vector (size d^L) in row-major physical index order.
+
+    Same convention as C mps_to_statevector: coefficient of |i0,i1,...,i_{L-1}>
+    is at linear index i0 + i1*d + ... + i_{L-1}*d^{L-1}.
+
+    Only feasible for small L due to exponential size.
+    """
+    var L = psi.num_sites()
+    if L == 0:
+        raise Error("mps_to_statevector requires at least one site")
+    # First site: [1, d, D1] -> [d, D1]
+    var result = psi.sites[0].tensor
+    var left_dim = result.shape[0] * result.shape[1]
+    var right_dim = result.shape[2]
+    result = result^.reshape(List[Int](left_dim, right_dim))
+    for i in range(1, L):
+        var site = psi.sites[i].tensor
+        var D_i = site.shape[0]
+        var d_i = site.shape[1]
+        var D_next = site.shape[2]
+        if right_dim != D_i:
+            raise Error("Bond dimension mismatch in mps_to_statevector")
+        var site_flat = site.reshape(List[Int](D_i, d_i * D_next))
+        # Matmul result (left_dim, right_dim) @ (D_i, d_i*D_next) has shape (left_dim, d_i*D_next)
+        var dot_rows = left_dim
+        var dot_cols = d_i * D_next
+        var result_new = create_dense_tensor[dtype](
+            ctx, List[Int](dot_rows, dot_cols), row_major=True, init_value=Scalar[dtype](0.0)
+        )
+        dense_tensor_dot(result_new, result^, site_flat^, ctx)
+        # Reshape to (left_dim*d_i, D_next) for next iteration
+        result = result_new^.reshape(List[Int](left_dim * d_i, D_next))
+        left_dim = left_dim * d_i
+        right_dim = D_next
+    if right_dim != 1:
+        raise Error("Expected trailing bond dimension 1 in mps_to_statevector")
+    var total = left_dim
+    return result^.reshape(List[Int](total))
+
+
+fn mps_norm[dtype: DType = DType.float32](
+    psi: MatrixProductState[dtype],
+    ctx: DeviceContext,
+) raises -> Float64:
+    """Compute Euclidean norm of the MPS (sqrt of inner product with itself).
+
+    Implemented by contracting to state vector then computing norm, so only
+    suitable for small systems. Tolerates small numerical error (implementation-agnostic).
+    """
+    var vec = mps_to_statevector[dtype](psi, ctx)
+    return vec.norm(ctx)
 

@@ -339,3 +339,167 @@ fn expectation_value_normalized[dtype: DType](
     if abs(denom) < 1e-20:
         raise Error("MPS norm is ~0 in expectation_value_normalized")
     return num / denom
+
+
+fn update_left_environment_two_mps[dtype: DType](
+    L_prev: DenseTensor[dtype],
+    A_bra: MPSSite[dtype],
+    A_ket: MPSSite[dtype],
+    W_site: MPOSite[dtype],
+    ctx: DeviceContext,
+) raises -> DenseTensor[dtype]:
+    """Update left environment with different bra and ket MPS (for overlap, etc.).
+    
+    Same as update_left_environment but A_bra and A_ket can differ.
+    L_prev[wL,Dl,Dl'] x A_ket[Dl,s,Dr] x W[wL,s,s',wR] x A_bra[Dl',s',Dr'] -> L_next[wR,Dr,Dr'].
+    """
+    var A_ket_t = A_ket.tensor
+    var A_bra_t = A_bra.tensor
+    var W = W_site.tensor
+
+    var L_shape = L_prev.shape.copy()
+    var wL = L_shape[0]
+    var Dl_prev = L_shape[1]
+    var Dl_prime = L_shape[2]
+    var s = A_ket_t.shape[1]
+    var Dr = A_ket_t.shape[2]
+
+    var L_trans = L_prev.transpose(List[Int](1, 0, 2), ctx)
+    var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
+    var A_ket_flat = A_ket_t.reshape(List[Int](Dl_prev, s * Dr))
+
+    var temp1_contract = create_dense_tensor[dtype](ctx, List[Int](wL * Dl_prime, s * Dr), init_value=Scalar[dtype](0.0))
+    dense_tensor_dot(temp1_contract, L_flat^, A_ket_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
+
+    var temp1_full = temp1_contract^.reshape(List[Int](wL, Dl_prime, s, Dr))
+
+    var W_shape = W.shape.copy()
+    var s_out = W_shape[2]
+    var wR = W_shape[3]
+
+    var temp1_perm = temp1_full^.transpose(List[Int](1, 3, 0, 2), ctx)
+    var temp1_mat = temp1_perm^.reshape(List[Int](Dl_prime * Dr, wL * s))
+    var W_mat = W.reshape(List[Int](wL * s, s_out * wR))
+
+    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR), init_value=Scalar[dtype](0.0))
+    dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
+
+    var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
+    var temp2_perm = temp2^.transpose(List[Int](1, 3, 0, 2), ctx)
+    var temp2_mat2 = temp2_perm^.reshape(List[Int](Dr * wR, Dl_prime * s_out))
+
+    var A_bra_flat = A_bra_t.reshape(List[Int](Dl_prime * s_out, Dr))
+
+    var L_next_mat = create_dense_tensor[dtype](ctx, List[Int](Dr * wR, Dr), init_value=Scalar[dtype](0.0))
+    dense_tensor_dot(L_next_mat, temp2_mat2^, A_bra_flat^, ctx)
+
+    var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
+    var L_next = L_next_temp^.transpose(List[Int](1, 0, 2), ctx)
+    return L_next^
+
+
+fn expectation_value_two_mps[dtype: DType](
+    mps_bra: MatrixProductState[dtype],
+    mpo: MatrixProductOperator[dtype],
+    mps_ket: MatrixProductState[dtype],
+    ctx: DeviceContext,
+) raises -> Float64:
+    """Compute <mps_bra|mpo|mps_ket> with different bra and ket MPS."""
+    var N = mps_bra.num_sites()
+    if mpo.num_sites() != N or mps_ket.num_sites() != N:
+        raise Error("expectation_value_two_mps: length mismatch")
+
+    var wL0 = mpo.bond_dimension(0)
+    var Dl0 = mps_bra.bond_dimension(0)
+    var L = create_dense_tensor[dtype](ctx, List[Int](wL0, Dl0, Dl0)^, init_value=Scalar[dtype](0.0))
+    var host_L = ctx.enqueue_create_host_buffer[dtype](wL0 * Dl0 * Dl0)
+    for w in range(wL0):
+        for d in range(Dl0):
+            host_L[w * (Dl0 * Dl0) + d * Dl0 + d] = Scalar[dtype](1.0)
+    ctx.enqueue_copy(L.storage, host_L)
+    ctx.synchronize()
+
+    for i in range(N):
+        L = update_left_environment_two_mps[dtype](L^, mps_bra.sites[i], mps_ket.sites[i], mpo.sites[i], ctx)
+
+    if L.size != 1:
+        raise Error("Unexpected final environment size in expectation_value_two_mps: " + String(L.size))
+
+    var host_out = ctx.enqueue_create_host_buffer[dtype](1)
+    ctx.enqueue_copy(host_out, L.storage)
+    ctx.synchronize()
+    return Float64(host_out[0])
+
+
+fn mps_overlap[dtype: DType](
+    mps_bra: MatrixProductState[dtype],
+    mps_ket: MatrixProductState[dtype],
+    ctx: DeviceContext,
+) raises -> Float64:
+    """Compute <mps_bra|mps_ket> using identity MPO (gauge-invariant for fidelity)."""
+    var id_mpo = create_identity_mpo[dtype](ctx, mps_bra.num_sites(), mps_bra.physical_dim)
+    return expectation_value_two_mps[dtype](mps_bra, id_mpo, mps_ket, ctx)
+
+
+fn variance[dtype: DType](
+    mps: MatrixProductState[dtype],
+    mpo: MatrixProductOperator[dtype],
+    ctx: DeviceContext,
+) raises -> Float64:
+    """Compute var = <H^2> - <H>^2 via MPO composition.
+    
+    Builds H^2 MPO and computes <mps|H^2|mps> using dense_tensor_dot for composition.
+    """
+    var E = expectation_value_normalized[dtype](mps, mpo, ctx)
+    var H2 = mpo_compose[dtype](mpo, mpo, ctx)
+    var E2 = expectation_value_normalized[dtype](mps, H2^, ctx)
+    return E2 - E * E
+
+
+fn mpo_compose[dtype: DType](
+    mpo_a: MatrixProductOperator[dtype],
+    mpo_b: MatrixProductOperator[dtype],
+    ctx: DeviceContext,
+) raises -> MatrixProductOperator[dtype]:
+    """Compose two MPOs: (A o B)|psi> = A(B|psi>).
+    
+    At each site: W_new = sum_d_mid W_a[:,:,d_mid,:] * W_b[:,d_mid,:,:]
+    Flatten bonds: left (wLa,wLb), right (wRa,wRb).
+    """
+    var N = mpo_a.num_sites()
+    if mpo_b.num_sites() != N:
+        raise Error("MPO compose: length mismatch")
+
+    var sites = List[MPOSite[dtype]](capacity=N)
+    for i in range(N):
+        var Wa = mpo_a.sites[i].tensor
+        var Wb = mpo_b.sites[i].tensor
+        var sa = Wa.shape.copy()
+        var sb = Wb.shape.copy()
+        var wLa = sa[0]
+        var d_in = sa[1]
+        var d_mid = sa[2]
+        var wRa = sa[3]
+        var wLb = sb[0]
+        var d_out = sb[2]
+        var wRb = sb[3]
+        if sb[1] != d_mid:
+            raise Error("MPO compose: physical dim mismatch at site " + String(i))
+
+        var wL_new = wLa * wLb
+        var wR_new = wRa * wRb
+
+        var Wa_perm = Wa.transpose(List[Int](0, 1, 3, 2), ctx)
+        var Wa_flat = Wa_perm^.reshape(List[Int](wLa * d_in * wRa, d_mid))
+        var Wb_perm = Wb.transpose(List[Int](1, 0, 2, 3), ctx)
+        var Wb_flat = Wb_perm^.reshape(List[Int](d_mid, wLb * d_out * wRb))
+
+        var C_mat = create_dense_tensor[dtype](ctx, List[Int](wLa * d_in * wRa, wLb * d_out * wRb), init_value=Scalar[dtype](0.0))
+        dense_tensor_dot(C_mat, Wa_flat^, Wb_flat^, ctx)
+
+        var C = C_mat^.reshape(List[Int](wLa, d_in, wRa, wLb, d_out, wRb))
+        var C_perm = C^.transpose(List[Int](0, 3, 1, 4, 2, 5), ctx)
+        var site_tensor = C_perm^.reshape(List[Int](wL_new, d_in, d_out, wR_new))
+        sites.append(MPOSite[dtype](site_tensor^))
+
+    return MatrixProductOperator[dtype](sites^)

@@ -25,7 +25,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     allows complete flexibility at runtime.
     
     Parameters:
-        dtype: The data type of the tensor elements (e.g., DType.float32, DType.float64).
+        dtype: The data type of the tensor elements (e.g., DType.float32, DType.float32).
     """
     var storage: DeviceBuffer[dtype]  # GPU storage for tensor data
     var shape: List[Int]  # Runtime shape
@@ -219,21 +219,18 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         """Transpose tensor dimensions according to a permutation.
         
         Reorders the dimensions of the tensor according to the permutation list.
-        For 2D tensors with permutation [1, 0], this performs a standard matrix transpose.
-        
-        Implementation details:
-        - For 2D transpose [1,0]: Creates a physically transposed copy in memory
-        - For other permutations: Creates a view with reordered shape/stride (no copy)
+        Creates a physically transposed copy in memory so the result is contiguous
+        and compatible with reshape and other operations that assume row-major layout.
         
         Args:
             self: The tensor to transpose (ownership transferred).
             perm: Permutation list specifying the new axis order.
+                  perm[i] = j means new dimension i comes from original dimension j.
                   Must have length equal to tensor rank.
-                  Each element is an index into the original dimensions.
-            ctx: Device context for GPU operations (used for 2D transpose copy).
+            ctx: Device context for GPU operations.
         
         Returns:
-            A new DenseTensor with transposed dimensions.
+            A new DenseTensor with physically transposed data (contiguous row-major).
         
         Raises:
             Error: If perm length doesn't match tensor rank.
@@ -245,64 +242,63 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
                 List[Float32](1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
                 List[Int](2, 3)^  # Shape: [2, 3]
             )
-            # Original: [[1, 2, 3],
-            #            [4, 5, 6]]
-            
             var perm = List[Int](1, 0)  # Swap rows and columns
             var transposed = matrix^.transpose(perm, ctx)
-            # Result shape: [3, 2]
-            # Result: [[1, 4],
-            #          [2, 5],
-            #          [3, 6]]
+            # Result shape: [3, 2], contiguous in memory
             
-            # 3D tensor transpose
-            var tensor_3d = create_dense_tensor(ctx, List[Int](2, 3, 4)^)
-            var perm_3d = List[Int](2, 0, 1)  # Move last dim to front
-            var transposed_3d = tensor_3d^.transpose(perm_3d, ctx)
-            # Original shape: [2, 3, 4]
-            # Result shape:   [4, 2, 3]
+            # 6D tensor: [Wl0, d_in0, d_out0, d_in1, d_out1, Wr1] -> [Wl0, d_in0, d_in1, d_out0, d_out1, Wr1]
+            var perm6 = List[Int](0, 1, 3, 2, 4, 5)
+            var transposed_6d = tensor_6d^.transpose(perm6, ctx)
         """
         var rank = len(self.shape)
         if len(perm) != rank:
             raise Error("Perm length mismatch")
 
-        # For simple 2D transpose on contiguous row-major
-        if rank == 2 and perm[0] == 1 and perm[1] == 0:
-            # Copy data to new transposed layout
-            var new_shape = List[Int]()
-            new_shape.append(self.shape[1])
-            new_shape.append(self.shape[0])
-            
-            var new_strides = compute_row_major_strides(new_shape, rank)
-            var total_size = self.size
-            var new_storage = ctx.enqueue_create_buffer[Self.dtype](total_size)
-            
-            # Copy transposed data using host memory (simple but works)
-            var host_src = ctx.enqueue_create_host_buffer[Self.dtype](total_size)
-            ctx.enqueue_copy(host_src, self.storage)
-            ctx.synchronize()
-            
-            var host_dst = ctx.enqueue_create_host_buffer[Self.dtype](total_size)
-            for i in range(self.shape[0]):
-                for j in range(self.shape[1]):
-                    var src_idx = i * self.shape[1] + j
-                    var dst_idx = j * self.shape[0] + i
-                    host_dst[dst_idx] = host_src[src_idx]
-            
-            ctx.enqueue_copy(new_storage, host_dst)
-            ctx.synchronize()
-            
-            return DenseTensor[dtype](new_storage, new_shape^, new_strides^)
-        else:
-            # For other permutations, create a view (stride-based)
-            # This doesn't copy data, just reinterprets layout
-            var new_shape = List[Int](capacity=rank)
-            var new_stride = List[Int](capacity=rank)
+        # Build new shape: new_shape[k] = old_shape[perm[k]]
+        var new_shape = List[Int](capacity=rank)
+        for k in range(rank):
+            new_shape.append(self.shape[perm[k]])
+
+        var new_strides = compute_row_major_strides(new_shape, rank)
+        var total_size = self.size
+        var new_storage = ctx.enqueue_create_buffer[Self.dtype](total_size)
+
+        # Copy to host for permutation
+        var host_src = ctx.enqueue_create_host_buffer[Self.dtype](total_size)
+        var host_dst = ctx.enqueue_create_host_buffer[Self.dtype](total_size)
+        ctx.enqueue_copy(host_src, self.storage)
+        ctx.synchronize()
+
+        # For each destination linear index, compute source linear index and copy
+        # dest_multi[k] corresponds to source_multi[perm[k]], so source_multi[perm[k]] = dest_multi[k]
+        var dest_multi = List[Int](capacity=rank)
+        var source_multi = List[Int](capacity=rank)
+        for _ in range(rank):
+            dest_multi.append(0)
+            source_multi.append(0)
+
+        for dst_linear in range(total_size):
+            # Convert dest linear index to multi-index (row-major)
+            var rem = dst_linear
+            for i in range(rank - 1, -1, -1):
+                dest_multi[i] = rem % new_shape[i]
+                rem = rem // new_shape[i]
+
+            # Map to source multi-index: source[perm[k]] = dest[k]
+            for k in range(rank):
+                source_multi[perm[k]] = dest_multi[k]
+
+            # Compute source linear index using original strides
+            var src_linear: Int = 0
             for i in range(rank):
-                new_shape.append(self.shape[perm[i]])
-                new_stride.append(self.stride[perm[i]])
-            
-            return DenseTensor[dtype](self.storage^, new_shape^, new_stride^)
+                src_linear += source_multi[i] * self.stride[i]
+
+            host_dst[dst_linear] = host_src[src_linear]
+
+        ctx.enqueue_copy(new_storage, host_dst)
+        ctx.synchronize()
+
+        return DenseTensor[dtype](new_storage, new_shape^, new_strides^)
 
     fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DenseTensor[dtype]:
         """Flatten a contiguous range of dimensions into a single dimension.
@@ -410,6 +406,25 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
 
         return sqrt(accum)
 
+    fn norm_sq(self, ctx: DeviceContext) raises -> Float64:
+        """Compute the squared Frobenius norm (no sqrt).
+        
+        Returns ||self||_F^2 = sum_i |x_i|^2.
+        """
+        if self.size == 0:
+            return 0.0
+
+        var host_copy = ctx.enqueue_create_host_buffer[Self.dtype](self.size)
+        ctx.enqueue_copy(host_copy, self.storage)
+        ctx.synchronize()
+
+        var accum = 0.0
+        for i in range(self.size):
+            var value = Float64(host_copy[i])
+            accum += value * value
+
+        return accum
+
     fn scale_in_place(var self, scale: Scalar[dtype], ctx: DeviceContext) raises -> None:
         """Scale tensor entries by a scalar factor in-place."""
         # TODO: Implement in-place scaling for GPU kernels or maybe SIMD handles it already search?
@@ -455,8 +470,8 @@ fn compute_row_major_strides(shape: List[Int], rank: Int) -> List[Int]:
     
     # Compute strides in reverse order (row-major)
     for i in range(rank - 1, -1, -1):
-        strides.insert(0, stride)
-        stride *= shape[i]
+        strides.insert(0, stride) # 24, 4, 1
+        stride *= shape[i] # sh: 4, st:4 | sh:3, st: 12 | sh: 2, st: 24 
     
     return strides.copy()
 
@@ -594,12 +609,19 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
     For standard 2D matrix multiplication A[m,k] @ B[k,n] = C[m,n], simply use
     default parameters. The function automatically adjusts axis contraction.
     
-    **Convention Note**: 
-    Current implementation follows standard linear algebra convention where default
-    parameters contract A's trailing axes with B's leading axes: A[..., k] @ B[k, ...]
+    **IMPORTANT - Automatic Axis Inference**: 
+    When BOTH axrange_A=False AND axrange_B=False (the defaults), the function
+    automatically infers which axes of B to contract by checking dimensions:
     
-    For tensor network applications where you need A[k, ...] @ B[..., k], explicitly set:
-    `axrange_A=True, axrange_B=False`
+    - If A's trailing ndim_mult axes match B's LEADING ndim_mult axes → uses B leading
+      (standard linear algebra: A[..., k] @ B[k, ...])
+    - If A's trailing ndim_mult axes match B's TRAILING ndim_mult axes → uses B trailing
+      (tensor network style: A[..., k] @ B[..., k])
+    - Prefers B leading if both match (e.g., square tensors)
+    
+    To explicitly control which axes to contract without inference, specify axrange_B:
+    - For A[k, ...] @ B[..., k]: set `axrange_A=True, axrange_B=False`
+    - For standard matmul without inference: set `axrange_A=False, axrange_B=True`
     
     Algorithm:
     - Contracts ndim_mult axes between A and B
@@ -619,7 +641,12 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
                    If True, contract A's leading axes.
         axrange_B: If False (default), contract B's trailing axes.
                    If True, contract B's leading axes.
-                   Note: Automatically set to True for standard 2D matmul.
+                   
+                   **IMPORTANT**: When both axrange_A and axrange_B are False (defaults),
+                   the function automatically infers which B axes to use by checking if
+                   A's trailing dims match B's leading or trailing dims. This inference
+                   is skipped if you explicitly pass axrange_B=True or axrange_A=True.
+                   See "IMPORTANT - Automatic Axis Inference" section above for details.
     
     Raises:
         Error: If ndim_mult < 1, or tensors don't have enough dimensions.
@@ -692,6 +719,29 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
             var C_tn2 = create_dense_tensor(ctx, List[Int](3, 5)^)
             dense_tensor_dot(C_tn2, A_tn2^, B_tn2^, ctx, ndim_mult=1,
                            axrange_A=True, axrange_B=False)
+        
+        # Example 6: Automatic Axis Inference (both defaults)
+        with DeviceContext() as ctx:
+            # Case 1: A trailing matches B leading → automatically infers B leading
+            # A[3, 4], B[4, 5] - default call infers A[3,4] @ B[4,5] (standard matmul)
+            var A1 = create_dense_tensor(ctx, List[Int](3, 4)^)
+            var B1 = create_dense_tensor(ctx, List[Int](4, 5)^)
+            var C1 = create_dense_tensor(ctx, List[Int](3, 5)^)
+            dense_tensor_dot(C1, A1^, B1^, ctx)  # Infers: contract A's [4] with B's leading [4]
+            
+            # Case 2: A trailing matches B trailing → automatically infers B trailing
+            # A[3, 4], B[5, 4] - default call infers A[3,4] @ B[5,4] with B trailing
+            var A2 = create_dense_tensor(ctx, List[Int](3, 4)^)
+            var B2 = create_dense_tensor(ctx, List[Int](5, 4)^)
+            var C2 = create_dense_tensor(ctx, List[Int](3, 5)^)
+            dense_tensor_dot(C2, A2^, B2^, ctx)  # Infers: contract A's [4] with B's trailing [4]
+            
+            # Case 3: Multi-dimensional inference (ndim_mult=2)
+            # A[2,3,4,5], B[4,5,6,7] - infers B leading since [4,5] matches B's first 2 dims
+            var A3 = create_dense_tensor(ctx, List[Int](2, 3, 4, 5)^)
+            var B3 = create_dense_tensor(ctx, List[Int](4, 5, 6, 7)^)
+            var C3 = create_dense_tensor(ctx, List[Int](2, 3, 6, 7)^)
+            dense_tensor_dot(C3, A3^, B3^, ctx, ndim_mult=2)  # Infers B leading
     
     Performance Notes:
         - Uses GPU-accelerated matrix multiplication (linalg.matmul)
@@ -714,54 +764,43 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
     if ndim_mult < 1 or rank_A < ndim_mult or rank_B < ndim_mult:
         raise Error("Invalid ndim_mult")
 
-    # For standard tensor dot product with default parameters:
-    # The convention depends on the use case:
-    # - Standard linear algebra: A[m,k] @ B[k,n] = contract A's trailing with B's leading
-    # - Tensor networks/chemistry: Often A[k,m] @ B[n,k] = contract A's leading with B's trailing
+    # ============================================================================
+    # AUTOMATIC AXIS INFERENCE (when both axrange_A=False and axrange_B=False)
+    # ============================================================================
+    # When both flags are False (the defaults), we automatically determine which
+    # axes of B to contract by checking if A's trailing axes match B's leading
+    # or trailing axes. This allows the same default call to work for both:
+    #   - Standard matmul: A[m,k] @ B[k,n] (A trailing matches B leading)
+    #   - Tensor network: A[m,k] @ B[n,k] (A trailing matches B trailing)
     # 
-    # Current implementation: A's TRAILING axis × B's LEADING axis (standard linalg convention)
-    # This means: A[..., k] @ B[k, ...] for any rank tensors
+    # To bypass this inference and explicitly control axes, pass axrange_B=True
+    # (for B leading) or ensure you're not using both defaults.
+    # ============================================================================
     var effective_axrange_B = axrange_B
     if not axrange_A and not axrange_B:
-        # Default behavior: contract A's trailing axes with B's leading axes
-        # This is the standard convention for matrix/tensor multiplication
-        effective_axrange_B = True
+        # INFERENCE: Check which B axes (leading or trailing) match A's trailing axes
+        var b_leading_matches = True
+        var b_trailing_matches = True
+        for i in range(ndim_mult):
+            var a_sz = A.shape[rank_A - ndim_mult + i]
+            if a_sz != B.shape[i]:
+                b_leading_matches = False
+            if a_sz != B.shape[rank_B - ndim_mult + i]:
+                b_trailing_matches = False
+        
+        # Set effective_axrange_B based on which dimensions match
+        if b_leading_matches:
+            effective_axrange_B = True   # Inferred: A trailing × B leading (standard)
+        elif b_trailing_matches:
+            effective_axrange_B = False  # Inferred: A trailing × B trailing
+        else:
+            effective_axrange_B = True   # Neither matches; will raise "Dim mismatch" below
 
-    # Check contracting dims match
-    # Important: When contracting A's trailing with B's leading, the order is REVERSED
-    # Example: A[4, 3, 2, 1] contracts with B[1, 2, 3, 4] for ndim_mult=2
-    #          i=0: A.shape[2]=2 must match B.shape[1]=2 ✓
-    #          i=1: A.shape[3]=1 must match B.shape[0]=1 ✓
-    #          Result shape: [4, 3] from A + [3, 4] from B = [4, 3, 3, 4]
+    # Check contracting dims match (Contract A: NO reversal, aligned blocks — matches C)
+    # C: s->dim[(axrange_s ? 0 : s->ndim-ndim_mult)+i] == t->dim[(axrange_t ? 0 : t->ndim-ndim_mult)+i]
     for i in range(ndim_mult):
-        var ax_A: Int
-        var ax_B: Int
-        
-        if axrange_A:
-            # A uses leading axes: [0, 1, 2, ..., ndim_mult-1]
-            ax_A = i
-        else:
-            # A uses trailing axes: [..., rank_A-ndim_mult, rank_A-ndim_mult+1, ..., rank_A-1]
-            ax_A = rank_A - ndim_mult + i
-        
-        if effective_axrange_B:
-            # B uses leading axes: [0, 1, 2, ..., ndim_mult-1]
-            # When A is trailing and B is leading, we need to REVERSE the order
-            if not axrange_A:
-                # Reverse: A's last matches B's first
-                ax_B = ndim_mult - 1 - i
-            else:
-                # Both leading: direct correspondence
-                ax_B = i
-        else:
-            # B uses trailing axes: [..., rank_B-ndim_mult, rank_B-ndim_mult+1, ..., rank_B-1]
-            if axrange_A:
-                # A is leading, B is trailing: reverse order
-                ax_B = rank_B - 1 - i
-            else:
-                # Both trailing: direct correspondence
-                ax_B = rank_B - ndim_mult + i
-        
+        var ax_A = (0 if axrange_A else rank_A - ndim_mult) + i
+        var ax_B = (0 if effective_axrange_B else rank_B - ndim_mult) + i
         if A.shape[ax_A] != B.shape[ax_B]:
             raise Error("Dim mismatch")
 
@@ -948,67 +987,30 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
         var tensor: DenseTensor[dtype],
         ctx: DeviceContext
     ) raises -> Tuple[DenseTensor[dtype], DenseTensor[dtype]]:
-    # Require 2D matrix
+    """QR decomposition (economical, C-compatible): Q [m,k], R [k,n], k = min(m,n)."""
     var rank = len(tensor.shape)
-    print("[QR DEBUG] Starting dense_tensor_qr invocation")
-    print("[QR DEBUG] Input rank:", rank)
-    print("[QR DEBUG] Input shape: [", end="")
-    for idx in range(len(tensor.shape)):
-        if idx > 0:
-            print(", ", end="")
-        print(tensor.shape[idx], end="")
-    print("]")
-    print("[QR DEBUG] Input stride: [", end="")
-    for idx in range(len(tensor.stride)):
-        if idx > 0:
-            print(", ", end="")
-        print(tensor.stride[idx], end="")
-    print("]")
-    print("[QR DEBUG] Input size:", tensor.size)
-    print("[QR DEBUG] Input contiguous:", tensor.is_contiguous())
     if rank != 2:
         raise Error("QR decomposition requires a 2D matrix, got rank " + String(rank))
 
-    var m = tensor.shape[0]  # rows
-    var n = tensor.shape[1]  # columns
+    var m = tensor.shape[0]
+    var n = tensor.shape[1]
     var k = min(m, n)
 
     var tensor_shape_copy = tensor.shape.copy()
-    # Create a copy of input tensor for in-place factorization
-    # (to preserve original tensor)
     var A_factorized = create_dense_tensor[dtype](ctx, tensor_shape_copy^, init_value=Scalar[dtype](0.0))
-    print("[QR DEBUG] A_factorized shape: [", end="")
-    for idx in range(len(A_factorized.shape)):
-        if idx > 0:
-            print(", ", end="")
-        print(A_factorized.shape[idx], end="")
-    print("]")
-    print("[QR DEBUG] A_factorized stride: [", end="")
-    for idx in range(len(A_factorized.stride)):
-        if idx > 0:
-            print(", ", end="")
-        print(A_factorized.stride[idx], end="")
-    print("]")
-
-    # Copy data from input tensor to A_factorized
     ctx.enqueue_copy(A_factorized.storage, tensor.storage)
     ctx.synchronize()
-    print("[QR DEBUG] Copied data into A_factorized buffer")
 
-    # Mirror the factorization buffer on host memory for MAX kernels
     var host_A_factorized = ctx.enqueue_create_host_buffer[dtype](m * n)
     ctx.enqueue_copy(host_A_factorized, A_factorized.storage)
     ctx.synchronize()
 
-    # Allocate sigma vector for Householder scaling factors
     var sigma_shape = List[Int](k)
     var sigma = create_dense_tensor[dtype](ctx, sigma_shape^, init_value=Scalar[dtype](0.0))
     var host_sigma = ctx.enqueue_create_host_buffer[dtype](k)
     for i in range(k):
         host_sigma[i] = Scalar[dtype](0.0)
 
-    # Create LayoutTensor views needed by MAX APIs
-    # 2 Dimensional Row Major Layouts shape = 2 with stride = 1
     alias matrix_layout = Layout.row_major(1, 1)
     alias sigma_layout = Layout.row_major(1)
 
@@ -1018,7 +1020,6 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
         shape=sigma_shape_rt,
         stride=sigma_stride_rt
     )
-    # sigma tensor
     var sigma_tensor = LayoutTensor[
         mut=True,
         dtype,
@@ -1028,18 +1029,10 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
         host_sigma,
         runtime_layout=sigma_runtime_layout
     )
-    print("[QR DEBUG] Sigma stride: [", end="")
-    for idx in range(len(sigma.stride)):
-        if idx > 0:
-            print(", ", end="")
-        print(sigma.stride[idx], end="")
-    print("]")
-    print("[QR DEBUG] Allocated sigma buffer with length:", k)
 
     var A_shape_rt = RuntimeTuple[matrix_layout.shape](m, n)
     var A_stride_rt = RuntimeTuple[matrix_layout.stride](A_factorized.stride[0], A_factorized.stride[1])
     var A_layout = RuntimeLayout[matrix_layout, linear_idx_type=_](shape=A_shape_rt, stride=A_stride_rt)
-    # A tensor
     var A_tensor = LayoutTensor[
         mut=True,
         dtype,
@@ -1050,103 +1043,52 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
         runtime_layout=A_layout
     )
 
-    # Step 1: Compute QR factorization in-place (Householder reflectors)
-    # The function modifies A_tensor in-place to store Householder reflectors
-    # and stores scaling factors in sigma_tensor
-    print("[QR DEBUG] Launching qr_factorization kernel")
     qr_factorization(sigma_tensor, A_tensor)
     ctx.synchronize()
     ctx.enqueue_copy(sigma.storage, host_sigma)
     ctx.enqueue_copy(A_factorized.storage, host_A_factorized)
     ctx.synchronize()
-    print("[QR DEBUG] qr_factorization completed, capturing sigma and A previews")
-    var sigma_debug = ctx.enqueue_create_host_buffer[dtype](k)
-    ctx.enqueue_copy(sigma_debug, sigma.storage)
-    ctx.synchronize()
-    var sigma_preview = min(k, 8)
-    print("[QR DEBUG] sigma preview:", end=" ")
-    for i in range(sigma_preview):
-        print(sigma_debug[i], end=" ")
-    if k > sigma_preview:
-        print("... (truncated)", end="")
-    print("")
 
-    var host_after_qr = ctx.enqueue_create_host_buffer[dtype](m * n)
-    ctx.enqueue_copy(host_after_qr, A_factorized.storage)
-    ctx.synchronize()
-    var elem_preview = min(m * n, 12)
-    print("[QR DEBUG] A_factorized preview (first", elem_preview, "elements):", end=" ")
-    for i in range(elem_preview):
-        print(host_after_qr[i], end=" ")
-    if m * n > elem_preview:
-        print("... (truncated)", end="")
-    print("")
-
-    # Step 2: Extract R from upper triangular part of A_factorized
-    # After qr_factorization, the upper triangular part of A_factorized contains R
-    var R = create_dense_tensor[dtype](ctx, List[Int](m, n), init_value=Scalar[dtype](0.0))
-
-    # Copy the upper triangular part via host memory
+    # R: economical [k, n] (C-compatible), upper triangular
+    var R = create_dense_tensor[dtype](ctx, List[Int](k, n), init_value=Scalar[dtype](0.0))
     var host_A = host_A_factorized
-
-    var host_R = ctx.enqueue_create_host_buffer[dtype](m * n)
-    for i in range(m):
+    var host_R = ctx.enqueue_create_host_buffer[dtype](k * n)
+    for i in range(k):
         for j in range(n):
-            var idx = i * n + j
-            if i <= j:
-                # Upper triangular part (including diagonal)
-                host_R[idx] = host_A[idx]
+            if j >= i:
+                host_R[i * n + j] = host_A[i * n + j]
             else:
-                # Lower triangular part - set to zero
-                host_R[idx] = Scalar[dtype](0.0)
-
+                host_R[i * n + j] = Scalar[dtype](0.0)
     ctx.enqueue_copy(R.storage, host_R)
     ctx.synchronize()
-    var r_preview = min(m * n, 12)
-    print("[QR DEBUG] R preview (first", r_preview, "elements):", end=" ")
-    for i in range(r_preview):
-        print(host_R[i], end=" ")
-    if m * n > r_preview:
-        print("... (truncated)", end="")
-    print("")
 
-    # Step 3: Form Q matrix from Householder reflectors
-    var Q = create_dense_tensor[dtype](ctx, List[Int](m, m), init_value=Scalar[dtype](0.0))
-    var host_Q = ctx.enqueue_create_host_buffer[dtype](m * m)
+    # Form full Q [m,m] then take first k columns -> Q_out [m,k] (economical, C-compatible)
+    var host_Q_full = ctx.enqueue_create_host_buffer[dtype](m * m)
     for i in range(m * m):
-        host_Q[i] = Scalar[dtype](0.0)
+        host_Q_full[i] = Scalar[dtype](0.0)
 
-    # Create LayoutTensor view for Q (output of form_q)
-    var Q_shape_rt = RuntimeTuple[matrix_layout.shape](m, m)
-    var Q_stride_rt = RuntimeTuple[matrix_layout.stride](Q.stride[0], Q.stride[1])
-    var Q_layout = RuntimeLayout[matrix_layout](shape=Q_shape_rt, stride=Q_stride_rt)
-    var Q_tensor = LayoutTensor[
+    var Q_full_shape_rt = RuntimeTuple[matrix_layout.shape](m, m)
+    var Q_full_stride_rt = RuntimeTuple[matrix_layout.stride](m, 1)
+    var Q_full_layout = RuntimeLayout[matrix_layout](shape=Q_full_shape_rt, stride=Q_full_stride_rt)
+    var Q_full_tensor = LayoutTensor[
         mut=True,
         dtype,
         matrix_layout,
         MutAnyOrigin
     ](
-        host_Q,
-        runtime_layout=Q_layout
+        host_Q_full,
+        runtime_layout=Q_full_layout
     )
-
-    # Form the orthogonal matrix Q from the Householder reflectors in A and sigma
-    # According to MAX API: form_q[dtype, element_layout](sigma, A, Q)
-    form_q(sigma_tensor, A_tensor, Q_tensor)
+    form_q(sigma_tensor, A_tensor, Q_full_tensor)
     ctx.synchronize()
+
+    var Q = create_dense_tensor[dtype](ctx, List[Int](m, k), init_value=Scalar[dtype](0.0))
+    var host_Q = ctx.enqueue_create_host_buffer[dtype](m * k)
+    for i in range(m):
+        for j in range(k):
+            host_Q[i * k + j] = host_Q_full[i * m + j]
     ctx.enqueue_copy(Q.storage, host_Q)
     ctx.synchronize()
-    print("[QR DEBUG] form_q completed, capturing Q preview")
-    var Q_host = ctx.enqueue_create_host_buffer[dtype](m * m)
-    ctx.enqueue_copy(Q_host, Q.storage)
-    ctx.synchronize()
-    var q_preview = min(m * m, 12)
-    print("[QR DEBUG] Q preview (first", q_preview, "elements):", end=" ")
-    for i in range(q_preview):
-        print(Q_host[i], end=" ")
-    if m * m > q_preview:
-        print("... (truncated)", end="")
-    print("")
 
     return (Q, R)
 
@@ -1214,8 +1156,8 @@ fn dense_tensor_svd_trunc_lapack_f64[dtype: DType](
     then copied back host->GPU.
     """
     @parameter
-    if dtype != DType.float64:
-        raise Error("dense_tensor_svd_trunc_lapack_f64 only supports DType.float64")
+    if dtype != DType.float32:
+        raise Error("dense_tensor_svd_trunc_lapack_f64 only supports DType.float32")
 
     var A = ensure_contiguous_2d[dtype](tensor^, ctx)
 
@@ -1326,94 +1268,14 @@ fn dense_tensor_svd_trunc[dtype: DType](
     - Float32: LAPACK in Float64 internally, then cast back to Float32
     """
     @parameter
-    if dtype == DType.float64:
+    if dtype == DType.float32:
         return dense_tensor_svd_trunc_lapack_f64[dtype](
             tensor^,
             ctx,
             chi_max=chi_max,
             eps_trunc=eps_trunc,
         )
-    elif dtype == DType.float32:
-        # Float32 path: copy to host, run LAPACK in Float64, cast results back.
-        var A32 = ensure_contiguous_2d[dtype](tensor^, ctx)
-
-        var m = A32.shape[0]
-        var n = A32.shape[1]
-        if m == 0 or n == 0:
-            var U_empty = create_dense_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
-            var S_empty = create_dense_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
-            var Vt_empty = create_dense_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
-            return (U_empty^, S_empty^, Vt_empty^, 0)
-
-        var host_A32 = ctx.enqueue_create_host_buffer[dtype](m * n)
-        ctx.enqueue_copy(host_A32, A32.storage)
-        ctx.synchronize()
-
-        # Build LAPACK input as Float64
-        var A_mat = MatrixF64(Int32(m), Int32(n), LapackLayout.ROW_MAJOR())
-        for idx in range(m * n):
-            A_mat.data[idx] = Float64(host_A32[idx])
-
-        var backend = SVDBackend("native/libsvd_shim.so")
-        var jobz = Int8(ord('S'))  # thin U, thin VT
-        var svd_res = svd_f64(backend, A_mat^, jobz)
-
-        var k = Int(svd_res.k)
-        var chi_kept = min(k, chi_max)
-        if eps_trunc > 0.0 and k > 0:
-            var total_norm_sq: Float64 = 0.0
-            for i in range(k):
-                var s = Float64(svd_res.S[i])
-                total_norm_sq += s * s
-            if total_norm_sq <= 0.0:
-                chi_kept = 0
-            else:
-                var kept_norm_sq: Float64 = 0.0
-                var limit = min(k, chi_max)
-                chi_kept = limit
-                for trial_chi in range(1, limit + 1):
-                    var s = Float64(svd_res.S[trial_chi - 1])
-                    kept_norm_sq += s * s
-                    var discarded_weight = (total_norm_sq - kept_norm_sq) / total_norm_sq
-                    if discarded_weight <= eps_trunc:
-                        chi_kept = trial_chi
-                        break
-
-        if chi_kept == 0:
-            var U_zero = create_dense_tensor[dtype](ctx, List[Int](m, 0)^, init_value=Scalar[dtype](0.0))
-            var S_zero = create_dense_tensor[dtype](ctx, List[Int](0)^, init_value=Scalar[dtype](0.0))
-            var Vt_zero = create_dense_tensor[dtype](ctx, List[Int](0, n)^, init_value=Scalar[dtype](0.0))
-            return (U_zero^, S_zero^, Vt_zero^, 0)
-
-        var U_out = create_dense_tensor[dtype](ctx, List[Int](m, chi_kept)^, init_value=Scalar[dtype](0.0))
-        var S_out = create_dense_tensor[dtype](ctx, List[Int](chi_kept)^, init_value=Scalar[dtype](0.0))
-        var Vt_out = create_dense_tensor[dtype](ctx, List[Int](chi_kept, n)^, init_value=Scalar[dtype](0.0))
-
-        var host_U = ctx.enqueue_create_host_buffer[dtype](m * chi_kept)
-        var host_S = ctx.enqueue_create_host_buffer[dtype](chi_kept)
-        var host_Vt = ctx.enqueue_create_host_buffer[dtype](chi_kept * n)
-
-        for i in range(chi_kept):
-            host_S[i] = Scalar[dtype](Float32(Float64(svd_res.S[i])))
-
-        var u_cols_full = Int(svd_res.u_cols)
-        var vt_cols_full = Int(svd_res.vt_cols)
-
-        for i in range(m):
-            for j in range(chi_kept):
-                host_U[i * chi_kept + j] = Scalar[dtype](Float32(Float64(svd_res.U[i * u_cols_full + j])))
-
-        for i in range(chi_kept):
-            for j in range(n):
-                host_Vt[i * n + j] = Scalar[dtype](Float32(Float64(svd_res.VT[i * vt_cols_full + j])))
-
-        ctx.enqueue_copy(U_out.storage, host_U)
-        ctx.enqueue_copy(S_out.storage, host_S)
-        ctx.enqueue_copy(Vt_out.storage, host_Vt)
-        ctx.synchronize()
-
-        return (U_out^, S_out^, Vt_out^, chi_kept)
     else:
         raise Error(
-            "dense_tensor_svd_trunc supports only DType.float32/float64 currently."
+            "dense_tensor_svd_trunc supports only DType.float32 currently."
         )

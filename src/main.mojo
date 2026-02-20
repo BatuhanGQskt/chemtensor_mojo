@@ -535,14 +535,14 @@ fn test_dense_svd_trunc() raises:
         data.append(0.0)
         
         var shape = List[Int](4, 3)
-        var A = create_dense_tensor_from_data[DType.float64](ctx, data, shape^)
+        var A = create_dense_tensor_from_data[DType.float32](ctx, data, shape^)
         
         print("Matrix A:")
         A.print_tensor(ctx)
         
         # Compute truncated SVD using Lapack
         print("\nComputing truncated SVD with Lapack (chi_max=2, eps_trunc=1e-10)...")
-        var svd_result = dense_tensor_svd_trunc_lapack_f64[DType.float64](A^, ctx, chi_max=2, eps_trunc=1e-10)
+        var svd_result = dense_tensor_svd_trunc_lapack_f64[DType.float32](A^, ctx, chi_max=2, eps_trunc=1e-10)
         var U = svd_result[0]
         var S = svd_result[1] 
         var Vt = svd_result[2]
@@ -630,7 +630,6 @@ fn test_dmrg[dmrg_dtype: DType](nsites: Int, J: Float64, h_longitudinal: Float64
                     krylov_tol=1e-10,
                     energy_tol=0.0,          # disable early stopping; user wants fixed sweep count
                     two_site=True,
-                    reorthogonalize=True,
                     verbose=False,
                 )
 

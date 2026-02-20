@@ -12,9 +12,7 @@ from src.state.mpo_state import MPOSite, MatrixProductOperator
 from src.state.environments import (
     update_left_environment,
     update_right_environment,
-    build_right_environments,      
-    expectation_value,
-    expectation_value_normalized,
+    build_right_environments,
 )
 from src.algorithms.krylov import lanczos_ground_state
 
@@ -24,6 +22,7 @@ struct DMRGParams:
     """Parameters for DMRG algorithm.
     
     Controls convergence, truncation, and algorithmic choices.
+    Matches C ChemTensor dmrg interface.
     """
     var num_sweeps: Int
     var chi_max: Int            # Maximum bond dimension
@@ -32,7 +31,6 @@ struct DMRGParams:
     var krylov_tol: Float64     # Lanczos convergence tolerance
     var energy_tol: Float64     # Energy convergence threshold for early stopping
     var two_site: Bool          # Two-site DMRG (True) or single-site (False, not implemented)
-    var reorthogonalize: Bool   # Reorthogonalize Krylov vectors
     var verbose: Bool           # Print progress
 
 
@@ -171,6 +169,10 @@ fn split_two_site_theta_svd[dtype: DType](
     var d = theta_shape[1]
     var Dr = theta_shape[3]
     
+    # Compute Frobenius norm of theta before SVD consumes the reshaped matrix
+    # ||theta||_F^2 = sum of all sigma_i^2 (including ones that will be discarded)
+    var total_norm_sq: Float64 = theta.norm_sq(ctx)
+    
     # Reshape theta to matrix: [Dl*d, d*Dr]
     var theta_mat = theta.reshape(List[Int](Dl * d, d * Dr))
     
@@ -181,18 +183,15 @@ fn split_two_site_theta_svd[dtype: DType](
     var Vt = svd_result[2]     # [chi, d*Dr]
     var chi_kept = svd_result[3]
     
-    # Compute discarded weight
+    # Compute discarded weight from kept singular values
     var host_S = ctx.enqueue_create_host_buffer[dtype](chi_kept)
     ctx.enqueue_copy(host_S, S.storage)
     ctx.synchronize()
     
-    var total_norm_sq: Float64 = 0.0
     var kept_norm_sq: Float64 = 0.0
     for i in range(chi_kept):
         var s_val = Float64(host_S[i])
-        var s_sq = s_val * s_val
-        total_norm_sq += s_sq
-        kept_norm_sq += s_sq
+        kept_norm_sq += s_val * s_val
     
     var discarded_weight: Float64 = 0.0
     if total_norm_sq > 0.0:
@@ -289,7 +288,6 @@ fn apply_two_site_heff[dtype: DType](
     """
     # This is a complex multi-index contraction
     # Break it down into sequential contractions
-    
     var theta_shape = theta.shape.copy()
     var Dl = theta_shape[0]
     var d = theta_shape[1]
@@ -405,7 +403,6 @@ fn dmrg_two_site[dtype: DType](
             krylov_tol=1e-8,
             energy_tol=1e-6,
             two_site=True,
-            reorthogonalize=True,
             verbose=True
         )
         
@@ -456,11 +453,12 @@ fn dmrg_two_site[dtype: DType](
             if params.verbose and i % max(1, (N - 1) // 10) == 0:
                 print("  R->L site", i, "energy:", energy)
         
-        # IMPORTANT: `energy` from local updates is a *local two-site Ritz value*,
-        # not the global <psi|H|psi>. For comparisons (and for convergence checks),
-        # compute the full expectation after each sweep.
-        var sweep_energy = expectation_value_normalized[dtype](mps, mpo, ctx)
-        energy = sweep_energy
+        # Use the last local Lanczos eigenvalue as the sweep energy.
+        # This matches the C chemtensor DMRG implementation (dmrg.c line 240/380)
+        # which stores `en` from the last `minimize_local_energy` call.
+        # Computing a full global <psi|H|psi>/<psi|psi> in float32 accumulates
+        # too much numerical error and gives unreliable results.
+        var sweep_energy = energy  # last Lanczos eigenvalue from the R->L sweep
 
         if params.verbose:
             print("Sweep", sweep + 1, "completed. Energy:", sweep_energy)
@@ -492,14 +490,12 @@ fn lanczos_two_site_optimize[dtype: DType](
     ctx: DeviceContext,
     max_iter: Int,
     tol: Float64,
-    reorthogonalize: Bool = True,
 ) raises -> Tuple[Float64, DenseTensor[dtype]]:
-    """Specialized Lanczos for two-site DMRG optimization without closures.
+    """Specialized Lanczos for two-site DMRG optimization.
     
-    We build a Krylov subspace with repeated applications of the effective two-site
-    Hamiltonian via `apply_two_site_heff`, then solve the small projected eigenproblem
-    to get the lowest Ritz pair. The heavy contractions are still done with GPU
-    matmul inside `apply_two_site_heff`.
+    Matches C implementation: no reorthogonalization, same loop structure as
+    eigensystem_krylov_symmetric in ChemTensor (krylov.c). Builds Krylov subspace
+    via apply_two_site_heff, then solves tridiagonal eigenproblem for lowest Ritz pair.
     """
     var v0 = initial_theta
     var dim = v0.size
@@ -619,78 +615,94 @@ fn lanczos_two_site_optimize[dtype: DType](
     ctx.enqueue_copy(v_current.storage, host_v0)
     ctx.synchronize()
 
-    # Store Krylov basis on host (each is length dim)
-    var krylov = List[List[Scalar[dtype]]](capacity=max_iter + 1)
-    var v0_list = List[Scalar[dtype]](capacity=dim)
+    # Store Krylov basis on host in Float64 (matches C double precision).
+    var krylov = List[List[Float64]](capacity=max_iter)
+    var v0_f64 = List[Float64](capacity=dim)
     for i in range(dim):
-        v0_list.append(host_v0[i])
-    krylov.append(v0_list^)
+        v0_f64.append(Float64(host_v0[i]))
+    krylov.append(v0_f64^)
 
     var alpha = List[Float64](capacity=max_iter)
     var beta = List[Float64](capacity=max_iter)
 
-    for iter in range(max_iter):
+    # C beta threshold: 100 * n * DBL_EPSILON = 2.2204460492503131e-16
+    var dbl_epsilon: Float64 = 2.2204460492503131e-16
+    var beta_threshold: Float64 = 100.0 * Float64(dim) * dbl_epsilon
+
+    var numiter: Int = max_iter
+
+    # Main loop: j = 0..max_iter-2 (full iterations, matching C)
+    for j in range(max_iter - 1):
         var w = apply_two_site_heff[dtype](v_current^, L_env, R_env, W_i, W_ip1, ctx)
 
-        var host_w = ctx.enqueue_create_host_buffer[dtype](dim)
-        var host_v = ctx.enqueue_create_host_buffer[dtype](dim)
-        ctx.enqueue_copy(host_w, w.storage)
-        ctx.enqueue_copy(host_v, v_current.storage)
+        var host_w_raw = ctx.enqueue_create_host_buffer[dtype](dim)
+        ctx.enqueue_copy(host_w_raw, w.storage)
         ctx.synchronize()
 
-        # alpha = <v|w>
+        var w_f64 = List[Float64](capacity=dim)
+        for i in range(dim):
+            w_f64.append(Float64(host_w_raw[i]))
+
+        var v_f64 = krylov[j].copy()
+
+        # alpha_j = <v_j | w>
         var a: Float64 = 0.0
         for i in range(dim):
-            a += Float64(host_v[i]) * Float64(host_w[i])
+            a += v_f64[i] * w_f64[i]
         alpha.append(a)
 
-        # w <- w - a v - b_prev v_prev
+        # w = w - alpha_j*v_j - beta_{j-1}*v_{j-1} (no reorthogonalization)
         for i in range(dim):
-            host_w[i] = host_w[i] - Scalar[dtype](a) * host_v[i]
-        if iter > 0:
-            var bprev = beta[iter - 1]
-            var vprev = krylov[iter - 1].copy()
+            w_f64[i] = w_f64[i] - a * v_f64[i]
+        if j > 0:
+            var bprev = beta[j - 1]
+            var vprev = krylov[j - 1].copy()
             for i in range(dim):
-                host_w[i] = host_w[i] - Scalar[dtype](bprev) * vprev[i]
+                w_f64[i] = w_f64[i] - bprev * vprev[i]
 
-        if reorthogonalize:
-            for k in range(len(krylov)):
-                var vk = krylov[k].copy()
-                var overlap: Float64 = 0.0
-                for i in range(dim):
-                    overlap += Float64(host_w[i]) * Float64(vk[i])
-                for i in range(dim):
-                    host_w[i] = host_w[i] - Scalar[dtype](overlap) * vk[i]
-
-        # beta = ||w||
+        # beta_j = ||w||
         var b: Float64 = 0.0
         for i in range(dim):
-            var val = Float64(host_w[i])
-            b += val * val
+            b += w_f64[i] * w_f64[i]
         b = sqrt(b)
 
-        if b < 1e-12:
+        if b < beta_threshold:
+            numiter = j + 1
             break
 
         beta.append(b)
 
-        # v_{next} = w / b
+        # v_{j+1} = w / beta_j
+        var vnext_f64 = List[Float64](capacity=dim)
         for i in range(dim):
-            host_w[i] = host_w[i] / Scalar[dtype](b)
+            vnext_f64.append(w_f64[i] / b)
+        krylov.append(vnext_f64^)
 
-        var vnext_list = List[Scalar[dtype]](capacity=dim)
+        var host_v_next = ctx.enqueue_create_host_buffer[dtype](dim)
         for i in range(dim):
-            vnext_list.append(host_w[i])
-        krylov.append(vnext_list^)
-
-        ctx.enqueue_copy(v_current.storage, host_w)
+            host_v_next[i] = Scalar[dtype](w_f64[i] / b)
+        ctx.enqueue_copy(v_current.storage, host_v_next)
         ctx.synchronize()
 
-    var nK = len(alpha)
+    # Final iteration: compute alpha only (matching C "complete final iteration")
+    if numiter == max_iter:
+        var j = max_iter - 1
+        var w = apply_two_site_heff[dtype](v_current^, L_env, R_env, W_i, W_ip1, ctx)
+        var host_w_raw = ctx.enqueue_create_host_buffer[dtype](dim)
+        ctx.enqueue_copy(host_w_raw, w.storage)
+        ctx.synchronize()
+
+        var v_f64 = krylov[j].copy()
+        var a: Float64 = 0.0
+        for i in range(dim):
+            a += v_f64[i] * Float64(host_w_raw[i])
+        alpha.append(a)
+
+    var nK = numiter
     if nK == 0:
         raise Error("Lanczos produced empty Krylov basis")
 
-    # Build dense T from alpha/beta
+    # Build dense T from alpha/beta (tridiagonal, matching C LAPACK dsteqr input)
     var T = List[List[Float64]](capacity=nK)
     for _ in range(nK):
         var row = List[Float64](capacity=nK)
@@ -709,25 +721,29 @@ fn lanczos_two_site_optimize[dtype: DType](
     # like `eig[1]` (it has no origin). Just copy; this list is tiny (<= max_iter).
     var coeffs = eig[1].copy()
 
-    # Reconstruct Ritz vector in the original (flattened) space
-    var host_out = ctx.enqueue_create_host_buffer[dtype](dim)
+    # Reconstruct Ritz vector in Float64, then cast to dtype once at the end
+    var out_f64 = List[Float64](capacity=dim)
     for j in range(dim):
-        host_out[j] = Scalar[dtype](0.0)
+        out_f64.append(0.0)
     for i in range(nK):
         var ci = coeffs[i]
         var vi = krylov[i].copy()
         for j in range(dim):
-            host_out[j] = host_out[j] + Scalar[dtype](ci) * vi[j]
+            out_f64[j] = out_f64[j] + ci * vi[j]
 
-    # Normalize host_out
+    # Normalize in Float64
     var out_norm: Float64 = 0.0
     for j in range(dim):
-        var val = Float64(host_out[j])
-        out_norm += val * val
+        out_norm += out_f64[j] * out_f64[j]
     out_norm = sqrt(out_norm)
     if out_norm > 0.0:
         for j in range(dim):
-            host_out[j] = host_out[j] / Scalar[dtype](out_norm)
+            out_f64[j] = out_f64[j] / out_norm
+
+    # Single cast from Float64 to dtype
+    var host_out = ctx.enqueue_create_host_buffer[dtype](dim)
+    for j in range(dim):
+        host_out[j] = Scalar[dtype](out_f64[j])
 
     var theta_opt = create_dense_tensor[dtype](ctx, shape^, init_value=Scalar[dtype](0.0))
     ctx.enqueue_copy(theta_opt.storage, host_out)
@@ -785,7 +801,6 @@ fn dmrg_local_update_two_site[dtype: DType](
         ctx,
         max_iter=params.max_krylov_iter,
         tol=params.krylov_tol,
-        reorthogonalize=params.reorthogonalize,
     )
     
     var eigenvalue = lanczos_result[0]
