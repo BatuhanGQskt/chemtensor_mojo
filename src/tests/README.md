@@ -8,10 +8,10 @@ The `src/tests/` folder exists to validate the Mojo implementation against the C
 
 Clone the C reference implementation so it sits **sibling** to the Mojo project. `run_main.sh` in the C repo expects this layout and copies generated JSON into the Mojo `test_data/` directory.
 
-Recommended layout:
+Recommended layout (the parent folder can be named anything; only the sibling structure matters):
 
 ```
-Master_Thesis/
+<parent_folder>/
 ├── chemtensor/          # C repo (clone here)
 │   ├── run_main.sh
 │   └── ...
@@ -24,7 +24,7 @@ Master_Thesis/
 Clone the C repository into the same parent directory as `chemtensor_mojo`:
 
 ```bash
-cd /path/to/Master_Thesis
+cd /path/to/parent_folder
 git clone git@github.com:BatuhanGQskt/chemtensor_c_replica.git
 ```
 

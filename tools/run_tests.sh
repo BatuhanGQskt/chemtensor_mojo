@@ -66,11 +66,6 @@ while IFS= read -r test_file; do
   echo "Running: $test_file"
   echo "----------------------------------------------------------------"
 
-  export CHEMTENSOR_DUMP_DIR=/home/batu/Master_Thesis/compare_chemtensors/out
-  export CHEMTENSOR_ISING_J=1.0
-  export CHEMTENSOR_ISING_H=0.0
-  export CHEMTENSOR_ISING_G=1.0
-
   OUTPUT_FILE=$(mktemp)
   set +e
   mojo run -I . $MOJO_EXTRA_FLAGS "$test_file" > "$OUTPUT_FILE" 2>&1
