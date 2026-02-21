@@ -92,16 +92,18 @@ Regenerate these by running the C project’s `run_main.sh` (see Step 1). Do not
 
 ### algorithms/
 
-**DMRG tests.** Same pattern as MPS/MPO and dense tensor tests: manual runs, gauge-invariant checks, and C vs Mojo comparison.
+**Algorithm tests.** DMRG tests are grouped under **algorithms/dmrg/** (see `algorithms/dmrg/README.md`).
 
-- **test_dmrg.mojo** — Manual DMRG runs (Heisenberg XXZ), prints results, writes JSON. Asserts: final MPS norm ≈ 1, ground energy in expected range. Mirrors `chemtensor/manual_tests/dmrg.c`.
-- **test_dmrg_gauge_safe.mojo** — Gauge-invariant checks (TFIM): energy = ⟨ψ|H|ψ⟩, variance small, observables in range. No C reference.
-- **test_dmrg_c_comparison.mojo** — Loads C reference from `test_data/dmrg_results_c_singlesite.json` and `test_data/dmrg_results_c_twosite.json`, runs Mojo DMRG with same parameters, compares `energy_final`, `bond_dims` length, and norm (tolerance-based).
-- **dmrg_json_loader.mojo** — Loads DMRG reference JSON (same schema as C `dmrg_results_to_json`).
+- **dmrg/** — DMRG test suite:
+  - **test_dmrg.mojo** — Manual runs (7-site XXX, 11-site XXZ), prints results, writes JSON. Asserts norm ≈ 1, energy in range. Mirrors `chemtensor/manual_tests/dmrg.c`.
+  - **test_dmrg_gauge_safe.mojo** — Gauge-invariant checks (TFIM): energy = ⟨ψ|H|ψ⟩, variance small, observables in range (Tiers A/B/C).
+  - **test_dmrg_c_comparison.mojo** — Loads C reference from `test_data/dmrg_results_c_*.json`, runs Mojo DMRG with same parameters, compares `energy_final`, `bond_dims` length, norm.
+  - **test_dmrg_exact_small.mojo** — 4-site Heisenberg XXX exact ground state energy (E₀ = -3) without C reference.
+  - **dmrg_json_loader.mojo** — Loads DMRG reference JSON (used by C comparison test).
 
-**C reference refresh:** In `chemtensor`, ensure DMRG is exercised (e.g. via `main.c` calling `dmrg_tests()` or equivalent), build and run so that C writes `generated/dmrg/dmrg_results_c_singlesite.json` and `dmrg_results_c_twosite.json`, then run `run_main.sh` to copy them into `test_data/`.
+**C reference refresh:** In `chemtensor`, run `run_main.sh` so that C builds, runs DMRG, and copies `generated/dmrg/dmrg_results_c_*.json` into this project’s `test_data/`.
 
-**Energy conventions (C vs Mojo):** C and Mojo DMRG energies can differ by roughly 4×–20× depending on which C code path produced the reference. The C “assembly” path uses spin-1/2 operators (effective coupling J/4 in Pauli form); the “manual” path (e.g. `manual_tests/dmrg.c` with `create_heisenberg_xxz_1d_mpo_tensors`) uses the same Pauli convention as Mojo. For strict energy comparison, generate the C reference with the same Hamiltonian as Mojo (manual C path). Otherwise, either (a) skip or relax the energy check and only compare norm and bond structure, or (b) compare scale-invariant quantities or document the convention and use a loose energy tolerance.
+**Energy conventions (C vs Mojo):** For strict comparison, generate the C reference with the manual Heisenberg XXZ MPO (same convention as Mojo). See `algorithms/dmrg/README.md`.
 
 ---
 

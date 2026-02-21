@@ -678,6 +678,8 @@ fn lanczos_two_site_optimize[dtype: DType](
             vnext_f64.append(w_f64[i] / b)
         krylov.append(vnext_f64^)
 
+        # Recreate v_current (previous one was consumed by apply_two_site_heff)
+        v_current = create_dense_tensor[dtype](ctx, shape.copy()^, init_value=Scalar[dtype](0.0))
         var host_v_next = ctx.enqueue_create_host_buffer[dtype](dim)
         for i in range(dim):
             host_v_next[i] = Scalar[dtype](w_f64[i] / b)
