@@ -316,6 +316,7 @@ fn expectation_value[dtype: DType](
     for i in range(N):
         L = update_left_environment[dtype](L^, mps.sites[i], mpo.sites[i], ctx)
 
+    ctx.synchronize()
     # At the right boundary we should have shape [1, 1, 1]
     if L.size != 1:
         # Still return the (0) element if it exists; but flag shape issues loudly.
@@ -422,6 +423,7 @@ fn expectation_value_two_mps[dtype: DType](
     for i in range(N):
         L = update_left_environment_two_mps[dtype](L^, mps_bra.sites[i], mps_ket.sites[i], mpo.sites[i], ctx)
 
+    ctx.synchronize()
     if L.size != 1:
         raise Error("Unexpected final environment size in expectation_value_two_mps: " + String(L.size))
 
@@ -538,18 +540,25 @@ fn apply_mpo[dtype: DType](
             raise Error("apply_mpo: physical dim mismatch at site " + String(i))
 
         # Contract A[Dl, d, Dr] with W[wL, d, d_out, wR] on index d.
-        # Reshape A to [Dl*Dr, d], W to [d, wL*d_out*wR]
-        var A_flat = A.reshape(List[Int](Dl * Dr, d))
-        var W_flat = W.reshape(List[Int](d, wL * d_out * wR))
+        # Transpose A to [Dl, Dr, d] so that physical axis d is last (column)
+        # in the flattened [Dl*Dr, d] matrix — needed for correct matmul contraction.
+        # W is [wL, d_in, d_out, wR] (row-major), so transpose to [d_in, wL, d_out, wR]
+        # then reshape to [d, wL*d_out*wR] so that W_flat[d_in, col] = W[wL, d_in, d_out, wR].
+        var A_perm = A.transpose(List[Int](0, 2, 1), ctx)  # [Dl, d, Dr] -> [Dl, Dr, d]
+        var A_flat = A_perm^.reshape(List[Int](Dl * Dr, d))
+        var W_perm = W.transpose(List[Int](1, 0, 2, 3), ctx)
+        var W_flat = W_perm^.reshape(List[Int](d, wL * d_out * wR))
         var C_mat = create_dense_tensor[dtype](
             ctx, List[Int](Dl * Dr, wL * d_out * wR), init_value=Scalar[dtype](0.0)
         )
         dense_tensor_dot(C_mat, A_flat^, W_flat^, ctx)
         # C_mat is [Dl*Dr, wL*d_out*wR]. Reshape to [Dl, Dr, wL, d_out, wR]
         var C = C_mat^.reshape(List[Int](Dl, Dr, wL, d_out, wR))
-        # Permute to [Dl, wL, d_out, Dr, wR] then reshape to [Dl*wL, d_out, Dr*wR]
-        var C_perm = C^.transpose(List[Int](0, 2, 3, 1, 4), ctx)
-        var site_tensor = C_perm^.reshape(List[Int](Dl * wL, d_out, Dr * wR))
+        # C perm_ax (0,3,1,2,4) -> (wL, Dl, d_in, wR, Dr); flatten (wL,Dl) and (wR,Dr).
+        # Permute to (wL, Dl, d_out, wR, Dr), reshape to (wL*Dl, d_out, wR*Dr).
+        var C_perm = C^.transpose(List[Int](2, 0, 3, 4, 1), ctx)
+        var site_tensor = C_perm^.reshape(List[Int](wL * Dl, d_out, wR * Dr))
         out_sites.append(MPSSite[dtype](site_tensor^))
 
+    ctx.synchronize()
     return MatrixProductState[dtype](out_sites^)

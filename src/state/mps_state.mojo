@@ -1,4 +1,5 @@
 from collections.list import List
+from math import sqrt
 from gpu.host import DeviceContext
 from src.m_tensor.dense_tensor import (
     DenseTensor,
@@ -241,7 +242,11 @@ fn create_uniform_mps[dtype: DType = DType.float32](
         var shape = List[Int](left_dim, physical_dim, right_dim)
         var site_tensor: DenseTensor[dtype]
         if init_value is None:
-            site_tensor = DenseTensor[dtype].random(ctx, shape^)  # Assume random factory
+            site_tensor = DenseTensor[dtype].random(ctx, shape^)
+            # Scale by 1/sqrt(nelem) per site to match C construct_random_mps (keeps norms/overlaps O(1))
+            var nelem = left_dim * physical_dim * right_dim
+            var scale_val = 1.0 / sqrt(Float64(nelem))
+            site_tensor.scale_in_place(Scalar[dtype](scale_val), ctx)
         else:
             site_tensor = create_dense_tensor[dtype](
                 ctx, shape^, row_major=True, init_value=init_value.value()

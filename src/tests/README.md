@@ -12,6 +12,7 @@ Recommended layout (the parent folder can be named anything; only the sibling st
 
 ```
 <parent_folder>/
+├── bench_config.json
 ├── chemtensor/          # C repo (clone here)
 │   ├── run_main.sh
 │   └── ...
@@ -108,6 +109,14 @@ From the C build directory you can also run the binary by hand:
 
 Defaults: nsites=6, d=2, chi_max=16, output_path=`generated/perf/contraction_timings.jsonl` (relative to build dir). After **run_main.sh**, C results are already in **results/perf/**; no need to pass a path unless you want a different file.
 
+**Quick path (recommended):** From the C repo root (`../chemtensor` in the sibling layout), simply run:
+
+```bash
+./run_main.sh
+```
+
+This script handles build + execution + copying outputs (including contraction timings) into this project’s `results/perf/`.
+
 ### Mojo (chemtensor_mojo)
 
 From the Mojo project root (`chemtensor_mojo/chemtensor_mojo`):
@@ -118,6 +127,17 @@ mojo run -I . src/tests/benchmarks/bench_contractions.mojo
 ```
 
 Defaults: nsites=6, d=2, chi_max=16. Output: `results/perf/contraction_timings.jsonl`. Parameters are currently constants in `src/tests/benchmarks/bench_contractions.mojo`; change them there for larger runs.
+
+**Shared config example** (used by both C and Mojo benchmarks via `bench_config.json` placed in the parent folder of both repos):
+
+```json
+{
+  "nsites": 6,
+  "d": 2,
+  "chi_max": 16,
+  "num_runs": 3
+}
+```
 
 ### Result file location
 
@@ -171,6 +191,7 @@ After **run_main.sh**, C timing data is in **results/perf/**; run the Mojo bench
 
 - **test_mps_extensive.mojo** — Product states, norms, state vectors, overlaps. No C reference; exercises `create_product_mps`, `mps_norm`, `mps_to_statevector`, and related observable checks.
 - **test_mps_c_comparison.mojo** — Loads C reference from `test_data/mps_product_*.json` and compares norms and overlaps with Mojo MPS (observable-based only, not dense tensor element-wise).
+- **test_mps_observables.mojo** — Observable sanity tests when MPS is involved in contractions: random MPS norm, MPS-MPS overlap, MPS-MPO inner product, and apply_mpo norm. Uses the same setup as the contraction benchmark (scaled random MPS, Ising MPO); asserts all observables are O(1). Catches regressions (e.g. unscaled random MPS or wrong contraction logic).
 
 ---
 
@@ -194,6 +215,10 @@ Some tests require a compatible GPU (`has_accelerator()`); they are skipped othe
 **Contraction timing benchmarks (C vs Mojo).**
 
 - **bench_contractions.mojo** — Times MPO-MPO, MPS-MPO inner product, MPS-MPO apply, and MPS-MPS; appends JSONL to `results/perf/contraction_timings.jsonl`. Run with `mojo run -I . src/tests/benchmarks/bench_contractions.mojo`. See [Contraction benchmarks](#contraction-benchmarks) above.
+
+- **test_mps_mpo_apply_stability.mojo** — Stability and plausibility for the mps_mpo_apply result (norm of MPO|ψ⟩). Same setup as bench_contractions (C-compatible RNG seed 42, Ising MPO, nsites=6, d=2, chi_max=16). Runs apply_mpo → norm 50 times; asserts max(norms) − min(norms) < 1e-6 (determinism) and norm in [0.01, 0.2] (C reference ~0.051). Run with `mojo run -I . src/tests/benchmarks/test_mps_mpo_apply_stability.mojo`.
+
+- **test_rng_c_compat.mojo** — Compares Mojo `rng_c_compat.mojo` with C `rng.c` output. Reads `test_data/rng_reference.txt` (produced by the C project’s `rng_export` when you run `./run_main.sh`). Asserts that the same seed yields identical `rand_uint32` and `randnf` sequences so that benchmarks (e.g. random MPS) match between C and Mojo. If the reference file is missing, the test is skipped. Generate the reference from the C repo: `./run_main.sh` builds and runs `rng_export 42 64` and copies `rng_reference.txt` to this project’s `test_data/`.
 
 ---
 
