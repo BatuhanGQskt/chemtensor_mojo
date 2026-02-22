@@ -88,6 +88,46 @@ Regenerate these by running the C project’s `run_main.sh` (see Step 1). Do not
 
 ---
 
+## Contraction benchmarks
+
+Timed benchmarks for **MPO-MPO**, **MPS-MPO inner product**, **MPS-MPO apply**, and **MPS-MPS** contractions are implemented in both C and Mojo. Results are written in **JSONL** (one JSON object per line) for future comparison; no plotting is implemented.
+
+**Operations:** (1) MPO-MPO: full MPO contraction to matrix; (2) MPS-MPO inner: \<χ|O|ψ\>; (3) MPS-MPO apply: O|ψ\>; (4) MPS-MPS: \<χ|ψ\>.
+
+**Scalability:** Both sides accept parameters `nsites`, `d`, `chi_max`. Use small values (e.g. nsites=6, chi_max=16) for quick runs; increase for high-memory CPU/GPU comparison.
+
+### C (chemtensor)
+
+C writes to a predetermined path under the build tree. When you run the C repo’s **run_main.sh**, it builds, runs `./main`, then runs `./perf_contractions` so that results go to **build/generated/perf/contraction_timings.jsonl**. That file is then copied into this project’s **results/perf/** (same layout as Mojo), so all contraction timing results (C and Mojo) live under **results/perf/**.
+
+From the C build directory you can also run the binary by hand:
+
+```bash
+./perf_contractions [nsites] [d] [chi_max] [output_path]
+```
+
+Defaults: nsites=6, d=2, chi_max=16, output_path=`generated/perf/contraction_timings.jsonl` (relative to build dir). After **run_main.sh**, C results are already in **results/perf/**; no need to pass a path unless you want a different file.
+
+### Mojo (chemtensor_mojo)
+
+From the Mojo project root (`chemtensor_mojo/chemtensor_mojo`):
+
+```bash
+mkdir -p results/perf
+mojo run -I . src/tests/benchmarks/bench_contractions.mojo
+```
+
+Defaults: nsites=6, d=2, chi_max=16. Output: `results/perf/contraction_timings.jsonl`. Parameters are currently constants in `src/tests/benchmarks/bench_contractions.mojo`; change them there for larger runs.
+
+### Result file location
+
+- **C:** writes to **build/generated/perf/contraction_timings.jsonl** when run from `build/` (default path). **run_main.sh** copies **generated/perf/*.jsonl** into this project’s **results/perf/**.
+- **Mojo:** writes to **results/perf/contraction_timings.jsonl** (append).
+
+After **run_main.sh**, C timing data is in **results/perf/**; run the Mojo benchmark from this project and it will append to the same file, so both backends contribute to **results/perf/contraction_timings.jsonl** for comparison.
+
+---
+
 ## Summaries by folder
 
 ### algorithms/
@@ -146,6 +186,14 @@ Regenerate these by running the C project’s `run_main.sh` (see Step 1). Do not
 - **test_c_replica_dot.mojo** — Replicates C dense_tensor_dot cases: matrix-matrix and matrix-vector multiplication, inner product.
 
 Some tests require a compatible GPU (`has_accelerator()`); they are skipped otherwise.
+
+---
+
+### benchmarks/
+
+**Contraction timing benchmarks (C vs Mojo).**
+
+- **bench_contractions.mojo** — Times MPO-MPO, MPS-MPO inner product, MPS-MPO apply, and MPS-MPS; appends JSONL to `results/perf/contraction_timings.jsonl`. Run with `mojo run -I . src/tests/benchmarks/bench_contractions.mojo`. See [Contraction benchmarks](#contraction-benchmarks) above.
 
 ---
 

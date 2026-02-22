@@ -503,3 +503,53 @@ fn mpo_compose[dtype: DType](
         sites.append(MPOSite[dtype](site_tensor^))
 
     return MatrixProductOperator[dtype](sites^)
+
+
+fn apply_mpo[dtype: DType](
+    mpo: MatrixProductOperator[dtype],
+    mps: MatrixProductState[dtype],
+    ctx: DeviceContext,
+) raises -> MatrixProductState[dtype]:
+    """Apply MPO to MPS: |out> = O|mps>.
+
+    At each site: contract MPS site A[Dl, d, Dr] with MPO site W[wL, d, d_out, wR]
+    on the physical index d. Result site has shape [Dl*wL, d_out, Dr*wR].
+
+    Matches C apply_mpo(op, psi, op_psi) for benchmarking.
+    """
+    var N = mps.num_sites()
+    if mpo.num_sites() != N:
+        raise Error("apply_mpo: MPS and MPO must have same number of sites")
+
+    var out_sites = List[MPSSite[dtype]](capacity=N)
+    for i in range(N):
+        var A = mps.sites[i].tensor
+        var W = mpo.sites[i].tensor
+        var Ash = A.shape.copy()
+        var Wsh = W.shape.copy()
+        var Dl = Ash[0]
+        var d = Ash[1]
+        var Dr = Ash[2]
+        var wL = Wsh[0]
+        var d_in = Wsh[1]
+        var d_out = Wsh[2]
+        var wR = Wsh[3]
+        if d_in != d:
+            raise Error("apply_mpo: physical dim mismatch at site " + String(i))
+
+        # Contract A[Dl, d, Dr] with W[wL, d, d_out, wR] on index d.
+        # Reshape A to [Dl*Dr, d], W to [d, wL*d_out*wR]
+        var A_flat = A.reshape(List[Int](Dl * Dr, d))
+        var W_flat = W.reshape(List[Int](d, wL * d_out * wR))
+        var C_mat = create_dense_tensor[dtype](
+            ctx, List[Int](Dl * Dr, wL * d_out * wR), init_value=Scalar[dtype](0.0)
+        )
+        dense_tensor_dot(C_mat, A_flat^, W_flat^, ctx)
+        # C_mat is [Dl*Dr, wL*d_out*wR]. Reshape to [Dl, Dr, wL, d_out, wR]
+        var C = C_mat^.reshape(List[Int](Dl, Dr, wL, d_out, wR))
+        # Permute to [Dl, wL, d_out, Dr, wR] then reshape to [Dl*wL, d_out, Dr*wR]
+        var C_perm = C^.transpose(List[Int](0, 2, 3, 1, 4), ctx)
+        var site_tensor = C_perm^.reshape(List[Int](Dl * wL, d_out, Dr * wR))
+        out_sites.append(MPSSite[dtype](site_tensor^))
+
+    return MatrixProductState[dtype](out_sites^)
