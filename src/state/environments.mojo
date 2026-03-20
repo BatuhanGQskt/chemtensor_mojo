@@ -1,6 +1,9 @@
 from collections.list import List
 from time import perf_counter_ns
+from math import ceildiv
+from gpu import thread_idx, block_idx, block_dim
 from gpu.host import DeviceContext
+from memory import UnsafePointer
 from src.m_tensor.dense_tensor import (
     DenseTensor,
     create_dense_tensor,
@@ -10,6 +13,34 @@ from src.m_tensor.dense_tensor import (
 from src.state.mps_state import MPSSite, MatrixProductState
 from src.state.mpo_state import MPOSite, MatrixProductOperator
 from src.state.mpo_state import create_identity_mpo
+
+
+fn _gpu_gemm_transposeA_f32(
+    A: UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin],
+    B: UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin],
+    C: UnsafePointer[Scalar[DType.float32], origin=MutAnyOrigin],
+    K: Int,  # shared dimension
+    M: Int,  # C rows / A cols
+    N: Int,  # C cols / B cols
+):
+    """Compute C(MxN) = (A(KxM))^T @ B(KxN), without materializing A^T.
+    
+    Indexing corresponds to:
+        C[m,n] = sum_k A[k,m] * B[k,n]
+    """
+    var tid = Int(block_dim.x * block_idx.x + thread_idx.x)
+    var total = M * N
+    if tid >= total:
+        return
+
+    var m = tid // N
+    var n = tid % N
+
+    var acc = Scalar[DType.float32](0.0)
+    for k in range(K):
+        acc += A[k * M + m] * B[k * N + n]
+
+    C[tid] = acc
 
 
 @fieldwise_init
@@ -759,6 +790,63 @@ fn _mps_contraction_step_left[dtype: DType](
     var Dl_ket = A_ket.shape[0]
     var Dr_ket = A_ket.shape[2]
 
+    @parameter
+    if dtype == DType.float32:
+        # Step 1: temp[Dl_bra, d, Dr_ket] from L_prev^T[Dl_bra, Dl_ket] @ A_ket[Dl_ket, d, Dr_ket]
+        var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
+
+        # View tensors as 2D matrices for GEMM:
+        #   A_storage: [K, M] = [Dl_ket, Dl_bra]  (L_prev)
+        #   B_storage: [K, N] = [Dl_ket, d*Dr_ket] (A_ket reshaped)
+        #   C_storage: [M, N] = [Dl_bra, d*Dr_ket] (temp reshaped)
+        var A_ket_mat = A_ket.reshape(List[Int](Dl_ket, d * Dr_ket))
+
+        alias BLOCK_SIZE = 256
+        var K1 = Dl_ket
+        var M1 = Dl_bra
+        var N1 = d * Dr_ket
+        var total1 = M1 * N1
+        var grid1 = ceildiv(total1, BLOCK_SIZE)
+
+        ctx.enqueue_function[_gpu_gemm_transposeA_f32](
+            L_prev.storage.unsafe_ptr(),
+            A_ket_mat.storage.unsafe_ptr(),
+            temp.storage.unsafe_ptr(),
+            K1,
+            M1,
+            N1,
+            grid_dim=grid1,
+            block_dim=BLOCK_SIZE,
+        )
+
+        # Step 2: L_next[Dr_ket, Dr_bra] from temp[K, M]^T @ A_bra[K, N]
+        var L_next = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr_ket, Dr_bra))
+
+        #   A_storage: [K, M] = [Dl_bra*d, Dr_ket] (temp reshaped)
+        #   B_storage: [K, N] = [Dl_bra*d, Dr_bra] (A_bra reshaped)
+        var temp_mat = temp^.reshape(List[Int](Dl_bra * d, Dr_ket))
+        var A_bra_mat = A_bra.reshape(List[Int](Dl_bra * d, Dr_bra))
+
+        var K2 = Dl_bra * d
+        var M2 = Dr_ket
+        var N2 = Dr_bra
+        var total2 = M2 * N2
+        var grid2 = ceildiv(total2, BLOCK_SIZE)
+
+        ctx.enqueue_function[_gpu_gemm_transposeA_f32](
+            temp_mat.storage.unsafe_ptr(),
+            A_bra_mat.storage.unsafe_ptr(),
+            L_next.storage.unsafe_ptr(),
+            K2,
+            M2,
+            N2,
+            grid_dim=grid2,
+            block_dim=BLOCK_SIZE,
+        )
+
+        return L_next^
+
+    # Fallback: generic contraction via dense_tensor_dot (supports other dtypes).
     # Step 1: Contract leading Dl_ket in both tensors.
     var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
     var L_view = L_prev.reshape(List[Int](Dl_ket, Dl_bra))
@@ -787,6 +875,71 @@ fn _mps_contraction_step_left[dtype: DType](
     var Dl_ket = A_ket.shape[0]
     var Dr_ket = A_ket.shape[2]
 
+    @parameter
+    if dtype == DType.float32:
+        var t0 = perf_counter_ns()
+        var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
+        profile.alloc_ns += perf_counter_ns() - t0
+
+        # Step 1 GEMM kernel
+        var A_ket_mat = A_ket.reshape(List[Int](Dl_ket, d * Dr_ket))
+        alias BLOCK_SIZE = 256
+
+        var K1 = Dl_ket
+        var M1 = Dl_bra
+        var N1 = d * Dr_ket
+        var total1 = M1 * N1
+        var grid1 = ceildiv(total1, BLOCK_SIZE)
+
+        ctx.synchronize()
+        t0 = perf_counter_ns()
+        ctx.enqueue_function[_gpu_gemm_transposeA_f32](
+            L_prev.storage.unsafe_ptr(),
+            A_ket_mat.storage.unsafe_ptr(),
+            temp.storage.unsafe_ptr(),
+            K1,
+            M1,
+            N1,
+            grid_dim=grid1,
+            block_dim=BLOCK_SIZE,
+        )
+        ctx.synchronize()
+        profile.dot_ns += perf_counter_ns() - t0
+        profile.dot_calls += 1
+
+        # Step 2
+        t0 = perf_counter_ns()
+        var L_next = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr_ket, Dr_bra))
+        profile.alloc_ns += perf_counter_ns() - t0
+
+        var temp_mat = temp^.reshape(List[Int](Dl_bra * d, Dr_ket))
+        var A_bra_mat = A_bra.reshape(List[Int](Dl_bra * d, Dr_bra))
+
+        var K2 = Dl_bra * d
+        var M2 = Dr_ket
+        var N2 = Dr_bra
+        var total2 = M2 * N2
+        var grid2 = ceildiv(total2, BLOCK_SIZE)
+
+        ctx.synchronize()
+        t0 = perf_counter_ns()
+        ctx.enqueue_function[_gpu_gemm_transposeA_f32](
+            temp_mat.storage.unsafe_ptr(),
+            A_bra_mat.storage.unsafe_ptr(),
+            L_next.storage.unsafe_ptr(),
+            K2,
+            M2,
+            N2,
+            grid_dim=grid2,
+            block_dim=BLOCK_SIZE,
+        )
+        ctx.synchronize()
+        profile.dot_ns += perf_counter_ns() - t0
+        profile.dot_calls += 1
+
+        return L_next^
+
+    # Fallback: generic contraction via dense_tensor_dot (supports other dtypes).
     var t0 = perf_counter_ns()
     var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
     profile.alloc_ns += perf_counter_ns() - t0
