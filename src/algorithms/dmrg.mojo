@@ -4,6 +4,7 @@ from math import sqrt, atan2, sin, cos
 from src.m_tensor.dense_tensor import (
     DenseTensor,
     create_dense_tensor,
+    create_dense_tensor_uninitialized,
     dense_tensor_dot,
     dense_tensor_svd_trunc,
 )
@@ -15,6 +16,7 @@ from src.state.environments import (
     build_right_environments,
 )
 from src.algorithms.krylov import lanczos_ground_state
+import benchmark
 
 
 @fieldwise_init
@@ -129,7 +131,7 @@ fn build_two_site_theta[dtype: DType](
     var A_ip1_mat = A_ip1.tensor.reshape(List[Int](Dm, d * Dr))
     
     # Contract: [Dl*d, Dm] @ [Dm, d*Dr] -> [Dl*d, d*Dr]
-    var theta_mat = create_dense_tensor[dtype](ctx, List[Int](Dl * d, d * Dr), init_value=Scalar[dtype](0.0))
+    var theta_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl * d, d * Dr))
     dense_tensor_dot(theta_mat, A_i_mat^, A_ip1_mat^, ctx)
     
     # Reshape to [Dl, d, d, Dr]
@@ -315,7 +317,7 @@ fn apply_two_site_heff[dtype: DType](
     var L_flat = L_trans^.reshape(List[Int](Dl, wL * Dl_bra))
     var theta_flat = theta.reshape(List[Int](Dl, d * d * Dr))
     
-    var temp1_contract = create_dense_tensor[dtype](ctx, List[Int](wL * Dl_bra, d * d * Dr), init_value=Scalar[dtype](0.0))
+    var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_bra, d * d * Dr))
     # Contract leading axis of L_flat (Dl) with leading axis of theta_flat (Dl).
     dense_tensor_dot(temp1_contract, L_flat^, theta_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     
@@ -332,7 +334,7 @@ fn apply_two_site_heff[dtype: DType](
     # W_i [wL, d_i, d_i', wM] -> reshape [wL*d_i, d_i'*wM]
     var Wi_mat = W_i.tensor.reshape(List[Int](wL * d, d_out * wM))
     
-    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_bra * d * Dr, d_out * wM), init_value=Scalar[dtype](0.0))
+    var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra * d * Dr, d_out * wM))
     dense_tensor_dot(temp2_mat, temp1_mat2^, Wi_mat^, ctx)
     
     var temp2 = temp2_mat^.reshape(List[Int](Dl_bra, d, Dr, d_out, wM))
@@ -348,7 +350,7 @@ fn apply_two_site_heff[dtype: DType](
     # W_{i+1} [wM, d_{i+1}, d_{i+1}', wR] -> reshape [wM*d_{i+1}, d_{i+1}'*wR]
     var Wip1_mat = W_ip1.tensor.reshape(List[Int](wM * d, d_out * wR))
     
-    var temp3_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_bra * Dr * d_out, d_out * wR), init_value=Scalar[dtype](0.0))
+    var temp3_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra * Dr * d_out, d_out * wR))
     dense_tensor_dot(temp3_mat, temp2_mat3^, Wip1_mat^, ctx)
     
     var temp3 = temp3_mat^.reshape(List[Int](Dl_bra, Dr, d_out, d_out, wR))
@@ -364,7 +366,7 @@ fn apply_two_site_heff[dtype: DType](
     # Transpose R to [wR, Dr, Dr'] -> Reshape [wR*Dr, Dr']
     var R_mat = R_env.reshape(List[Int](wR * Dr, Dr_bra))
     
-    var result_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_bra * d_out * d_out, Dr_bra), init_value=Scalar[dtype](0.0))
+    var result_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra * d_out * d_out, Dr_bra))
     dense_tensor_dot(result_mat, temp3_mat4^, R_mat^, ctx)
     
     var result = result_mat^.reshape(List[Int](Dl_bra, d_out, d_out, Dr_bra))
@@ -611,7 +613,7 @@ fn lanczos_two_site_optimize[dtype: DType](
         host_v0[i] = host_v0[i] / Scalar[dtype](norm0)
 
     # IMPORTANT: don't consume `shape` here; we need it again later.
-    var v_current = create_dense_tensor[dtype](ctx, shape.copy()^, init_value=Scalar[dtype](0.0))
+    var v_current = create_dense_tensor_uninitialized[dtype](ctx, shape.copy()^)
     ctx.enqueue_copy(v_current.storage, host_v0)
     ctx.synchronize()
 
@@ -679,7 +681,7 @@ fn lanczos_two_site_optimize[dtype: DType](
         krylov.append(vnext_f64^)
 
         # Recreate v_current (previous one was consumed by apply_two_site_heff)
-        v_current = create_dense_tensor[dtype](ctx, shape.copy()^, init_value=Scalar[dtype](0.0))
+        v_current = create_dense_tensor_uninitialized[dtype](ctx, shape.copy()^)
         var host_v_next = ctx.enqueue_create_host_buffer[dtype](dim)
         for i in range(dim):
             host_v_next[i] = Scalar[dtype](w_f64[i] / b)
@@ -747,7 +749,7 @@ fn lanczos_two_site_optimize[dtype: DType](
     for j in range(dim):
         host_out[j] = Scalar[dtype](out_f64[j])
 
-    var theta_opt = create_dense_tensor[dtype](ctx, shape^, init_value=Scalar[dtype](0.0))
+    var theta_opt = create_dense_tensor_uninitialized[dtype](ctx, shape^)
     ctx.enqueue_copy(theta_opt.storage, host_out)
     ctx.synchronize()
 

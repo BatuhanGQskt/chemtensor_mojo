@@ -21,10 +21,13 @@ from src.state.mps_state import (
 from src.tests.benchmarks.rng_c_compat import create_random_mps_c_compatible
 from src.state.mpo_state import MatrixProductOperator, MPOSite
 from src.state.hamiltonians import create_ising_1d_mpo
+from src.m_tensor.dense_tensor import create_dense_tensor
 from src.state.environments import (
     expectation_value_two_mps,
     mps_overlap,
     apply_mpo,
+    update_left_environment,
+    ProfileStats,
 )
 from src.tests.state.mpo.mpo_test_helpers import mpo_to_full_matrix
 
@@ -141,6 +144,20 @@ fn _results_path(nsites: Int, d: Int, chi_max: Int) -> String:
     )
 
 
+fn _profile_results_path(nsites: Int, d: Int, chi_max: Int) -> String:
+    """Build parameterized profiling JSONL output path."""
+    return (
+        RESULTS_DIR
+        + "/profiling_"
+        + String(nsites)
+        + "_"
+        + String(d)
+        + "_"
+        + String(chi_max)
+        + ".jsonl"
+    )
+
+
 fn _bond_dims_list(nsites: Int, chi_max: Int) -> List[Int]:
     """Return [1, chi_max, chi_max, ..., chi_max, 1] of length nsites+1."""
     var bonds = List[Int](capacity=nsites + 1)
@@ -187,6 +204,54 @@ fn _write_record(
     _append_jsonl(path, line)
 
 
+fn _write_profile_record(
+    path: String,
+    operation: String,
+    nsites: Int,
+    d: Int,
+    chi_max: Int,
+    profile: ProfileStats,
+    result: Float64,
+) raises -> None:
+    var line = String("{\"backend\":\"mojo\",\"operation\":\"")
+    line += operation
+    line += "\",\"params\":{\"nsites\":"
+    line += String(nsites)
+    line += ",\"d\":"
+    line += String(d)
+    line += ",\"chi_max\":"
+    line += String(chi_max)
+    line += "},\"result\":"
+    line += String(result)
+    line += ",\"profile\":{"
+    line += "\"transpose_ns\":"
+    line += String(profile.transpose_ns)
+    line += ",\"transpose_calls\":"
+    line += String(profile.transpose_calls)
+    line += ",\"dot_ns\":"
+    line += String(profile.dot_ns)
+    line += ",\"dot_calls\":"
+    line += String(profile.dot_calls)
+    line += ",\"alloc_ns\":"
+    line += String(profile.alloc_ns)
+    line += ",\"reshape_ns\":"
+    line += String(profile.reshape_ns)
+    line += ",\"reshape_calls\":"
+    line += String(profile.reshape_calls)
+    line += ",\"sync_ns\":"
+    line += String(profile.sync_ns)
+    line += ",\"sync_calls\":"
+    line += String(profile.sync_calls)
+    line += ",\"copy_ns\":"
+    line += String(profile.copy_ns)
+    line += ",\"copy_calls\":"
+    line += String(profile.copy_calls)
+    line += ",\"total_ns\":"
+    line += String(profile.total_ns)
+    line += "}}"
+    _append_jsonl(path, line)
+
+
 fn run_bench_contractions(
     config_path: String = DEFAULT_CONFIG_PATH,
 ) raises -> None:
@@ -197,6 +262,7 @@ fn run_bench_contractions(
     var chi_max = cfg.chi_max
     var num_runs = cfg.num_runs
     var out_path = _results_path(nsites, d, chi_max)
+    var profile_out_path = _profile_results_path(nsites, d, chi_max)
 
     var ctx = DeviceContext()
 
@@ -254,7 +320,63 @@ fn run_bench_contractions(
     print("mps_mps: " + String(sec_mps) + " s (result=" + String(result_mps) + ")")
     _write_record(out_path, "mps_mps", nsites, d, chi_max, sec_mps, result_mps, num_runs)
 
-    print("Appended 4 records to " + out_path)
+    # 4b) Profiled mps_overlap — calls the real function with a ProfileStats
+    var profile = ProfileStats.create()
+    var result_prof = mps_overlap[DType.float32](chi, psi, ctx, profile)
+    print("mps_mps_profile: " + String(profile))
+    _write_profile_record(profile_out_path, "mps_mps_profile", nsites, d, chi_max, profile, result_prof)
+
+    # 5) Left-environment sweep (GPU timing: sync before/after so we measure kernel execution)
+    var wL0 = mpo.bond_dimension(0)
+    var Dl0 = psi.bond_dimension(0)
+    var L_initial = create_dense_tensor[DType.float32](
+        ctx,
+        List[Int](wL0, Dl0, Dl0),
+        init_value=Scalar[DType.float32](0.0),
+    )
+    var host_L = ctx.enqueue_create_host_buffer[DType.float32](wL0 * Dl0 * Dl0)
+    for w in range(wL0):
+        for d in range(Dl0):
+            host_L[w * (Dl0 * Dl0) + d * Dl0 + d] = Scalar[DType.float32](1.0)
+    ctx.enqueue_copy(L_initial.storage, host_L)
+    ctx.synchronize()
+
+    # Warmup: one full sweep (copy L_initial so we don't consume it)
+    var L_warmup = create_dense_tensor[DType.float32](ctx, List[Int](wL0, Dl0, Dl0), init_value=Scalar[DType.float32](0.0))
+    ctx.enqueue_copy(L_warmup.storage, L_initial.storage)
+    ctx.synchronize()
+    for i in range(nsites):
+        L_warmup = update_left_environment[DType.float32](L_warmup^, psi.sites[i], mpo.sites[i], ctx)
+    ctx.synchronize()
+
+    # Timed runs: sync before/after to measure GPU kernel execution. Fresh L each run from L_initial.
+    t0 = perf_counter_ns()
+    for _ in range(num_runs):
+        ctx.synchronize()
+        var L_run = create_dense_tensor[DType.float32](ctx, List[Int](wL0, Dl0, Dl0), init_value=Scalar[DType.float32](0.0))
+        ctx.enqueue_copy(L_run.storage, L_initial.storage)
+        ctx.synchronize()
+        for i in range(nsites):
+            L_run = update_left_environment[DType.float32](L_run^, psi.sites[i], mpo.sites[i], ctx)
+        ctx.synchronize()
+    t1 = perf_counter_ns()
+    var sec_left_env = Float64(t1 - t0) / 1e9 / num_runs
+    print("left_env_sweep: " + String(sec_left_env) + " s (GPU timed, " + String(num_runs) + " runs)")
+    _write_record(out_path, "left_env_sweep", nsites, d, chi_max, sec_left_env, Float64(0.0), num_runs)
+
+    # 5b) Profiled left-env sweep
+    var profile_lenv = ProfileStats.create()
+    var L_prof = create_dense_tensor[DType.float32](ctx, List[Int](wL0, Dl0, Dl0), init_value=Scalar[DType.float32](0.0))
+    ctx.enqueue_copy(L_prof.storage, L_initial.storage)
+    ctx.synchronize()
+    for i in range(nsites):
+        L_prof = update_left_environment[DType.float32](L_prof^, psi.sites[i], mpo.sites[i], ctx, profile_lenv)
+    ctx.synchronize()
+    print("left_env_profile: " + String(profile_lenv))
+    _write_profile_record(profile_out_path, "left_env_profile", nsites, d, chi_max, profile_lenv, Float64(0.0))
+
+    print("Appended 5 records to " + out_path)
+    print("Appended 2 profiling records to " + profile_out_path)
 
 
 fn main() raises:

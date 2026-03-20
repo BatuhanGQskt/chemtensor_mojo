@@ -1,14 +1,69 @@
 from collections.list import List
+from time import perf_counter_ns
 from gpu.host import DeviceContext
 from src.m_tensor.dense_tensor import (
     DenseTensor,
     create_dense_tensor,
+    create_dense_tensor_uninitialized,
     dense_tensor_dot,
 )
 from src.state.mps_state import MPSSite, MatrixProductState
 from src.state.mpo_state import MPOSite, MatrixProductOperator
 from src.state.mpo_state import create_identity_mpo
 
+
+@fieldwise_init
+struct ProfileStats(Writable, Movable):
+    """Accumulates real wall-clock nanoseconds per operation category.
+
+    Pass an instance to the profiled overloads of `mps_overlap`,
+    `expectation_value_two_mps`, or `update_left_environment` /
+    `update_left_environment_two_mps`.  After the call returns inspect
+    or print the struct to see where time was spent.
+    """
+    var transpose_ns: Int
+    var transpose_calls: Int
+    var dot_ns: Int
+    var dot_calls: Int
+    var alloc_ns: Int
+    var total_ns: Int
+    var reshape_ns: Int
+    var reshape_calls: Int
+    var sync_ns: Int
+    var sync_calls: Int
+    var copy_ns: Int
+    var copy_calls: Int
+
+    @staticmethod
+    fn create() -> ProfileStats:
+        return ProfileStats(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+    fn write_to[W: Writer](self, mut writer: W) -> None:
+        writer.write("transpose=")
+        writer.write(String(Float64(self.transpose_ns) / 1e6))
+        writer.write("ms (")
+        writer.write(self.transpose_calls)
+        writer.write(" calls), dot=")
+        writer.write(String(Float64(self.dot_ns) / 1e6))
+        writer.write("ms (")
+        writer.write(self.dot_calls)
+        writer.write(" calls), alloc=")
+        writer.write(String(Float64(self.alloc_ns) / 1e6))
+        writer.write("ms, reshape=")
+        writer.write(String(Float64(self.reshape_ns) / 1e6))
+        writer.write("ms (")
+        writer.write(self.reshape_calls)
+        writer.write(" calls), sync=")
+        writer.write(String(Float64(self.sync_ns) / 1e6))
+        writer.write("ms (")
+        writer.write(self.sync_calls)
+        writer.write(" calls), copy=")
+        writer.write(String(Float64(self.copy_ns) / 1e6))
+        writer.write("ms (")
+        writer.write(self.copy_calls)
+        writer.write(" calls), total=")
+        writer.write(String(Float64(self.total_ns) / 1e6))
+        writer.write("ms")
 
 fn update_left_environment[dtype: DType](
     L_prev: DenseTensor[dtype],
@@ -63,7 +118,7 @@ fn update_left_environment[dtype: DType](
     var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
     var A_flat = A.reshape(List[Int](Dl_prev, s * Dr))
     
-    var temp1_contract = create_dense_tensor[dtype](ctx, List[Int](wL * Dl_prime, s * Dr), init_value=Scalar[dtype](0.0))
+    var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_prime, s * Dr))
     # Contract leading axis of L_flat (Dl) with leading axis of A_flat (Dl).
     dense_tensor_dot(temp1_contract, L_flat^, A_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     
@@ -83,7 +138,7 @@ fn update_left_environment[dtype: DType](
     # W[wL, s, s', wR] -> reshape to [wL*s, s'*wR]
     var W_mat = W.reshape(List[Int](wL * s, s_out * wR))
     
-    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR), init_value=Scalar[dtype](0.0))
+    var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR))
     dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
     
     var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
@@ -104,7 +159,7 @@ fn update_left_environment[dtype: DType](
     # A is [Dl', s', Dr']. Reshape(Dl'*s', Dr'). Yes.
     var A_flat2 = A.reshape(List[Int](Dl_prime * s_out, Dr))
     
-    var L_next_mat = create_dense_tensor[dtype](ctx, List[Int](Dr * wR, Dr), init_value=Scalar[dtype](0.0))
+    var L_next_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr * wR, Dr))
     dense_tensor_dot(L_next_mat, temp2_mat2^, A_flat2^, ctx)
     
     var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
@@ -112,6 +167,111 @@ fn update_left_environment[dtype: DType](
     # Permute to standard order: [wR, Dr, Dr']
     var L_next = L_next_temp^.transpose(List[Int](1, 0, 2), ctx)
     
+    return L_next^
+
+
+fn update_left_environment[dtype: DType](
+    L_prev: DenseTensor[dtype],
+    A_site: MPSSite[dtype],
+    W_site: MPOSite[dtype],
+    ctx: DeviceContext,
+    mut profile: ProfileStats,
+) raises -> DenseTensor[dtype]:
+    """Profiled overload — same logic with per-op wall-clock timing."""
+    var fn_t0 = perf_counter_ns()
+
+    var A = A_site.tensor
+    var W = W_site.tensor
+
+    var L_shape = L_prev.shape.copy()
+    var A_shape = A.shape.copy()
+    var wL = L_shape[0]
+    var Dl_prev = L_shape[1]
+    var Dl_prime = L_shape[2]
+    var s = A_shape[1]
+    var Dr = A_shape[2]
+
+    ctx.synchronize()
+    var t0 = perf_counter_ns()
+    var L_trans = L_prev.transpose(List[Int](1, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
+    var A_flat = A.reshape(List[Int](Dl_prev, s * Dr))
+
+    t0 = perf_counter_ns()
+    var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_prime, s * Dr))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(temp1_contract, L_flat^, A_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    var temp1_full = temp1_contract^.reshape(List[Int](wL, Dl_prime, s, Dr))
+
+    var W_shape = W.shape.copy()
+    var s_out = W_shape[2]
+    var wR = W_shape[3]
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    var temp1_perm = temp1_full^.transpose(List[Int](1, 3, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    var temp1_mat = temp1_perm^.reshape(List[Int](Dl_prime * Dr, wL * s))
+    var W_mat = W.reshape(List[Int](wL * s, s_out * wR))
+
+    t0 = perf_counter_ns()
+    var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    var temp2_perm = temp2^.transpose(List[Int](1, 3, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    var temp2_mat2 = temp2_perm^.reshape(List[Int](Dr * wR, Dl_prime * s_out))
+    var A_flat2 = A.reshape(List[Int](Dl_prime * s_out, Dr))
+
+    t0 = perf_counter_ns()
+    var L_next_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr * wR, Dr))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(L_next_mat, temp2_mat2^, A_flat2^, ctx)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    var L_next = L_next_temp^.transpose(List[Int](1, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    profile.total_ns += Int(perf_counter_ns() - fn_t0)
     return L_next^
 
 
@@ -174,7 +334,7 @@ fn update_right_environment[dtype: DType](
     var A_trans = A.transpose(List[Int](2, 0, 1), ctx)
     var A_flat = A_trans^.reshape(List[Int](Dr, Dl * s))
     
-    var temp1_mat = create_dense_tensor[dtype](ctx, List[Int](wR * Dr_prime, Dl * s), init_value=Scalar[dtype](0.0))
+    var temp1_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wR * Dr_prime, Dl * s))
     # Contract leading axis of R_flat (Dr) with leading axis of A_flat (Dr).
     dense_tensor_dot(temp1_mat, R_flat^, A_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     
@@ -199,7 +359,7 @@ fn update_right_environment[dtype: DType](
     # Transpose W_mat for dot
     var W_mat_T = W_mat^.transpose(List[Int](1, 0), ctx) # [wR*s, wL*s']
     
-    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dr_prime * Dl, wL * s_out), init_value=Scalar[dtype](0.0))
+    var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr_prime * Dl, wL * s_out))
     dense_tensor_dot(temp2_mat, temp1_mat2^, W_mat_T^, ctx)
     
     var temp2 = temp2_mat^.reshape(List[Int](Dr_prime, Dl, wL, s_out))
@@ -215,7 +375,7 @@ fn update_right_environment[dtype: DType](
     var A_trans2 = A.transpose(List[Int](2, 1, 0), ctx)
     var A_mat2 = A_trans2^.reshape(List[Int](Dr_prime * s_out, Dl))
     
-    var R_prev_mat = create_dense_tensor[dtype](ctx, List[Int](Dl * wL, Dl), init_value=Scalar[dtype](0.0))
+    var R_prev_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl * wL, Dl))
     dense_tensor_dot(R_prev_mat, temp2_mat3^, A_mat2^, ctx)
     
     var R_prev_temp = R_prev_mat^.reshape(List[Int](Dl, wL, Dl))
@@ -252,7 +412,7 @@ fn build_right_environments[dtype: DType](
     var Dr_boundary = mps.bond_dimension(N)
     
     var R_boundary_shape = List[Int](wR_boundary, Dr_boundary, Dr_boundary)
-    var R_boundary = create_dense_tensor[dtype](ctx, R_boundary_shape^, init_value=Scalar[dtype](0.0))
+    var R_boundary = create_dense_tensor_uninitialized[dtype](ctx, R_boundary_shape^)
     
     # Set to identity in the (Dr, Dr) subspace
     var host_R = ctx.enqueue_create_host_buffer[dtype](wR_boundary * Dr_boundary * Dr_boundary)
@@ -301,10 +461,9 @@ fn expectation_value[dtype: DType](
     # Left boundary environment: shape [wL0, Dl0, Dl0] with identity in the bond space.
     var wL0 = mpo.bond_dimension(0)
     var Dl0 = mps.bond_dimension(0)
-    var L = create_dense_tensor[dtype](
+    var L = create_dense_tensor_uninitialized[dtype](
         ctx,
-        List[Int](wL0, Dl0, Dl0)^,
-        init_value=Scalar[dtype](0.0),
+        List[Int](wL0, Dl0, Dl0)^
     )
     var host_L = ctx.enqueue_create_host_buffer[dtype](wL0 * Dl0 * Dl0)
     for w in range(wL0):
@@ -369,7 +528,7 @@ fn update_left_environment_two_mps[dtype: DType](
     var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
     var A_ket_flat = A_ket_t.reshape(List[Int](Dl_prev, s * Dr))
 
-    var temp1_contract = create_dense_tensor[dtype](ctx, List[Int](wL * Dl_prime, s * Dr), init_value=Scalar[dtype](0.0))
+    var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_prime, s * Dr))
     dense_tensor_dot(temp1_contract, L_flat^, A_ket_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
 
     var temp1_full = temp1_contract^.reshape(List[Int](wL, Dl_prime, s, Dr))
@@ -382,7 +541,7 @@ fn update_left_environment_two_mps[dtype: DType](
     var temp1_mat = temp1_perm^.reshape(List[Int](Dl_prime * Dr, wL * s))
     var W_mat = W.reshape(List[Int](wL * s, s_out * wR))
 
-    var temp2_mat = create_dense_tensor[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR), init_value=Scalar[dtype](0.0))
+    var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR))
     dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
 
     var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
@@ -391,11 +550,117 @@ fn update_left_environment_two_mps[dtype: DType](
 
     var A_bra_flat = A_bra_t.reshape(List[Int](Dl_prime * s_out, Dr))
 
-    var L_next_mat = create_dense_tensor[dtype](ctx, List[Int](Dr * wR, Dr), init_value=Scalar[dtype](0.0))
+    var L_next_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr * wR, Dr))
     dense_tensor_dot(L_next_mat, temp2_mat2^, A_bra_flat^, ctx)
 
     var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
     var L_next = L_next_temp^.transpose(List[Int](1, 0, 2), ctx)
+    return L_next^
+
+
+fn update_left_environment_two_mps[dtype: DType](
+    L_prev: DenseTensor[dtype],
+    A_bra: MPSSite[dtype],
+    A_ket: MPSSite[dtype],
+    W_site: MPOSite[dtype],
+    ctx: DeviceContext,
+    mut profile: ProfileStats,
+) raises -> DenseTensor[dtype]:
+    """Profiled overload — same logic with per-op wall-clock timing."""
+    var fn_t0 = perf_counter_ns()
+
+    var A_ket_t = A_ket.tensor
+    var A_bra_t = A_bra.tensor
+    var W = W_site.tensor
+
+    var L_shape = L_prev.shape.copy()
+    var wL = L_shape[0]
+    var Dl_prev = L_shape[1]
+    var Dl_prime = L_shape[2]
+    var s = A_ket_t.shape[1]
+    var Dr = A_ket_t.shape[2]
+
+    ctx.synchronize()
+    var t0 = perf_counter_ns()
+    var L_trans = L_prev.transpose(List[Int](1, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
+    var A_ket_flat = A_ket_t.reshape(List[Int](Dl_prev, s * Dr))
+
+    t0 = perf_counter_ns()
+    var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_prime, s * Dr))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(temp1_contract, L_flat^, A_ket_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    var temp1_full = temp1_contract^.reshape(List[Int](wL, Dl_prime, s, Dr))
+
+    var W_shape = W.shape.copy()
+    var s_out = W_shape[2]
+    var wR = W_shape[3]
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    var temp1_perm = temp1_full^.transpose(List[Int](1, 3, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    var temp1_mat = temp1_perm^.reshape(List[Int](Dl_prime * Dr, wL * s))
+    var W_mat = W.reshape(List[Int](wL * s, s_out * wR))
+
+    t0 = perf_counter_ns()
+    var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    var temp2_perm = temp2^.transpose(List[Int](1, 3, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    var temp2_mat2 = temp2_perm^.reshape(List[Int](Dr * wR, Dl_prime * s_out))
+    var A_bra_flat = A_bra_t.reshape(List[Int](Dl_prime * s_out, Dr))
+
+    t0 = perf_counter_ns()
+    var L_next_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr * wR, Dr))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(L_next_mat, temp2_mat2^, A_bra_flat^, ctx)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
+
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    var L_next = L_next_temp^.transpose(List[Int](1, 0, 2), ctx)
+    ctx.synchronize()
+    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_calls += 1
+
+    profile.total_ns += Int(perf_counter_ns() - fn_t0)
     return L_next^
 
 
@@ -412,7 +677,7 @@ fn expectation_value_two_mps[dtype: DType](
 
     var wL0 = mpo.bond_dimension(0)
     var Dl0 = mps_bra.bond_dimension(0)
-    var L = create_dense_tensor[dtype](ctx, List[Int](wL0, Dl0, Dl0)^, init_value=Scalar[dtype](0.0))
+    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL0, Dl0, Dl0)^)
     var host_L = ctx.enqueue_create_host_buffer[dtype](wL0 * Dl0 * Dl0)
     for w in range(wL0):
         for d in range(Dl0):
@@ -433,14 +698,221 @@ fn expectation_value_two_mps[dtype: DType](
     return Float64(host_out[0])
 
 
+fn expectation_value_two_mps[dtype: DType](
+    mps_bra: MatrixProductState[dtype],
+    mpo: MatrixProductOperator[dtype],
+    mps_ket: MatrixProductState[dtype],
+    ctx: DeviceContext,
+    mut profile: ProfileStats,
+) raises -> Float64:
+    """Profiled overload of expectation_value_two_mps."""
+    var N = mps_bra.num_sites()
+    if mpo.num_sites() != N or mps_ket.num_sites() != N:
+        raise Error("expectation_value_two_mps: length mismatch")
+
+    var wL0 = mpo.bond_dimension(0)
+    var Dl0 = mps_bra.bond_dimension(0)
+    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL0, Dl0, Dl0)^)
+    var host_L = ctx.enqueue_create_host_buffer[dtype](wL0 * Dl0 * Dl0)
+    for w in range(wL0):
+        for d in range(Dl0):
+            host_L[w * (Dl0 * Dl0) + d * Dl0 + d] = Scalar[dtype](1.0)
+    ctx.enqueue_copy(L.storage, host_L)
+    ctx.synchronize()
+
+    for i in range(N):
+        L = update_left_environment_two_mps[dtype](L^, mps_bra.sites[i], mps_ket.sites[i], mpo.sites[i], ctx, profile)
+
+    ctx.synchronize()
+    if L.size != 1:
+        raise Error("Unexpected final environment size in expectation_value_two_mps: " + String(L.size))
+
+    var host_out = ctx.enqueue_create_host_buffer[dtype](1)
+    ctx.enqueue_copy(host_out, L.storage)
+    ctx.synchronize()
+    return Float64(host_out[0])
+
+
+fn _mps_contraction_step_left[dtype: DType](
+    A_bra: DenseTensor[dtype],
+    A_ket: DenseTensor[dtype],
+    L_prev: DenseTensor[dtype],
+    ctx: DeviceContext,
+) raises -> DenseTensor[dtype]:
+    """Single left-to-right contraction step for MPS-MPS overlap (no MPO).
+    
+    Convention matches existing code: L[Dl_ket, Dl_bra] (ket index first, bra second).
+    
+    Contracts:
+        L_prev[Dl_ket, Dl_bra] × A_ket[Dl_ket, d, Dr_ket] × A_bra*[Dl_bra, d, Dr_bra]
+        → L_next[Dr_ket, Dr_bra]
+    
+    For real tensors, conjugation is identity.
+    
+    Algorithm (2 tensor-dot contractions, no explicit transpose):
+        1. temp[Dl_bra, d, Dr_ket] = contract L_prev and A_ket on Dl_ket
+        2. L_next[Dr_ket, Dr_bra] = contract temp and A_bra on (Dl_bra, d)
+    """
+    var Dl_bra = A_bra.shape[0]
+    var d = A_bra.shape[1]
+    var Dr_bra = A_bra.shape[2]
+    var Dl_ket = A_ket.shape[0]
+    var Dr_ket = A_ket.shape[2]
+
+    # Step 1: Contract leading Dl_ket in both tensors.
+    var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
+    var L_view = L_prev.reshape(List[Int](Dl_ket, Dl_bra))
+    var A_ket_view = A_ket.reshape(List[Int](Dl_ket, d, Dr_ket))
+    dense_tensor_dot(temp, L_view^, A_ket_view^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
+
+    # Step 2: Contract leading (Dl_bra, d) blocks in temp and A_bra.
+    var L_next = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr_ket, Dr_bra))
+    var A_bra_view = A_bra.reshape(List[Int](Dl_bra, d, Dr_bra))
+    dense_tensor_dot(L_next, temp^, A_bra_view^, ctx, ndim_mult=2, axrange_A=True, axrange_B=True)
+
+    return L_next^
+
+
+fn _mps_contraction_step_left[dtype: DType](
+    A_bra: DenseTensor[dtype],
+    A_ket: DenseTensor[dtype],
+    L_prev: DenseTensor[dtype],
+    ctx: DeviceContext,
+    mut profile: ProfileStats,
+) raises -> DenseTensor[dtype]:
+    """Profiled single left-to-right contraction step for MPS-MPS overlap."""
+    var Dl_bra = A_bra.shape[0]
+    var d = A_bra.shape[1]
+    var Dr_bra = A_bra.shape[2]
+    var Dl_ket = A_ket.shape[0]
+    var Dr_ket = A_ket.shape[2]
+
+    var t0 = perf_counter_ns()
+    var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    var L_view = L_prev.reshape(List[Int](Dl_ket, Dl_bra))
+    var A_ket_view = A_ket.reshape(List[Int](Dl_ket, d, Dr_ket))
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(temp, L_view^, A_ket_view^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    t0 = perf_counter_ns()
+    var L_next = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr_ket, Dr_bra))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    var A_bra_view = A_bra.reshape(List[Int](Dl_bra, d, Dr_bra))
+    ctx.synchronize()
+    t0 = perf_counter_ns()
+    dense_tensor_dot(L_next, temp^, A_bra_view^, ctx, ndim_mult=2, axrange_A=True, axrange_B=True)
+    ctx.synchronize()
+    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_calls += 1
+
+    return L_next^
+
+
+fn mps_vdot_direct[dtype: DType](
+    bra: MatrixProductState[dtype],
+    ket: MatrixProductState[dtype],
+    ctx: DeviceContext,
+) raises -> Float64:
+    """Direct MPS-MPS overlap <bra|ket> without identity MPO.
+    
+    Much faster than going through identity MPO: 2 matmuls + 1 transpose per site
+    instead of 4 transposes + 3 dots per site.
+    
+    Sweeps left-to-right with L[Dl_ket, Dl_bra] convention.
+    """
+    var N = bra.num_sites()
+    if ket.num_sites() != N:
+        raise Error("mps_vdot_direct: length mismatch")
+    if N == 0:
+        return 0.0
+    
+    # Initialize L at left boundary: [Dl_ket, Dl_bra] = [1, 1] with value 1.0
+    var Dl_ket = ket.bond_dimension(0)  # leading bond = 1
+    var Dl_bra = bra.bond_dimension(0)
+    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_ket, Dl_bra))
+    
+    # Set diagonal to 1 (identity for the 1x1 case at boundary)
+    var L_size = Dl_ket * Dl_bra
+    var host_L = ctx.enqueue_create_host_buffer[dtype](L_size)
+    for i in range(min(Dl_ket, Dl_bra)):
+        host_L[i * Dl_bra + i] = Scalar[dtype](1.0)
+    ctx.enqueue_copy(L.storage, host_L)
+    
+    # Sweep left to right
+    for i in range(N):
+        var A_bra = bra.sites[i].tensor
+        var A_ket = ket.sites[i].tensor
+        L = _mps_contraction_step_left[dtype](A_bra, A_ket, L^, ctx)
+    
+    # Final L should be [1, 1] - extract scalar
+    ctx.synchronize()
+    if L.size != 1:
+        raise Error("mps_vdot_direct: final L is not scalar, size=" + String(L.size))
+    
+    var host_out = ctx.enqueue_create_host_buffer[dtype](1)
+    ctx.enqueue_copy(host_out, L.storage)
+    ctx.synchronize()
+    return Float64(host_out[0])
+
+
 fn mps_overlap[dtype: DType](
     mps_bra: MatrixProductState[dtype],
     mps_ket: MatrixProductState[dtype],
     ctx: DeviceContext,
 ) raises -> Float64:
-    """Compute <mps_bra|mps_ket> using identity MPO (gauge-invariant for fidelity)."""
-    var id_mpo = create_identity_mpo[dtype](ctx, mps_bra.num_sites(), mps_bra.physical_dim)
-    return expectation_value_two_mps[dtype](mps_bra, id_mpo, mps_ket, ctx)
+    """Compute <mps_bra|mps_ket> using direct contraction (no identity MPO)."""
+    return mps_vdot_direct[dtype](mps_bra, mps_ket, ctx)
+
+
+fn mps_overlap[dtype: DType](
+    mps_bra: MatrixProductState[dtype],
+    mps_ket: MatrixProductState[dtype],
+    ctx: DeviceContext,
+    mut profile: ProfileStats,
+) raises -> Float64:
+    """Profiled overload of mps_overlap (uses direct contraction)."""
+    var fn_t0 = perf_counter_ns()
+    var N = mps_bra.num_sites()
+    if mps_ket.num_sites() != N:
+        raise Error("mps_vdot_direct: length mismatch")
+    if N == 0:
+        return 0.0
+
+    var Dl_ket = mps_ket.bond_dimension(0)
+    var Dl_bra = mps_bra.bond_dimension(0)
+
+    var t0 = perf_counter_ns()
+    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_ket, Dl_bra))
+    profile.alloc_ns += perf_counter_ns() - t0
+
+    var L_size = Dl_ket * Dl_bra
+    var host_L = ctx.enqueue_create_host_buffer[dtype](L_size)
+    for i in range(min(Dl_ket, Dl_bra)):
+        host_L[i * Dl_bra + i] = Scalar[dtype](1.0)
+    ctx.enqueue_copy(L.storage, host_L)
+
+    for i in range(N):
+        var A_bra = mps_bra.sites[i].tensor
+        var A_ket = mps_ket.sites[i].tensor
+        L = _mps_contraction_step_left[dtype](A_bra, A_ket, L^, ctx, profile)
+
+    ctx.synchronize()
+    if L.size != 1:
+        raise Error("mps_vdot_direct: final L is not scalar, size=" + String(L.size))
+
+    var host_out = ctx.enqueue_create_host_buffer[dtype](1)
+    ctx.enqueue_copy(host_out, L.storage)
+    ctx.synchronize()
+    var result = Float64(host_out[0])
+    profile.total_ns += Int(perf_counter_ns() - fn_t0)
+    return result
 
 
 fn variance[dtype: DType](
