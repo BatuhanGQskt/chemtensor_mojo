@@ -1,0 +1,45 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Pixi local environment (will be rebuilt in container)
+.pixi
+
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+*.egg-info
+
+# Jupyter checkpoints
+.ipynb_checkpoints
+
+# Results and data (mount these instead)
+results/
+test_data/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+
+# Documentation (optional - uncomment to include)
+# *.md

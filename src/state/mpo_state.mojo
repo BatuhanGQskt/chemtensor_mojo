@@ -18,7 +18,7 @@ struct MPOSite[dtype: DType](Writable, Movable, ImplicitlyCopyable):
     - Contract phys_in with ket physical index
     - phys_out becomes the new physical index
     """
-    var tensor: DenseTensor[dtype]
+    var tensor: DenseTensor[dtype] # BlockSparse
     
     fn rank(self) -> Int:
         return len(self.tensor.shape)
@@ -237,4 +237,72 @@ fn create_identity_mpo[dtype: DType = DType.float32](
         var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
         sites.append(MPOSite[dtype](site_tensor^))
     
+    return MatrixProductOperator[dtype](sites^)
+
+
+fn create_single_site_op_mpo[dtype: DType = DType.float32](
+    ctx: DeviceContext,
+    num_sites: Int,
+    site_idx: Int,
+    op_data: List[Scalar[dtype]],
+) raises -> MatrixProductOperator[dtype]:
+    """Create MPO for single-site operator O_i (identity elsewhere).
+    
+    op_data is 2x2 row-major: [op[0,0], op[0,1], op[1,0], op[1,1]].
+    """
+    if num_sites < 1 or site_idx < 0 or site_idx >= num_sites:
+        raise Error("create_single_site_op_mpo: invalid site_idx")
+    if len(op_data) != 4:
+        raise Error("create_single_site_op_mpo: op_data must be 4 elements (2x2)")
+
+    var d = 2
+    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    for i in range(num_sites):
+        var shape = List[Int](1, d, d, 1)
+        var data = List[Scalar[dtype]](capacity=4)
+        if i == site_idx:
+            for k in range(4):
+                data.append(op_data[k])
+        else:
+            for p_in in range(d):
+                for p_out in range(d):
+                    data.append(Scalar[dtype](1.0) if p_in == p_out else Scalar[dtype](0.0))
+        var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
+        sites.append(MPOSite[dtype](site_tensor^))
+    return MatrixProductOperator[dtype](sites^)
+
+
+fn create_two_site_op_mpo[dtype: DType = DType.float32](
+    ctx: DeviceContext,
+    num_sites: Int,
+    site_i: Int,
+    site_j: Int,
+    op_i_data: List[Scalar[dtype]],
+    op_j_data: List[Scalar[dtype]],
+) raises -> MatrixProductOperator[dtype]:
+    """Create MPO for two-site operator O_i O_j (identity elsewhere).
+    Assumes site_i < site_j.
+    """
+    if num_sites < 2 or site_i < 0 or site_j >= num_sites or site_i >= site_j:
+        raise Error("create_two_site_op_mpo: invalid sites")
+    if len(op_i_data) != 4 or len(op_j_data) != 4:
+        raise Error("create_two_site_op_mpo: op data must be 4 elements each")
+
+    var d = 2
+    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    for i in range(num_sites):
+        var shape = List[Int](1, d, d, 1)
+        var data = List[Scalar[dtype]](capacity=4)
+        if i == site_i:
+            for k in range(4):
+                data.append(op_i_data[k])
+        elif i == site_j:
+            for k in range(4):
+                data.append(op_j_data[k])
+        else:
+            for p_in in range(d):
+                for p_out in range(d):
+                    data.append(Scalar[dtype](1.0) if p_in == p_out else Scalar[dtype](0.0))
+        var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
+        sites.append(MPOSite[dtype](site_tensor^))
     return MatrixProductOperator[dtype](sites^)

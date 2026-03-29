@@ -11,7 +11,7 @@ struct ComplexDenseTensor[dtype: DType](Writable, Movable):
     imaginary components, allowing efficient GPU operations with complex numbers.
     
     Parameters:
-        dtype: The underlying real data type (e.g., DType.float32, DType.float64).
+        dtype: The underlying real data type (e.g., DType.float32, DType.float32).
                The complex values will be represented as pairs of this type.
     
     Example:mojo
