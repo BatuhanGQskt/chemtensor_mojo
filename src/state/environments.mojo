@@ -791,7 +791,7 @@ fn _mps_contraction_step_left[dtype: DType](
     var Dr_ket = A_ket.shape[2]
 
     @parameter
-    if dtype == DType.float32:
+    if False: # dtype == DType.float32:
         # Step 1: temp[Dl_bra, d, Dr_ket] from L_prev^T[Dl_bra, Dl_ket] @ A_ket[Dl_ket, d, Dr_ket]
         var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
 

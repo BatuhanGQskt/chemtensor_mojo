@@ -4,7 +4,6 @@ from collections.list import List
 from utils import IndexList
 from gpu import thread_idx, block_idx, block_dim, barrier, global_idx
 from gpu.host import DeviceContext, DeviceBuffer
-from layout.layout import DimList
 from buffer.buffer import NDBuffer
 from memory.unsafe_pointer import UnsafePointer
 import linalg
@@ -106,10 +105,10 @@ fn _gpu_norm_sq_kernel[dtype: DType](
 fn _gpu_dot_kernel[dtype: DType](
     a: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     b: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
-    out: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
+    dst: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     total_size: Int,
 ):
-    """GPU kernel: element-wise multiply a[i]*b[i] and store in out[i].
+    """GPU kernel: element-wise multiply a[i]*b[i] and store in dst[i].
     
     Host sums out[] afterwards to get the inner product.
     This keeps the bulk data on GPU and only transfers the (small) product array.
@@ -117,7 +116,7 @@ fn _gpu_dot_kernel[dtype: DType](
     var tid = Int(block_dim.x * block_idx.x + thread_idx.x)
     if tid >= total_size:
         return
-    out[tid] = a[tid] * b[tid]
+    dst[tid] = a[tid] * b[tid]
 
 
 fn _gpu_axpy_kernel[dtype: DType](
@@ -1108,10 +1107,10 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
             dense_tensor_dot(C3, A3^, B3^, ctx, ndim_mult=2)  # Infers B leading
     
     Performance Notes:
-        - Uses GPU-accelerated matrix multiplication (linalg.matmul)
-        - Automatically copies non-contiguous tensors to contiguous layout
-        - Employs tiled shared memory kernels for efficiency
-        - Best performance with tile sizes 16-32 (Due to Warps) for float32 on modern GPUs
+        - float32: Uses `linalg.matmul` exclusively. When a logical transpose is required
+          (leading axes of A or trailing axes of B), physically transposes first via
+          `DenseTensor.transpose`, then calls `linalg.matmul`.
+        - Other dtypes: not supported on GPU in this build (raises after shape checks).
     
     Implementation Details:
         The function internally:
@@ -1119,9 +1118,8 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
         2. Saves shape information before transferring ownership
         3. Ensures tensors are contiguous (copies if needed) (TODO: NOT SURE ABOUT THIS COPYING MIGHT BE COSTLY)
         4. Flattens tensors to 2D matrices (non-contracted dims × contracted dims)
-        5. Transposes if necessary to align contraction axes
-        6. Calls GPU matrix multiplication kernel
-        7. Result is written directly to output tensor C
+        5. Physically transposes A/B when needed for row-major GEMM layout
+        6. Calls `linalg.matmul` and writes result directly to output tensor C
     """
     var rank_A = len(A.shape)
     var rank_B = len(B.shape)
@@ -1248,9 +1246,9 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
         var A_flat_2d = A_flat^.reshape(List[Int](1, A_flat.shape[0]))
         A_flat = A_flat_2d^
 
-    # Transpose if leading (to make row-major inner contract)
+    # Align to row-major GEMM layout (m×k) @ (k×n) for `linalg.matmul`.
     var trans_A = axrange_A
-    var trans_B = not effective_axrange_B  # Flip for B if trailing ( shouldn't be the case for matrix matrix multiplication )
+    var trans_B = not effective_axrange_B  # Flip for B if trailing
     if trans_A:
         var perm_A = List[Int](1, 0)  # Swap for 2D
         A_flat = A_flat^.transpose(perm_A, ctx)
@@ -1300,15 +1298,9 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
             if C_shape_actual[i] != C_shape_expected[i]:
                 raise Error("Output tensor C has wrong shape: expected " + format_shape(C_shape_expected) + " got " + format_shape(C_shape_actual))
 
-    # Calculate the 2D shape for matrix multiplication
-    # m = product of A's non-contracted dimensions
-    # n = product of B's non-contracted dimensions
-    var m = A_flat.shape[0]  # Already flattened
-    var n = B_flat.shape[1]  # Already flattened
-    
-    # Flatten C to 2D shape (m, n) for matrix multiplication
-    # This creates a 2D "view" of C's storage without copying
-    # For contiguous row-major 2D tensor (m, n), strides are [n, 1]
+    # 2D output view of C: row-major (m, n)
+    var m = A_flat.shape[0]
+    var n = B_flat.shape[1]
     var C_flat_shape = List[Int](m, n)
     var C_flat_stride = List[Int](n, 1)
     var C_flat = DenseTensor[dtype](
@@ -1317,23 +1309,14 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
         stride=C_flat_stride^
     )
 
-    # Create NDBuffers (now 2D contiguous)
+    # Create NDBuffers (2D contiguous row-major)
     var shape_Af = IndexList[2](A_flat.shape[0], A_flat.shape[1])
     var shape_Bf = IndexList[2](B_flat.shape[0], B_flat.shape[1])
     var shape_Cf = IndexList[2](C_flat.shape[0], C_flat.shape[1])
-
     var ndbuf_A = NDBuffer[dtype, 2, MutAnyOrigin](A_flat.storage.unsafe_ptr(), shape_Af)
     var ndbuf_B = NDBuffer[dtype, 2, MutAnyOrigin](B_flat.storage.unsafe_ptr(), shape_Bf)
     var ndbuf_C = NDBuffer[mut=True, dtype, 2, MutAnyOrigin](C_flat.storage.unsafe_ptr(), shape_Cf)
 
-    # Call matmul (tiled shared mem kernel)
-    # Result is written to C_flat, which shares storage with C
-    # So C automatically gets the result in the correct ND shape
-    #
-    # IMPORTANT:
-    # In some MAX nightlies/environments, Float64 GPU matmul/GEMV offload can fail
-    # with a compiler error ("unhandled shuffle dtype"). To keep GPU execution
-    # reliable, we currently restrict this path to float32.
     @parameter
     if dtype == DType.float32:
         linalg.matmul.matmul[target="gpu"](ndbuf_C, ndbuf_A, ndbuf_B, Optional(ctx))

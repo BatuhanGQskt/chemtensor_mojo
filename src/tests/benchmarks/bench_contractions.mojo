@@ -1,14 +1,19 @@
 """
-Timed benchmarks for MPO-MPO, MPS-MPO inner product, MPS-MPO apply, and MPS-MPS.
+Timed benchmarks for MPO-MPO, MPS-MPO inner product, MPS-MPO apply, MPS-MPS, and DMRG.
 Writes one JSONL record per operation to results/perf/contraction_timings_{nsites}_{d}_{chi_max}.jsonl
 for comparison with C perf_contractions.
 
 Reads shared config from ../../bench_config.json (relative to project root).
-CLI override not yet implemented; edit bench_config.json to change parameters.
+CLI: pass `--mpo-mpo` to include the full MPO→dense matrix benchmark (very memory-heavy);
+by default that step is skipped so large (nsites, d) runs stay tractable.
+Pass `--dmrg-only` to run only DMRG benchmarks (reads dmrg_* keys from bench_config.json).
+
+Optional: `mojo run -I . src/tests/benchmarks/bench_contractions.mojo --mpo-mpo`
 """
 
 from collections.list import List
 from math import sqrt
+from sys import argv
 from time import perf_counter_ns
 from gpu.host import DeviceContext
 from src.state.mps_state import (
@@ -20,7 +25,7 @@ from src.state.mps_state import (
 )
 from src.tests.benchmarks.rng_c_compat import create_random_mps_c_compatible
 from src.state.mpo_state import MatrixProductOperator, MPOSite
-from src.state.hamiltonians import create_ising_1d_mpo
+from src.state.hamiltonians import create_ising_1d_mpo, create_heisenberg_xxz_mpo
 from src.m_tensor.dense_tensor import create_dense_tensor
 from src.state.environments import (
     expectation_value_two_mps,
@@ -30,6 +35,7 @@ from src.state.environments import (
     ProfileStats,
 )
 from src.tests.state.mpo.mpo_test_helpers import mpo_to_full_matrix
+from src.algorithms.dmrg import dmrg_two_site, DMRGParams
 
 # Fallback defaults (used if config file is not found)
 alias DEFAULT_NSITES = 6
@@ -92,6 +98,49 @@ fn _parse_int_field(content: String, key: String, default: Int) -> Int:
         return Int(num_str)
     except:
         return default
+
+
+fn _cli_run_mpo_mpo() -> Bool:
+    """True if argv contains --mpo-mpo (opt-in full MPO matrix contraction)."""
+    var args = argv()
+    var n = len(args)
+    var i = 1
+    while i < n:
+        if args[i] == "--mpo-mpo":
+            return True
+        i += 1
+    return False
+
+
+fn _cli_dmrg_only() -> Bool:
+    """True if argv contains --dmrg-only (skip MPO/MPS contraction timings)."""
+    var args = argv()
+    var n = len(args)
+    var i = 1
+    while i < n:
+        if args[i] == "--dmrg-only":
+            return True
+        i += 1
+    return False
+
+
+fn _cli_wants_help() -> Bool:
+    var args = argv()
+    var n = len(args)
+    var i = 1
+    while i < n:
+        if args[i] == "-h" or args[i] == "--help":
+            return True
+        i += 1
+    return False
+
+
+fn _print_bench_usage() raises -> None:
+    print(
+        "bench_contractions: --mpo-mpo enables full MPO→dense contraction"
+        " (exact Hilbert space; huge memory). --dmrg-only runs only DMRG (bench_config dmrg_*)."
+        " Default runs contractions then DMRG. Flags: -h, --help."
+    )
 
 
 fn load_bench_config(config_path: String = DEFAULT_CONFIG_PATH) -> BenchConfig:
@@ -252,10 +301,59 @@ fn _write_profile_record(
     _append_jsonl(path, line)
 
 
+fn _parse_float_field(content: String, key: String, default: Float64) -> Float64:
+    """Extract a float value for a JSON key from a flat JSON string."""
+    var pattern = '"' + key + '"'
+    var idx = content.find(pattern)
+    if idx == -1:
+        return default
+    var after_key = idx + len(pattern)
+    var i = after_key
+    while i < len(content):
+        var c = content[i]
+        if c == ":" or c == " " or c == "\t" or c == "\n":
+            i += 1
+            continue
+        break
+    var num_str = String("")
+    var dot_seen = False
+    var exp_seen = False
+    while i < len(content):
+        var c = content[i]
+        if c == "+" or c == "-":
+            if len(num_str) == 0 or (len(num_str) > 0 and (num_str[len(num_str) - 1] == "e" or num_str[len(num_str) - 1] == "E")):
+                num_str += c
+                i += 1
+                continue
+            break
+        if c >= "0" and c <= "9":
+            num_str += c
+            i += 1
+            continue
+        if c == "." and not dot_seen:
+            dot_seen = True
+            num_str += c
+            i += 1
+            continue
+        if (c == "e" or c == "E") and not exp_seen:
+            exp_seen = True
+            num_str += c
+            i += 1
+            continue
+        break
+    if len(num_str) == 0:
+        return default
+    try:
+        return Float64(num_str)
+    except:
+        return default
+
+
 fn run_bench_contractions(
     config_path: String = DEFAULT_CONFIG_PATH,
+    run_mpo_mpo: Bool = False,
 ) raises -> None:
-    """Run all four contraction benchmarks and append JSONL to parameterized output file."""
+    """Run contraction benchmarks; MPO→full matrix is optional (see --mpo-mpo)."""
     var cfg = load_bench_config(config_path)
     var nsites = cfg.nsites
     var d = cfg.d
@@ -273,22 +371,30 @@ fn run_bench_contractions(
     var psi = create_random_mps_c_compatible[DType.float32](ctx, nsites, d, chi_max, 42)
     var chi = create_random_mps_c_compatible[DType.float32](ctx, nsites, d, chi_max, 43)
 
-    # 1) MPO-MPO: full contraction via mpo_to_full_matrix
-    var t0 = perf_counter_ns()
-    for _ in range(num_runs):
-        var mat = mpo_to_full_matrix(mpo, ctx)
-    var t1 = perf_counter_ns()
-    var sec_mpo_mpo = Float64(t1 - t0) / 1e9 / num_runs
-    var mat_once = mpo_to_full_matrix(mpo, ctx)
-    var nrm_sq = mat_once.norm_sq(ctx)
-    var result_mpo_mpo = Float64(0.0)
-    if nrm_sq > 0.0:
-        result_mpo_mpo = sqrt(nrm_sq)
-    print("mpo_mpo: " + String(sec_mpo_mpo) + " s (result=" + String(result_mpo_mpo) + ")")
-    _write_record(out_path, "mpo_mpo", nsites, d, chi_max, sec_mpo_mpo, result_mpo_mpo, num_runs)
+    var n_contraction_jsonl = 0
+
+    # 1) MPO-MPO: full contraction via mpo_to_full_matrix (optional)
+    if run_mpo_mpo:
+        var t0 = perf_counter_ns()
+        for _ in range(num_runs):
+            var mat = mpo_to_full_matrix(mpo, ctx)
+        var t1 = perf_counter_ns()
+        var sec_mpo_mpo = Float64(t1 - t0) / 1e9 / num_runs
+        var mat_once = mpo_to_full_matrix(mpo, ctx)
+        var nrm_sq = mat_once.norm_sq(ctx)
+        var result_mpo_mpo = Float64(0.0)
+        if nrm_sq > 0.0:
+            result_mpo_mpo = sqrt(nrm_sq)
+        print("mpo_mpo: " + String(sec_mpo_mpo) + " s (result=" + String(result_mpo_mpo) + ")")
+        _write_record(out_path, "mpo_mpo", nsites, d, chi_max, sec_mpo_mpo, result_mpo_mpo, num_runs)
+        n_contraction_jsonl += 1
+    else:
+        print(
+            "mpo_mpo: skipped (pass --mpo-mpo to benchmark full MPO→dense matrix; memory ~ d^(2·nsites))"
+        )
 
     # 2) MPS-MPO inner product <chi|op|psi>
-    t0 = perf_counter_ns()
+    var t0 = perf_counter_ns()
     for _ in range(num_runs):
         var inner = expectation_value_two_mps[DType.float32](chi, mpo, psi, ctx)
     t1 = perf_counter_ns()
@@ -297,6 +403,7 @@ fn run_bench_contractions(
     var result_inner = -expectation_value_two_mps[DType.float32](chi, mpo, psi, ctx)
     print("mps_mpo_inner: " + String(sec_inner) + " s (result=" + String(result_inner) + ")")
     _write_record(out_path, "mps_mpo_inner", nsites, d, chi_max, sec_inner, result_inner, num_runs)
+    n_contraction_jsonl += 1
 
     # 3) MPS-MPO apply
     t0 = perf_counter_ns()
@@ -309,6 +416,7 @@ fn run_bench_contractions(
     var result_apply = sqrt(mps_overlap[DType.float32](op_psi, op_psi, ctx))
     print("mps_mpo_apply: " + String(sec_apply) + " s (result=" + String(result_apply) + ")")
     _write_record(out_path, "mps_mpo_apply", nsites, d, chi_max, sec_apply, result_apply, num_runs)
+    n_contraction_jsonl += 1
 
     # 4) MPS-MPS overlap <chi|psi>
     t0 = perf_counter_ns()
@@ -319,6 +427,7 @@ fn run_bench_contractions(
     var result_mps = mps_overlap[DType.float32](chi, psi, ctx)
     print("mps_mps: " + String(sec_mps) + " s (result=" + String(result_mps) + ")")
     _write_record(out_path, "mps_mps", nsites, d, chi_max, sec_mps, result_mps, num_runs)
+    n_contraction_jsonl += 1
 
     # 4b) Profiled mps_overlap — calls the real function with a ProfileStats
     var profile = ProfileStats.create()
@@ -363,6 +472,7 @@ fn run_bench_contractions(
     var sec_left_env = Float64(t1 - t0) / 1e9 / num_runs
     print("left_env_sweep: " + String(sec_left_env) + " s (GPU timed, " + String(num_runs) + " runs)")
     _write_record(out_path, "left_env_sweep", nsites, d, chi_max, sec_left_env, Float64(0.0), num_runs)
+    n_contraction_jsonl += 1
 
     # 5b) Profiled left-env sweep
     var profile_lenv = ProfileStats.create()
@@ -375,9 +485,207 @@ fn run_bench_contractions(
     print("left_env_profile: " + String(profile_lenv))
     _write_profile_record(profile_out_path, "left_env_profile", nsites, d, chi_max, profile_lenv, Float64(0.0))
 
-    print("Appended 5 records to " + out_path)
+    print("Appended " + String(n_contraction_jsonl) + " records to " + out_path)
     print("Appended 2 profiling records to " + profile_out_path)
 
 
+fn _dmrg_results_path(operation: String, nsites: Int, d: Int, chi_max: Int) -> String:
+    """Build parameterized DMRG JSONL output path."""
+    return (
+        RESULTS_DIR
+        + "/"
+        + operation
+        + "_timings_"
+        + String(nsites)
+        + "_"
+        + String(d)
+        + "_"
+        + String(chi_max)
+        + ".jsonl"
+    )
+
+
+fn _write_dmrg_record(
+    path: String,
+    operation: String,
+    nsites: Int,
+    d: Int,
+    chi_max: Int,
+    num_sweeps: Int,
+    maxiter_lanczos: Int,
+    J: Float64,
+    D: Float64,
+    h: Float64,
+    tol_split: Float64,
+    time_seconds: Float64,
+    result: Float64,
+    runs: Int,
+) raises -> None:
+    var line = String("{\"backend\":\"mojo\",\"operation\":\"")
+    line += operation
+    line += "\",\"params\":{\"nsites\":"
+    line += String(nsites)
+    line += ",\"d\":"
+    line += String(d)
+    line += ",\"chi_max\":"
+    line += String(chi_max)
+    line += ",\"num_sweeps\":"
+    line += String(num_sweeps)
+    line += ",\"maxiter_lanczos\":"
+    line += String(maxiter_lanczos)
+    line += ",\"J\":"
+    line += String(J)
+    line += ",\"D\":"
+    line += String(D)
+    line += ",\"h\":"
+    line += String(h)
+    if tol_split >= 0.0:
+        line += ",\"tol_split\":"
+        line += String(tol_split)
+    line += "},\"time_seconds\":"
+    line += String(time_seconds)
+    line += ",\"result\":"
+    line += String(result)
+    line += ",\"runs\":"
+    line += String(runs)
+    line += "}"
+    _append_jsonl(path, line)
+
+
+fn neel_basis(nsites: Int, d: Int) -> List[Int]:
+    """Néel product state basis: [0,1,0,1,...]. Has overlap with AFM ground state."""
+    var basis = List[Int](capacity=nsites)
+    for i in range(nsites):
+        basis.append(i % d)
+    return basis^
+
+
+fn run_bench_dmrg(config_path: String = DEFAULT_CONFIG_PATH) raises -> None:
+    """Run DMRG benchmarks and append JSONL to parameterized output files.
+    
+    Reads optional DMRG-specific keys from bench_config.json:
+    - dmrg_singlesite_nsites, dmrg_singlesite_d, dmrg_singlesite_chi_max
+    - dmrg_singlesite_num_sweeps, dmrg_singlesite_maxiter_lanczos
+    - dmrg_singlesite_J, dmrg_singlesite_D, dmrg_singlesite_h
+    - dmrg_twosite_nsites, dmrg_twosite_d, dmrg_twosite_chi_max
+    - dmrg_twosite_num_sweeps, dmrg_twosite_maxiter_lanczos
+    - dmrg_twosite_J, dmrg_twosite_D, dmrg_twosite_h, dmrg_twosite_tol_split
+    """
+    var cfg = load_bench_config(config_path)
+    var ctx = DeviceContext()
+    var content = String("")
+    try:
+        var f = open(config_path, "r")
+        content = f.read()
+        f.close()
+    except:
+        content = String("")
+    
+    print("\n" + "=" * 60)
+    print("DMRG Benchmarks")
+    print("=" * 60)
+    
+    # ---- Single-site DMRG proxy (two-site with small chi_max) ----
+    # Parameters matching C: nsites=7, d=2, J=1, D=1, h=0, chi_max=16, 6 sweeps
+    var nsites_ss = _parse_int_field(content, "dmrg_singlesite_nsites", 7)
+    var d_ss = _parse_int_field(content, "dmrg_singlesite_d", 2)
+    var J_ss: Float64 = _parse_float_field(content, "dmrg_singlesite_J", 1.0)
+    var D_ss: Float64 = _parse_float_field(content, "dmrg_singlesite_D", 1.0)
+    var h_ss: Float64 = _parse_float_field(content, "dmrg_singlesite_h", 0.0)
+    var chi_max_ss = _parse_int_field(content, "dmrg_singlesite_chi_max", 16)
+    var num_sweeps_ss = _parse_int_field(content, "dmrg_singlesite_num_sweeps", 6)
+    var maxiter_lanczos_ss = _parse_int_field(content, "dmrg_singlesite_maxiter_lanczos", 25)
+    
+    print("\n--- Single-site DMRG proxy (Heisenberg XXX, " + String(nsites_ss) + " sites) ---")
+    print("Parameters: J=" + String(J_ss) + ", D=" + String(D_ss) + ", h=" + String(h_ss))
+    print("chi_max=" + String(chi_max_ss) + ", num_sweeps=" + String(num_sweeps_ss))
+    
+    var H_ss = create_heisenberg_xxz_mpo[DType.float32](ctx, nsites_ss, J=J_ss, D=D_ss, h=h_ss)
+    var basis_ss = neel_basis(nsites_ss, d_ss)
+    var psi_ss = create_product_mps[DType.float32](ctx, d_ss, basis_ss^)
+    
+    var params_ss = DMRGParams(
+        num_sweeps=num_sweeps_ss,
+        chi_max=chi_max_ss,
+        eps_trunc=1e-10,
+        max_krylov_iter=maxiter_lanczos_ss,
+        krylov_tol=1e-8,
+        energy_tol=1e-8,
+        two_site=True,
+        verbose=False,
+    )
+    
+    ctx.synchronize()
+    var t0_ss = perf_counter_ns()
+    var result_ss = dmrg_two_site[DType.float32](ctx, H_ss^, psi_ss^, params_ss)
+    ctx.synchronize()
+    var t1_ss = perf_counter_ns()
+    
+    var E_ss = result_ss[0]
+    var sec_ss = Float64(t1_ss - t0_ss) / 1e9
+    
+    print("dmrg_singlesite: " + String(sec_ss) + " s (energy=" + String(E_ss) + ")")
+    var out_path_ss = _dmrg_results_path("dmrg_singlesite", nsites_ss, d_ss, chi_max_ss)
+    _write_dmrg_record(out_path_ss, "dmrg_singlesite", nsites_ss, d_ss, chi_max_ss, num_sweeps_ss,
+                       maxiter_lanczos_ss, J_ss, D_ss, h_ss, Float64(-1.0), sec_ss, E_ss, 1)
+    
+    # ---- Two-site DMRG ----
+    # Parameters matching C: nsites=11, d=2, J=1, D=0.5, h=0.2, chi_max=32, 4 sweeps
+    var nsites_ts = _parse_int_field(content, "dmrg_twosite_nsites", 11)
+    var d_ts = _parse_int_field(content, "dmrg_twosite_d", 2)
+    var J_ts: Float64 = _parse_float_field(content, "dmrg_twosite_J", 1.0)
+    var D_ts: Float64 = _parse_float_field(content, "dmrg_twosite_D", 0.5)
+    var h_ts: Float64 = _parse_float_field(content, "dmrg_twosite_h", 0.2)
+    var chi_max_ts = _parse_int_field(content, "dmrg_twosite_chi_max", 32)
+    var num_sweeps_ts = _parse_int_field(content, "dmrg_twosite_num_sweeps", 4)
+    var maxiter_lanczos_ts = _parse_int_field(content, "dmrg_twosite_maxiter_lanczos", 25)
+    var tol_split_ts: Float64 = _parse_float_field(content, "dmrg_twosite_tol_split", 1e-10)
+    
+    print("\n--- Two-site DMRG (Heisenberg XXZ, " + String(nsites_ts) + " sites) ---")
+    print("Parameters: J=" + String(J_ts) + ", D=" + String(D_ts) + ", h=" + String(h_ts))
+    print("chi_max=" + String(chi_max_ts) + ", num_sweeps=" + String(num_sweeps_ts))
+    
+    var H_ts = create_heisenberg_xxz_mpo[DType.float32](ctx, nsites_ts, J=J_ts, D=D_ts, h=h_ts)
+    var basis_ts = neel_basis(nsites_ts, d_ts)
+    var psi_ts = create_product_mps[DType.float32](ctx, d_ts, basis_ts^)
+    
+    var params_ts = DMRGParams(
+        num_sweeps=num_sweeps_ts,
+        chi_max=chi_max_ts,
+        eps_trunc=1e-10,
+        max_krylov_iter=maxiter_lanczos_ts,
+        krylov_tol=1e-8,
+        energy_tol=1e-8,
+        two_site=True,
+        verbose=False,
+    )
+    
+    ctx.synchronize()
+    var t0_ts = perf_counter_ns()
+    var result_ts = dmrg_two_site[DType.float32](ctx, H_ts^, psi_ts^, params_ts)
+    ctx.synchronize()
+    var t1_ts = perf_counter_ns()
+    
+    var E_ts = result_ts[0]
+    var sec_ts = Float64(t1_ts - t0_ts) / 1e9
+    
+    print("dmrg_twosite: " + String(sec_ts) + " s (energy=" + String(E_ts) + ")")
+    var out_path_ts = _dmrg_results_path("dmrg_twosite", nsites_ts, d_ts, chi_max_ts)
+    _write_dmrg_record(out_path_ts, "dmrg_twosite", nsites_ts, d_ts, chi_max_ts, num_sweeps_ts,
+                       maxiter_lanczos_ts, J_ts, D_ts, h_ts, tol_split_ts, sec_ts, E_ts, 1)
+    
+    print("\nAppended DMRG records to:")
+    print("  " + out_path_ss)
+    print("  " + out_path_ts)
+
+
 fn main() raises:
-    run_bench_contractions()
+    if _cli_wants_help():
+        _print_bench_usage()
+        return
+    if _cli_dmrg_only():
+        run_bench_dmrg()
+        return
+    var run_mpo = _cli_run_mpo_mpo()
+    run_bench_contractions(run_mpo_mpo=run_mpo)
+    run_bench_dmrg()
