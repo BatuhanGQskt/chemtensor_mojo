@@ -14,6 +14,7 @@ from src.mylinalg.backend import SVDBackend
 from src.mylinalg.matrix import MatrixF64
 from src.mylinalg.svd import svd_f64
 from src.mylinalg.types import Layout as LapackLayout
+from src.m_tensor.tensor_traits import TensorOps, TensorBackend
 
 
 # ---------------------------------------------------------------------------
@@ -262,14 +263,32 @@ fn _gpu_transpose_kernel[dtype: DType](
 
 ## Fully dense tensor with runtime-determined rank, shape, and stride
 @fieldwise_init
-struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
+struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOps):
     """A tensor where rank, shape, and stride are all determined at runtime.
     
-    Unlike DenseTensor which requires compile-time Layout parameter, this tensor
+    This tensor implements the TensorOps trait, allowing it to be used
+    interchangeably with other tensor implementations (like BlockSparseTensor)
+    in generic algorithms.
+    
+    Unlike StaticTensor which requires compile-time Layout parameter, this tensor
     allows complete flexibility at runtime.
     
     Parameters:
-        dtype: The data type of the tensor elements (e.g., DType.float32, DType.float32).
+        dtype: The data type of the tensor elements (e.g., DType.float32).
+    
+    Example:
+        ```mojo
+        with DeviceContext() as ctx:
+            # Create a 3x4 tensor initialized to zeros
+            var tensor = create_dense_tensor[DType.float32](
+                ctx, List[Int](3, 4)^, init_value=Scalar[DType.float32](0.0)
+            )
+            
+            # Check properties via trait methods
+            print("Shape:", tensor.get_shape())
+            print("Is contiguous:", tensor.is_contiguous())
+            print("Norm:", tensor.compute_norm(ctx))
+        ```
     """
     var storage: DeviceBuffer[dtype]  # GPU storage for tensor data
     var shape: List[Int]  # Runtime shape
@@ -308,6 +327,116 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
         self.shape = existing.shape.copy()
         self.stride = existing.stride.copy()
         self.size = existing.size
+
+    # =========================================================================
+    # TensorOps Trait Implementation
+    # =========================================================================
+    
+    fn get_shape(self) -> List[Int]:
+        """Get the shape of the tensor (TensorOps trait).
+        
+        Returns:
+            Copy of the shape list.
+        """
+        return self.shape.copy()
+    
+    fn get_stride(self) -> List[Int]:
+        """Get the stride of the tensor (TensorOps trait).
+        
+        Returns:
+            Copy of the stride list.
+        """
+        return self.stride.copy()
+    
+    fn get_size(self) -> Int:
+        """Get the total number of elements (TensorOps trait).
+        
+        Returns:
+            Total element count.
+        """
+        return self.size
+    
+    fn get_rank(self) -> Int:
+        """Get the number of dimensions (TensorOps trait).
+        
+        Returns:
+            Tensor rank.
+        """
+        return len(self.shape)
+    
+    fn compute_norm(self, ctx: DeviceContext) raises -> Float64:
+        """Compute Frobenius norm (TensorOps trait).
+        
+        Wrapper around norm() for trait compatibility.
+        
+        Args:
+            ctx: Device context for GPU operations.
+        
+        Returns:
+            Frobenius norm.
+        """
+        return self.norm(ctx)
+    
+    fn compute_norm_sq(self, ctx: DeviceContext) raises -> Float64:
+        """Compute squared Frobenius norm (TensorOps trait).
+        
+        Wrapper around norm_sq() for trait compatibility.
+        
+        Args:
+            ctx: Device context for GPU operations.
+        
+        Returns:
+            Squared Frobenius norm.
+        """
+        return self.norm_sq(ctx)
+    
+    fn compute_dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
+        """Compute inner product <self, other> (TensorOps trait).
+        
+        Wrapper around dot_product() for trait compatibility.
+        
+        Args:
+            other: Another tensor of the same size.
+            ctx: Device context for GPU operations.
+        
+        Returns:
+            Inner product.
+        """
+        return self.dot_product(other, ctx)
+    
+    fn get_flat_index(self, indices: List[Int]) -> Int:
+        """Compute flat index from multi-dimensional indices (TensorOps trait).
+        
+        Args:
+            indices: Multi-dimensional indices (length must equal rank).
+        
+        Returns:
+            Flat index into the storage buffer.
+        """
+        var flat_idx = 0
+        for i in range(len(self.shape)):
+            flat_idx += indices[i] * self.stride[i]
+        return flat_idx
+    
+    fn print_contents(self, ctx: DeviceContext) raises -> None:
+        """Print the tensor contents for debugging (TensorOps trait).
+        
+        Wrapper around print_tensor() for trait compatibility.
+        """
+        self.print_tensor(ctx)
+    
+    # =========================================================================
+    # Backend identification
+    # =========================================================================
+    
+    @staticmethod
+    fn backend() -> TensorBackend:
+        """Get the backend type for this tensor implementation.
+        
+        Returns:
+            TensorBackend.DENSE for DenseTensor.
+        """
+        return TensorBackend(TensorBackend.DENSE)
 
     fn write_to[W: Writer](self, mut writer: W) -> None:
         """Write tensor information to a writer."""
@@ -357,21 +486,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             if self.size > 100:
                 print("... (", self.size - 100, " more elements)")
 
-    fn get_flat_index(self, indices: List[Int]) -> Int:
-        """Compute flat index from multi-dimensional indices using stride.
-        
-        Args:
-            indices: Multi-dimensional indices (length must equal rank).
-        
-        Returns:
-            Flat index into the storage buffer.
-        """
-        var flat_idx = 0
-        for i in range(len(self.shape)):
-            flat_idx += indices[i] * self.stride[i]
-        return flat_idx
-
-    fn is_contiguous(self: DenseTensor) -> Bool:
+    fn is_contiguous(self) -> Bool:
         """Check if tensor memory layout is contiguous in row-major order.
         
         A contiguous tensor means elements are stored sequentially in memory without gaps.

@@ -3,6 +3,10 @@ Timed benchmarks for MPO-MPO, MPS-MPO inner product, MPS-MPO apply, MPS-MPS, and
 Writes one JSONL record per operation to results/perf/contraction_timings_{nsites}_{d}_{chi_max}.jsonl
 for comparison with C perf_contractions.
 
+Block-sparse tensors (ChemTensor layout) use the same generic ops as dense when you import from
+``src.m_tensor.tensor_ops``: build ``C`` with ``allocate_block_sparse_for_tensor_dot``, then
+``tensor_dot[DType.float32](mut C, A^, B^, ctx)`` (see ``src/m_tensor/block_sparse_tensor.mojo``).
+
 Reads shared config from ../../bench_config.json (relative to project root).
 CLI: pass `--mpo-mpo` to include the full MPO→dense matrix benchmark (very memory-heavy);
 by default that step is skipped so large (nsites, d) runs stay tractable.
