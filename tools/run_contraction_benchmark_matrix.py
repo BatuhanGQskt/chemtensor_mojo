@@ -36,8 +36,8 @@ from pathlib import Path
 
 
 # Number of sites × bond dimension chi_max ("d" stays as in bench_config.json).
-NSITES_VALUES = (25, ) #  (2, 4, 6, 8, 10)
-CHI_VALUES = (2048, )
+NSITES_VALUES = (2, 4, 6, 8, 10, 12, 14, 16, 18, 20) #  (2, 4, 6, 8, 10)
+CHI_VALUES = (64, 128, 256, 512, 1024)
 
 
 def _paths(script: Path) -> tuple[Path, Path, Path, Path]:
