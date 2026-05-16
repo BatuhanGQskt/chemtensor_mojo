@@ -385,6 +385,162 @@ fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
     return (site, next_remainder)
 
 
+fn mps_local_orthonormalize_qr_pair[dtype: DType = DType.float32](
+    ctx: DeviceContext,
+    var A_i: DenseTensor[dtype],
+    var A_ip1: DenseTensor[dtype],
+) raises -> Tuple[MPSSite[dtype], MPSSite[dtype]]:
+    """Left-orthonormalize site i and absorb R into site i+1 (C `mps_local_orthonormalize_qr`)."""
+    var shape_i = A_i.shape.copy()
+    var Dl = shape_i[0]
+    var d = shape_i[1]
+    var Dm = shape_i[2]
+    var mat = A_i.reshape(List[Int](Dl * d, Dm))
+
+    var qr_result = dense_tensor_qr[dtype](mat^, ctx)
+    var Q_full = qr_result[0]
+    var R_full = qr_result[1]
+
+    var m = Q_full.shape[0]
+    var q_cols = Q_full.shape[1]
+    var r_cols = R_full.shape[1]
+    var reduced_cols = m
+    if reduced_cols > r_cols:
+        reduced_cols = r_cols
+
+    var host_Q = ctx.enqueue_create_host_buffer[dtype](Q_full.size)
+    ctx.enqueue_copy(host_Q, Q_full.storage)
+    var host_R = ctx.enqueue_create_host_buffer[dtype](R_full.size)
+    ctx.enqueue_copy(host_R, R_full.storage)
+    ctx.synchronize()
+
+    var q_data = List[Scalar[dtype]](capacity=m * reduced_cols)
+    for row in range(m):
+        for col in range(reduced_cols):
+            q_data.append(host_Q[row * q_cols + col])
+    var Q_red = create_dense_tensor_from_data[dtype](ctx, q_data, List[Int](m, reduced_cols))
+
+    var r_data = List[Scalar[dtype]](capacity=reduced_cols * r_cols)
+    for row in range(reduced_cols):
+        for col in range(r_cols):
+            r_data.append(host_R[row * r_cols + col])
+    var R_red = create_dense_tensor_from_data[dtype](ctx, r_data, List[Int](reduced_cols, r_cols))
+
+    var A_i_new = Q_red.reshape(List[Int](Dl, d, reduced_cols))
+
+    var shape_ip1 = A_ip1.shape.copy()
+    var d_ip1 = shape_ip1[1]
+    var Dr = shape_ip1[2]
+    var A_ip1_mat = A_ip1.reshape(List[Int](Dm, d_ip1 * Dr))
+    var R_shape = List[Int](reduced_cols, Dm)
+    var dot_shape = List[Int](reduced_cols, d_ip1 * Dr)
+    var A_ip1_new_mat = create_dense_tensor[dtype](ctx, dot_shape^, init_value=Scalar[dtype](0.0))
+    dense_tensor_dot(A_ip1_new_mat, R_red^, A_ip1_mat^, ctx)
+    var A_ip1_new = A_ip1_new_mat^.reshape(List[Int](reduced_cols, d_ip1, Dr))
+
+    return (MPSSite[dtype](A_i_new^), MPSSite[dtype](A_ip1_new^))
+
+
+fn mps_local_orthonormalize_rq_pair[dtype: DType = DType.float32](
+    ctx: DeviceContext,
+    var A_i: DenseTensor[dtype],
+    var A_im1: DenseTensor[dtype],
+) raises -> Tuple[MPSSite[dtype], MPSSite[dtype]]:
+    """Right-orthonormalize site i and absorb R into site i-1 (C `mps_local_orthonormalize_rq`)."""
+    var shape_i = A_i.shape.copy()
+    var Dl = shape_i[0]
+    var d = shape_i[1]
+    var Dr = shape_i[2]
+    var mat = A_i.reshape(List[Int](Dl, d * Dr))
+
+    var mat_T = mat^.transpose(List[Int](1, 0), ctx)
+    var qr_result = dense_tensor_qr[dtype](mat_T^, ctx)
+    var Q_T = qr_result[0]
+    var R_T = qr_result[1]
+
+    var n = Q_T.shape[0]
+    var k = Q_T.shape[1]
+    var host_QT = ctx.enqueue_create_host_buffer[dtype](Q_T.size)
+    ctx.enqueue_copy(host_QT, Q_T.storage)
+    var host_RT = ctx.enqueue_create_host_buffer[dtype](R_T.size)
+    ctx.enqueue_copy(host_RT, R_T.storage)
+    ctx.synchronize()
+
+    var r_data = List[Scalar[dtype]](capacity=Dl * k)
+    for i in range(Dl):
+        for j in range(k):
+            r_data.append(host_RT[j * Dl + i])
+    var R_out = create_dense_tensor_from_data[dtype](ctx, r_data, List[Int](Dl, k))
+
+    var q_data = List[Scalar[dtype]](capacity=k * n)
+    for i in range(k):
+        for j in range(n):
+            q_data.append(host_QT[j * k + i])
+    var Q_out = create_dense_tensor_from_data[dtype](ctx, q_data, List[Int](k, n))
+    var A_i_new = Q_out^.reshape(List[Int](k, d, Dr))
+
+    var shape_im1 = A_im1.shape.copy()
+    var Dl_prev = shape_im1[0]
+    var d_prev = shape_im1[1]
+    var Dm = shape_im1[2]
+    var A_im1_mat = A_im1.reshape(List[Int](Dl_prev * d_prev, Dm))
+    var dot_shape = List[Int](Dl_prev * d_prev, k)
+    var A_im1_new_mat = create_dense_tensor[dtype](ctx, dot_shape^, init_value=Scalar[dtype](0.0))
+    dense_tensor_dot(A_im1_new_mat, A_im1_mat^, R_out^, ctx)
+    var A_im1_new = A_im1_new_mat^.reshape(List[Int](Dl_prev, d_prev, k))
+
+    return (MPSSite[dtype](A_i_new^), MPSSite[dtype](A_im1_new^))
+
+
+fn mps_orthonormalize_right[dtype: DType = DType.float32](
+    ctx: DeviceContext,
+    mut mps: MatrixProductState[dtype],
+) raises:
+    """Right-canonicalize MPS (C `mps_orthonormalize_qr(..., MPS_ORTHONORMAL_RIGHT)`)."""
+    var N = mps.num_sites()
+    if N < 1:
+        return
+    if N == 1:
+        var Dl0 = mps.sites[0].left_bond_dim()
+        var tail_elems = Dl0 * Dl0
+        var tail_data = List[Scalar[dtype]](capacity=tail_elems)
+        for _ in range(tail_elems):
+            tail_data.append(Scalar[dtype](0.0))
+        for b in range(Dl0):
+            tail_data[b * Dl0 + b] = Scalar[dtype](1.0)
+        var tail = create_dense_tensor_from_data[dtype](
+            ctx, tail_data^, List[Int](Dl0, 1, Dl0)
+        )
+        var ortho0 = mps_local_orthonormalize_rq_pair[dtype](
+            ctx, mps.sites[0].tensor, tail
+        )
+        mps.sites[0] = ortho0[0]
+        return
+
+    for i in range(N - 1, 0, -1):
+        var ortho = mps_local_orthonormalize_rq_pair[dtype](
+            ctx, mps.sites[i].tensor, mps.sites[i - 1].tensor
+        )
+        mps.sites[i] = ortho[0]
+        mps.sites[i - 1] = ortho[1]
+        mps.bond_dims[i] = mps.sites[i - 1].right_bond_dim()
+
+    var Dl0 = mps.sites[0].left_bond_dim()
+    var tail_elems = Dl0 * Dl0
+    var tail_data = List[Scalar[dtype]](capacity=tail_elems)
+    for _ in range(tail_elems):
+        tail_data.append(Scalar[dtype](0.0))
+    for b in range(Dl0):
+        tail_data[b * Dl0 + b] = Scalar[dtype](1.0)
+    var tail = create_dense_tensor_from_data[dtype](
+        ctx, tail_data^, List[Int](Dl0, 1, Dl0)
+    )
+    var ortho0 = mps_local_orthonormalize_rq_pair[dtype](
+        ctx, mps.sites[0].tensor, tail
+    )
+    mps.sites[0] = ortho0[0]
+
+
 fn mps_orthogonalize_qr[dtype: DType = DType.float32](
     ctx: DeviceContext,
     var full_state: DenseTensor[dtype],

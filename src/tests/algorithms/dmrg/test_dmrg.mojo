@@ -12,7 +12,8 @@ from collections.list import List
 from gpu.host import DeviceContext
 from src.state.mps_state import create_product_mps, mps_norm
 from src.state.hamiltonians import create_heisenberg_xxz_mpo
-from src.algorithms.dmrg import dmrg_two_site, DMRGParams
+from src.algorithms.dmrg import dmrg_single_site, dmrg_two_site, DMRGParams
+from src.tests.benchmarks.rng_c_compat import create_random_mps_c_compatible
 from src.algorithms.dmrg_results_json import save_dmrg_results_to_json, DMRGJsonParams
 from src.tests.test_utils import assert_close
 from testing import TestSuite
@@ -34,17 +35,14 @@ fn print_subsection(title: String) -> None:
 # Test 1 — Two-site DMRG, small system (mirrors single-site test structure)
 #
 # The C test uses dmrg_singlesite with nsites=7, d=2, 6 sweeps.
-# Mojo only has dmrg_two_site, so we run two-site with modest chi_max
-# on the same 7-site Heisenberg XXX chain (D=1, h=0).
-#
-fn test_dmrg_singlesite_proxy() raises:
-    """Two-site DMRG on 7-site Heisenberg XXX (proxy for single-site test).
+fn test_dmrg_singlesite_manual() raises:
+    """Single-site DMRG on 7-site Heisenberg XXX.
     
     Mirrors C test_dmrg_singlesite_manual:
       Model: Heisenberg XXZ (J=1, D=1, h=0  =>  XXX)
       nsites=7, d=2, 6 sweeps, chi_max=16
     """
-    print_separator("DMRG Single-Site Proxy (Heisenberg XXX, manual)")
+    print_separator("DMRG Single-Site (Heisenberg XXX, manual)")
     
     with DeviceContext() as ctx:
         var num_sites = 7
@@ -66,13 +64,10 @@ fn test_dmrg_singlesite_proxy() raises:
         var H = create_heisenberg_xxz_mpo[DType.float32](ctx, num_sites, J=J, D=D, h=h_field)
         print("MPO constructed: " + String(H.num_sites()) + " sites")
         
-        # Initial product state |0000000>
-        var basis = List[Int](capacity=num_sites)
-        for _ in range(num_sites):
-            basis.append(0)
-        
-        var psi_initial = create_product_mps[DType.float32](ctx, physical_dim, basis^)
-        print("Initial MPS  : product |000...0>")
+        var psi_initial = create_random_mps_c_compatible[DType.float32](
+            ctx, num_sites, physical_dim, chi_max, 42
+        )
+        print("Initial MPS  : random (C-compatible seed 42)")
         print("")
         
         # DMRG parameters matching C test
@@ -83,11 +78,11 @@ fn test_dmrg_singlesite_proxy() raises:
             max_krylov_iter=25,
             krylov_tol=1e-8,
             energy_tol=1e-8,
-            two_site=True,
+            two_site=False,
             verbose=True       # prints per-sweep energy
         )
         
-        var result = dmrg_two_site[DType.float32](ctx, H^, psi_initial^, params)
+        var result = dmrg_single_site[DType.float32](ctx, H^, psi_initial^, params)
         var ground_energy = result[0]
         var ground_state = result[1]
         

@@ -12,7 +12,7 @@ Examples:
       ../chemtensor/build/generated/perf/contraction_timings_2_2_256.jsonl \\
       results/perf/contraction_timings_2_2_256.jsonl
 
-  # No args: read nsites/d/chi_max from Master_Thesis/bench_config.json (or BENCH_CONFIG)
+  # No args: read nsites/d/chi_max from Master_Thesis/bench_config_contraction.json (or BENCH_CONFIG)
   # and merge contraction_timings_{nsites}_{d}_{chi_max}.jsonl from C + Mojo dirs:
   python3 tools/merge_and_analyze_benchmarks.py
 
@@ -25,7 +25,7 @@ Examples:
   # Pass flags to the analyzer after -- :
   python3 tools/merge_and_analyze_benchmarks.py --auto contraction_timings_2_2_256.jsonl -- --show-runs
 
-  # DMRG: use bench_config.json dmrg_* keys; merge C+Mojo singlesite/twosite JSONLs, then analyze:
+  # DMRG: use dmrg_config.json dmrg_* keys; merge C+Mojo singlesite/twosite JSONLs, then analyze:
   python3 tools/merge_and_analyze_benchmarks.py --dmrg
 
   # Override C perf directory (also supports env CHEMTENSOR_C_PERF_DIR):
@@ -60,16 +60,24 @@ def _default_mojo_perf_dir(repo: Path) -> Path:
     return (repo / "results" / "perf").resolve()
 
 
-def _default_bench_config_path(repo: Path) -> Path:
+def _default_contraction_config_path(repo: Path) -> Path:
     env = os.environ.get("BENCH_CONFIG", "").strip()
     if env:
         return Path(env).expanduser().resolve()
     thesis = repo.parent.parent
-    return (thesis / "bench_config.json").resolve()
+    return (thesis / "bench_config_contraction.json").resolve()
 
 
-def dmrg_basenames_from_bench_config(config_path: Path) -> tuple[str, str] | None:
-    """Return (singlesite_basename, twosite_basename) using the same rules as bench_config-driven perf files."""
+def _default_dmrg_config_path(repo: Path) -> Path:
+    env = os.environ.get("DMRG_CONFIG", "").strip()
+    if env:
+        return Path(env).expanduser().resolve()
+    thesis = repo.parent.parent
+    return (thesis / "dmrg_config.json").resolve()
+
+
+def dmrg_basenames_from_config(config_path: Path) -> tuple[str, str] | None:
+    """Return DMRG timing basenames from dmrg_config."""
     if not config_path.is_file():
         return None
     try:
@@ -83,13 +91,15 @@ def dmrg_basenames_from_bench_config(config_path: Path) -> tuple[str, str] | Non
         ss_ns = int(data.get("dmrg_singlesite_nsites", ns))
         ss_d = int(data.get("dmrg_singlesite_d", d))
         ss_chi = int(data.get("dmrg_singlesite_chi_max", chi))
+        ss_sweeps = int(data.get("dmrg_singlesite_num_sweeps", 6))
         ts_ns = int(data.get("dmrg_twosite_nsites", ns))
         ts_d = int(data.get("dmrg_twosite_d", d))
         ts_chi = int(data.get("dmrg_twosite_chi_max", chi))
+        ts_sweeps = int(data.get("dmrg_twosite_num_sweeps", 4))
     except (TypeError, ValueError):
         return None
-    ss = f"dmrg_singlesite_timings_{ss_ns}_{ss_d}_{ss_chi}.jsonl"
-    ts = f"dmrg_twosite_timings_{ts_ns}_{ts_d}_{ts_chi}.jsonl"
+    ss = f"dmrg_singlesite_timings_{ss_ns}_{ss_d}_{ss_chi}_{ss_sweeps}.jsonl"
+    ts = f"dmrg_twosite_timings_{ts_ns}_{ts_d}_{ts_chi}_{ts_sweeps}.jsonl"
     return (ss, ts)
 
 
@@ -176,7 +186,12 @@ def main() -> int:
     parser.add_argument(
         "--config",
         type=Path,
-        help="bench_config.json (default: <thesis>/bench_config.json or BENCH_CONFIG env)",
+        help="Contraction config path (default: <thesis>/bench_config_contraction.json or BENCH_CONFIG env)",
+    )
+    parser.add_argument(
+        "--dmrg-config",
+        type=Path,
+        help="DMRG config path (default: <thesis>/dmrg_config.json or DMRG_CONFIG env)",
     )
     parser.add_argument(
         "--newest-mojo",
@@ -187,7 +202,7 @@ def main() -> int:
         "--dmrg",
         action="store_true",
         help=(
-            "Merge DMRG JSONLs from bench_config (dmrg_singlesite_*, dmrg_twosite_*) "
+            "Merge DMRG JSONLs from dmrg config (dmrg_singlesite_*, dmrg_twosite_*) "
             "and run analyze_benchmarks.py --dmrg"
         ),
     )
@@ -227,17 +242,21 @@ def main() -> int:
     m_dir = args.mojo_dir.resolve() if args.mojo_dir else _default_mojo_perf_dir(repo)
 
     if args.dmrg:
-        cfg_path = args.config.resolve() if args.config else _default_bench_config_path(repo)
-        pair = dmrg_basenames_from_bench_config(cfg_path)
+        cfg_path = (
+            args.dmrg_config.resolve()
+            if args.dmrg_config
+            else (args.config.resolve() if args.config else _default_dmrg_config_path(repo))
+        )
+        pair = dmrg_basenames_from_config(cfg_path)
         if not pair:
             print(
-                f"error: could not read DMRG keys from bench config: {cfg_path}\n"
+                f"error: could not read DMRG keys from config: {cfg_path}\n"
                 "  Expected nsites, d, chi_max and/or dmrg_singlesite_* / dmrg_twosite_* integers.",
                 file=sys.stderr,
             )
             return 1
         ss_name, ts_name = pair
-        print(f"From bench config {cfg_path}:\n  singlesite: {ss_name}\n  twosite:   {ts_name}\n", flush=True)
+        print(f"From DMRG config {cfg_path}:\n  singlesite: {ss_name}\n  twosite:   {ts_name}\n", flush=True)
         c_ss = (c_dir / ss_name).resolve()
         m_ss = (m_dir / ss_name).resolve()
         c_ts = (c_dir / ts_name).resolve()
@@ -300,12 +319,12 @@ def main() -> int:
 
     if not auto_name and not inputs:
         if not args.newest_mojo:
-            cfg_path = args.config.resolve() if args.config else _default_bench_config_path(repo)
+            cfg_path = args.config.resolve() if args.config else _default_contraction_config_path(repo)
             from_cfg = contraction_basename_from_bench_config(cfg_path)
             if from_cfg:
                 auto_name = from_cfg
                 print(
-                    f"From bench config {cfg_path}: nsites/d/chi_max → {auto_name}\n",
+                    f"From contraction config {cfg_path}: nsites/d/chi_max → {auto_name}\n",
                     flush=True,
                 )
             elif cfg_path.is_file():

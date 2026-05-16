@@ -3,12 +3,12 @@
 Run the contraction and/or DMRG benchmark pipeline for each (nsites, chi_max) pair in a fixed grid.
 
 For each job (contraction sweep only):
-  1. Update Master_Thesis/bench_config.json ("nsites" and "chi_max"; "d" and dmrg_* keys unchanged).
+  1. Update Master_Thesis/bench_config_contraction.json ("nsites" and "chi_max"; "d" unchanged).
   2. bash run_main.sh in chemtensor/ (build + main + perf_contractions, copies jsonl to Mojo).
   3. mojo run bench_contractions.mojo from the Mojo project root.
   4. python3 tools/merge_and_analyze_benchmarks.py (contraction) then --dmrg.
 
-DMRG-only mode (--dmrg-only): one run; bench_config is not rewritten for contraction sweep.
+DMRG-only mode (--dmrg-only): one run; contraction config is not rewritten.
   1. bash run_main.sh --dmrg-only (main + copy dmrg jsonl; skips perf_contractions).
   2. mojo ... bench_contractions.mojo --dmrg-only
   3. merge_and_analyze_benchmarks.py --dmrg
@@ -16,11 +16,12 @@ DMRG-only mode (--dmrg-only): one run; bench_config is not rewritten for contrac
 The default matrix matches the contraction sweep:
   nsites in {2, 4, 6, 8, 10} × chi_max in {16, 32, 64, 128, 256, 512, 1024}.
 
-Original bench_config.json content is restored when the script exits (including on failure).
+Original bench_config_contraction.json content is restored when the script exits (including on failure).
 
 Examples:
   python3 tools/run_contraction_benchmark_matrix.py --dry-run
   python3 tools/run_contraction_benchmark_matrix.py --continue-on-error
+  python3 tools/run_contraction_benchmark_matrix.py --repeat 3
   python3 tools/run_contraction_benchmark_matrix.py --build  # pass --build to run_main.sh
   python3 tools/run_contraction_benchmark_matrix.py --dmrg-only
 """
@@ -35,17 +36,17 @@ import sys
 from pathlib import Path
 
 
-# Number of sites × bond dimension chi_max ("d" stays as in bench_config.json).
+# Number of sites × bond dimension chi_max ("d" stays as in contraction config).
 NSITES_VALUES = (2, 4, 6, 8, 10, 12, 14, 16, 18, 20) #  (2, 4, 6, 8, 10)
 CHI_VALUES = (64, 128, 256, 512, 1024)
 
 
 def _paths(script: Path) -> tuple[Path, Path, Path, Path]:
-    """Mojo repo root, thesis root, chemtensor root, bench_config path."""
+    """Mojo repo root, thesis root, chemtensor root, contraction config path."""
     mojo_repo = script.resolve().parent.parent
     thesis = mojo_repo.parent.parent
     chemtensor = thesis / "chemtensor"
-    bench = thesis / "bench_config.json"
+    bench = thesis / "bench_config_contraction.json"
     return mojo_repo, thesis, chemtensor, bench
 
 
@@ -112,7 +113,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Sweep contraction benchmarks over (nsites, chi_max), and/or run DMRG perf "
-            "(bench_config dmrg_* keys)."
+            "(dmrg_config dmrg_* keys)."
         )
     )
     parser.add_argument(
@@ -124,14 +125,14 @@ def main() -> int:
         "--dmrg-only",
         action="store_true",
         help=(
-            "Single run: skip contraction sweep and perf_contractions; use dmrg_* from bench_config; "
+            "Single run: skip contraction sweep and perf_contractions; use dmrg_* from dmrg_config; "
             "merge with --dmrg only."
         ),
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print steps only; do not write bench_config or run commands.",
+        help="Print steps only; do not write contraction config or run commands.",
     )
     parser.add_argument(
         "--continue-on-error",
@@ -144,6 +145,13 @@ def main() -> int:
         help="Pass --build to run_main.sh (cmake/make before ./main).",
     )
     parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Repeat each benchmark job N times (default: 1).",
+    )
+    parser.add_argument(
         "--mpo-mpo",
         action="store_true",
         help="Pass --mpo-mpo to run_main.sh (very heavy C MPO→dense benchmark; ignored with --dmrg-only).",
@@ -154,6 +162,9 @@ def main() -> int:
         help="Mojo executable (default: $MOJO or 'mojo').",
     )
     args = parser.parse_args()
+    if args.repeat < 1:
+        print("error: --repeat must be >= 1", file=sys.stderr)
+        return 1
 
     script = Path(__file__).resolve()
     mojo_repo, thesis, chemtensor, bench_path = _paths(script)
@@ -164,7 +175,7 @@ def main() -> int:
 
     for label, path in (
         ("chemtensor/run_main.sh", run_main),
-        ("bench_config.json", bench_path),
+        ("bench_config_contraction.json", bench_path),
         ("bench_contractions.mojo", bench_mojo),
         ("tools/merge_and_analyze_benchmarks.py", merge_py),
     ):
@@ -188,14 +199,17 @@ def main() -> int:
     original = bench_path.read_bytes()
     exit_code = 0
 
-    def build_run_main_cmd(*, dmrg_only: bool) -> list[str]:
+    def build_run_main_cmd(*, dmrg_only: bool, do_build: bool) -> list[str]:
         cmd = ["bash", str(run_main)]
-        if args.build:
+        if do_build:
             cmd.append("--build")
         if dmrg_only:
             cmd.append("--dmrg-only")
-        elif args.mpo_mpo:
-            cmd.append("--mpo-mpo")
+        else:
+            cmd.append("--contractions-only")
+            if args.mpo_mpo:
+                cmd.append("--mpo-mpo")
+        cmd.append("--no-clean")
         return cmd
 
     mojo_bench_cmd = [
@@ -208,39 +222,59 @@ def main() -> int:
     if args.dmrg_only:
         mojo_bench_cmd.append("--dmrg-only")
     elif args.mpo_mpo:
-        mojo_bench_cmd.append("--mpo-mpo")
+        mojo_bench_cmd.extend(["--contractions-only", "--mpo-mpo"])
+    else:
+        mojo_bench_cmd.append("--contractions-only")
 
     try:
         for i, job in enumerate(jobs, start=1):
             if job is None:
                 print(
-                    f"\n========== [{i}/{len(jobs)}] DMRG-only (bench_config dmrg_* unchanged) ==========\n",
+                    f"\n========== [{i}/{len(jobs)}] DMRG-only (dmrg_config unchanged) ==========\n",
                     flush=True,
                 )
                 if args.dry_run:
                     print(
-                        "  would not rewrite nsites/chi_max for contraction sweep"
+                        "  would not rewrite nsites/chi_max for contraction config"
                     )
-                    print(f"  would bash {' '.join(build_run_main_cmd(dmrg_only=True))}")
-                    print(f"  would {' '.join(mojo_bench_cmd)}")
-                    print(
-                        f"  would python3 {merge_py} --dmrg"
-                    )
+                    for rep in range(1, args.repeat + 1):
+                        do_build = args.build and i == 1 and rep == 1
+                        print(f"  repetition {rep}/{args.repeat}:")
+                        print(
+                            f"    would bash {' '.join(build_run_main_cmd(dmrg_only=True, do_build=do_build))}"
+                        )
+                        print(f"    would {' '.join(mojo_bench_cmd)}")
+                        print(f"    would python3 {merge_py} --dmrg")
                     continue
 
-                steps: list[tuple[str, list[str], Path]] = [
-                    (
-                        "run_main.sh",
-                        build_run_main_cmd(dmrg_only=True),
-                        chemtensor,
-                    ),
-                    ("mojo bench_contractions (DMRG)", mojo_bench_cmd, mojo_repo),
-                    (
-                        "merge_and_analyze_benchmarks (--dmrg)",
-                        [sys.executable, str(merge_py), "--dmrg"],
-                        mojo_repo,
-                    ),
-                ]
+                for rep in range(1, args.repeat + 1):
+                    do_build = args.build and i == 1 and rep == 1
+                    print(
+                        f"--- repetition {rep}/{args.repeat} for DMRG-only run [{i}/{len(jobs)}] ---",
+                        flush=True,
+                    )
+                    steps: list[tuple[str, list[str], Path]] = [
+                        (
+                            "run_main.sh",
+                            build_run_main_cmd(dmrg_only=True, do_build=do_build),
+                            chemtensor,
+                        ),
+                        ("mojo bench_contractions (DMRG)", mojo_bench_cmd, mojo_repo),
+                        (
+                            "merge_and_analyze_benchmarks (--dmrg)",
+                            [sys.executable, str(merge_py), "--dmrg"],
+                            mojo_repo,
+                        ),
+                    ]
+                    step_rc = _run_steps(
+                        steps=steps,
+                        continue_on_error=args.continue_on_error,
+                    )
+                    if step_rc != 0:
+                        exit_code = step_rc
+                        if not args.continue_on_error:
+                            return exit_code
+                continue
             else:
                 nsites, chi_max = job
                 print(
@@ -249,49 +283,51 @@ def main() -> int:
                 )
                 if args.dry_run:
                     print(
-                        f"  would set bench_config nsites={nsites} chi_max={chi_max} (d and dmrg_* unchanged)"
+                        f"  would set contraction config nsites={nsites} chi_max={chi_max} (d unchanged)"
                     )
-                    print(
-                        f"  would bash {' '.join(build_run_main_cmd(dmrg_only=False))}"
-                    )
-                    print(f"  would {' '.join(mojo_bench_cmd)}")
-                    print(f"  would python3 {merge_py}")
-                    print(f"  would python3 {merge_py} --dmrg")
+                    for rep in range(1, args.repeat + 1):
+                        do_build = args.build and i == 1 and rep == 1
+                        print(f"  repetition {rep}/{args.repeat}:")
+                        print(
+                            f"    would bash {' '.join(build_run_main_cmd(dmrg_only=False, do_build=do_build))}"
+                        )
+                        print(f"    would {' '.join(mojo_bench_cmd)}")
+                        print(f"    would python3 {merge_py}")
                     continue
 
                 _apply_nsites_chi(bench_path, nsites, chi_max)
 
-                steps = [
-                    (
-                        "run_main.sh",
-                        build_run_main_cmd(dmrg_only=False),
-                        chemtensor,
-                    ),
-                    ("mojo bench_contractions", mojo_bench_cmd, mojo_repo),
-                    (
-                        "merge_and_analyze_benchmarks (contractions)",
-                        [sys.executable, str(merge_py)],
-                        mojo_repo,
-                    ),
-                    (
-                        "merge_and_analyze_benchmarks (--dmrg)",
-                        [sys.executable, str(merge_py), "--dmrg"],
-                        mojo_repo,
-                    ),
-                ]
-
-            step_rc = _run_steps(
-                steps=steps,
-                continue_on_error=args.continue_on_error,
-            )
-            if step_rc != 0:
-                exit_code = step_rc
-                if not args.continue_on_error:
-                    return exit_code
+                for rep in range(1, args.repeat + 1):
+                    do_build = args.build and i == 1 and rep == 1
+                    print(
+                        f"--- repetition {rep}/{args.repeat} for job [{i}/{len(jobs)}] ---",
+                        flush=True,
+                    )
+                    steps = [
+                        (
+                            "run_main.sh",
+                            build_run_main_cmd(dmrg_only=False, do_build=do_build),
+                            chemtensor,
+                        ),
+                        ("mojo bench_contractions", mojo_bench_cmd, mojo_repo),
+                        (
+                            "merge_and_analyze_benchmarks (contractions)",
+                            [sys.executable, str(merge_py)],
+                            mojo_repo,
+                        ),
+                    ]
+                    step_rc = _run_steps(
+                        steps=steps,
+                        continue_on_error=args.continue_on_error,
+                    )
+                    if step_rc != 0:
+                        exit_code = step_rc
+                        if not args.continue_on_error:
+                            return exit_code
     finally:
         if not args.dry_run:
             bench_path.write_bytes(original)
-            print("\nRestored original bench_config.json.", flush=True)
+            print("\nRestored original bench_config_contraction.json.", flush=True)
 
     return exit_code
 

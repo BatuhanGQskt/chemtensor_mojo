@@ -6,16 +6,14 @@ Same pattern as test_mps_c_comparison and test_mpo_c_comparison:
 - Run Mojo DMRG with the same model parameters (Heisenberg XXZ)
 - Compare gauge-invariant observables: energy_final, norm, bond_dims length
 
-Initial state: C uses random initial MPS (seed 42). We use a Néel product state
-|0,1,0,1,...> so that DMRG can converge to the same ground state. Using |0...0>
-would leave Mojo stuck in that eigenstate (energy e.g. -6 for 7-site XXX).
+Initial state: C uses random MPS (seed 42); both tests use create_random_mps_c_compatible.
 """
 
 from collections.list import List
 from gpu.host import DeviceContext
-from src.state.mps_state import create_product_mps
 from src.state.hamiltonians import create_heisenberg_xxz_mpo
-from src.algorithms.dmrg import dmrg_two_site, DMRGParams
+from src.algorithms.dmrg import dmrg_single_site, dmrg_two_site, DMRGParams
+from src.tests.benchmarks.rng_c_compat import create_random_mps_c_compatible
 from src.tests.test_utils import assert_close, assert_equal
 from src.tests.algorithms.dmrg.dmrg_json_loader import load_dmrg_reference, print_dmrg_reference_info
 from testing import TestSuite
@@ -31,35 +29,27 @@ fn print_subsection(title: String) -> None:
     print("\n--- " + title + " ---")
 
 
-# Tolerance for energy comparison (Néel init vs C random init, float32 vs float64).
-# Two-site (11 sites, 4 sweeps) can differ by ~0.15% so use 0.2% rtol.
-alias energy_rtol: Float64 = 2e-3
+# Energy rtol: float32 GPU vs C double; 16-site / chi=64 can differ by ~0.3–0.5%.
+alias energy_rtol: Float64 = 5e-3
 alias norm_atol: Float64 = 1e-5
 
 
-fn neel_basis(nsites: Int, d: Int) -> List[Int]:
-    """Néel product state basis: [0,1,0,1,...]. Has overlap with AFM ground state."""
-    var basis = List[Int](capacity=nsites)
-    for i in range(nsites):
-        basis.append(i % d)
-    return basis^
-
-
 fn test_dmrg_singlesite_vs_c_reference() raises:
-    """Compare Mojo single-site proxy (two-site with chi_max=16) vs C reference.
+    """Compare Mojo single-site DMRG vs C reference.
 
     C reference: test_data/dmrg_results_c_singlesite.json
     Model: Heisenberg XXZ (J=1, D=1, h=0), nsites=7, d=2, 6 sweeps, chi_max=16.
     """
-    print_separator("Test 1: DMRG Single-Site Proxy vs C Reference")
+    print_separator("Test 1: DMRG Single-Site vs C Reference")
 
     var ref_path = String("test_data/dmrg_results_c_singlesite.json")
     var dmrg_ref = load_dmrg_reference(ref_path)
     print_dmrg_reference_info(dmrg_ref)
 
     with DeviceContext() as ctx:
-        var basis = neel_basis(dmrg_ref.nsites, dmrg_ref.d)
-        var psi_initial = create_product_mps[DType.float32](ctx, dmrg_ref.d, basis^)
+        var psi_initial = create_random_mps_c_compatible[DType.float32](
+            ctx, dmrg_ref.nsites, dmrg_ref.d, dmrg_ref.chi_max, 42
+        )
         var H = create_heisenberg_xxz_mpo[DType.float32](
             ctx, dmrg_ref.nsites, J=dmrg_ref.J, D=dmrg_ref.D, h=dmrg_ref.h
         )
@@ -71,11 +61,11 @@ fn test_dmrg_singlesite_vs_c_reference() raises:
             max_krylov_iter=dmrg_ref.maxiter_lanczos,
             krylov_tol=1e-8,
             energy_tol=1e-8,
-            two_site=True,
+            two_site=False,
             verbose=False,
         )
 
-        var result = dmrg_two_site[DType.float32](ctx, H^, psi_initial^, params)
+        var result = dmrg_single_site[DType.float32](ctx, H^, psi_initial^, params)
         var E_mojo = result[0]
         var psi = result[1]
 
@@ -94,7 +84,7 @@ fn test_dmrg_singlesite_vs_c_reference() raises:
         )
         assert_equal(len(psi.bond_dims), len(dmrg_ref.bond_dims), "bond_dims length")
         print("  ✓ bond_dims length: " + String(len(psi.bond_dims)))
-        print("\n✓ Single-site proxy DMRG matches C reference (observables)")
+        print("\n✓ Single-site DMRG matches C reference (observables)")
 
 
 fn test_dmrg_twosite_vs_c_reference() raises:
@@ -110,8 +100,9 @@ fn test_dmrg_twosite_vs_c_reference() raises:
     print_dmrg_reference_info(dmrg_ref)
 
     with DeviceContext() as ctx:
-        var basis = neel_basis(dmrg_ref.nsites, dmrg_ref.d)
-        var psi_initial = create_product_mps[DType.float32](ctx, dmrg_ref.d, basis^)
+        var psi_initial = create_random_mps_c_compatible[DType.float32](
+            ctx, dmrg_ref.nsites, dmrg_ref.d, dmrg_ref.chi_max, 42
+        )
         var H = create_heisenberg_xxz_mpo[DType.float32](
             ctx, dmrg_ref.nsites, J=dmrg_ref.J, D=dmrg_ref.D, h=dmrg_ref.h
         )

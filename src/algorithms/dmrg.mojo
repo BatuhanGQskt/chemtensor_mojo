@@ -4,11 +4,18 @@ from math import sqrt, atan2, sin, cos
 from src.m_tensor.dense_tensor import (
     DenseTensor,
     create_dense_tensor,
+    create_dense_tensor_from_data,
     create_dense_tensor_uninitialized,
     dense_tensor_dot,
     dense_tensor_svd_trunc,
 )
-from src.state.mps_state import MPSSite, MatrixProductState
+from src.state.mps_state import (
+    MPSSite,
+    MatrixProductState,
+    mps_local_orthonormalize_qr_pair,
+    mps_local_orthonormalize_rq_pair,
+    mps_orthonormalize_right,
+)
 from src.state.mpo_state import MPOSite, MatrixProductOperator
 from src.state.environments import (
     update_left_environment,
@@ -32,7 +39,7 @@ struct DMRGParams:
     var max_krylov_iter: Int    # Max Lanczos iterations per site
     var krylov_tol: Float64     # Lanczos convergence tolerance
     var energy_tol: Float64     # Energy convergence threshold for early stopping
-    var two_site: Bool          # Two-site DMRG (True) or single-site (False, not implemented)
+    var two_site: Bool          # True: two-site DMRG; False: single-site DMRG (fixed bond dimension)
     var verbose: Bool           # Print progress
 
 
@@ -374,6 +381,419 @@ fn apply_two_site_heff[dtype: DType](
     return result^
 
 
+fn _dmrg_jacobi_smallest_eigpair(
+    mut A: List[List[Float64]],
+    tol: Float64,
+    max_sweeps: Int = 200,
+) raises -> Tuple[Float64, List[Float64]]:
+    """Smallest eigenpair of a small real symmetric matrix (Lanczos Ritz solve)."""
+    var n = len(A)
+    if n == 0:
+        raise Error("Empty matrix in Jacobi eigensolver")
+    if n == 1:
+        return (A[0][0], List[Float64](1.0))
+
+    var V = List[List[Float64]](capacity=n)
+    for i in range(n):
+        var row = List[Float64](capacity=n)
+        for j in range(n):
+            row.append(1.0 if i == j else 0.0)
+        V.append(row^)
+
+    for _ in range(max_sweeps):
+        var p = 0
+        var q = 1
+        var max_val = abs(A[0][1])
+        for i in range(n):
+            for j in range(i + 1, n):
+                var v = abs(A[i][j])
+                if v > max_val:
+                    max_val = v
+                    p = i
+                    q = j
+
+        if max_val < tol:
+            break
+
+        var app = A[p][p]
+        var aqq = A[q][q]
+        var apq = A[p][q]
+        var phi = 0.5 * atan2(2.0 * apq, (aqq - app))
+        var c = cos(phi)
+        var s = sin(phi)
+
+        for k in range(n):
+            if k != p and k != q:
+                var aik = A[k][p]
+                var akq = A[k][q]
+                var new_kp = c * aik - s * akq
+                var new_kq = s * aik + c * akq
+                A[k][p] = new_kp
+                A[p][k] = new_kp
+                A[k][q] = new_kq
+                A[q][k] = new_kq
+
+        var new_pp = c * c * app - 2.0 * s * c * apq + s * s * aqq
+        var new_qq = s * s * app + 2.0 * s * c * apq + c * c * aqq
+        A[p][p] = new_pp
+        A[q][q] = new_qq
+        A[p][q] = 0.0
+        A[q][p] = 0.0
+
+        for k in range(n):
+            var vip = V[k][p]
+            var viq = V[k][q]
+            V[k][p] = c * vip - s * viq
+            V[k][q] = s * vip + c * viq
+
+    var min_i = 0
+    var min_val = A[0][0]
+    for i in range(1, n):
+        if A[i][i] < min_val:
+            min_val = A[i][i]
+            min_i = i
+
+    var vec = List[Float64](capacity=n)
+    for i in range(n):
+        vec.append(V[i][min_i])
+
+    var norm: Float64 = 0.0
+    for i in range(n):
+        norm += vec[i] * vec[i]
+    norm = sqrt(norm)
+    if norm > 0.0:
+        for i in range(n):
+            vec[i] = vec[i] / norm
+
+    return (min_val, vec^)
+
+
+fn apply_one_site_heff[dtype: DType](
+    vec: DenseTensor[dtype],
+    L_env: DenseTensor[dtype],
+    R_env: DenseTensor[dtype],
+    W_site: MPOSite[dtype],
+    ctx: DeviceContext,
+) raises -> DenseTensor[dtype]:
+    """Apply effective single-site Hamiltonian H_eff|vec> (matrix-free, matches C apply_local_hamiltonian)."""
+    var vec_shape = vec.shape.copy()
+    var Dl = vec_shape[0]
+    var d = vec_shape[1]
+    var Dr = vec_shape[2]
+
+    var L_shape = L_env.shape.copy()
+    var R_shape = R_env.shape.copy()
+    var W_shape = W_site.tensor.shape.copy()
+    var wL = L_shape[0]
+    var Dl_bra = L_shape[2]
+    var wR = R_shape[0]
+    var Dr_bra = R_shape[2]
+    var s_out = W_shape[2]
+
+    # L[wL,Dl,Dl'] x vec[Dl,s,Dr] -> temp1[wL,Dl',s,Dr]
+    var L_trans = L_env.transpose(List[Int](1, 0, 2), ctx)
+    var L_flat = L_trans^.reshape(List[Int](Dl, wL * Dl_bra))
+    var vec_flat = vec.reshape(List[Int](Dl, d * Dr))
+    var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_bra, d * Dr))
+    dense_tensor_dot(temp1_contract, L_flat^, vec_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
+    var temp1 = temp1_contract^.reshape(List[Int](wL, Dl_bra, d, Dr))
+
+    # temp1 x W -> temp2[Dl',Dr,s',wR]
+    var temp1_perm = temp1^.transpose(List[Int](1, 3, 0, 2), ctx)
+    var temp1_mat = temp1_perm^.reshape(List[Int](Dl_bra * Dr, wL * d))
+    var W_mat = W_site.tensor.reshape(List[Int](wL * d, s_out * wR))
+    var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra * Dr, s_out * wR))
+    dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
+    var temp2 = temp2_mat^.reshape(List[Int](Dl_bra, Dr, s_out, wR))
+
+    # temp2 x R -> result[Dl',s',Dr']
+    var temp2_perm = temp2^.transpose(List[Int](0, 2, 3, 1), ctx)
+    var temp2_mat2 = temp2_perm^.reshape(List[Int](Dl_bra * s_out, wR * Dr))
+    var R_mat = R_env.reshape(List[Int](wR * Dr, Dr_bra))
+    var result_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra * s_out, Dr_bra))
+    dense_tensor_dot(result_mat, temp2_mat2^, R_mat^, ctx)
+
+    return result_mat^.reshape(List[Int](Dl_bra, s_out, Dr_bra))
+
+
+fn lanczos_one_site_optimize[dtype: DType](
+    initial_vec: DenseTensor[dtype],
+    L_env: DenseTensor[dtype],
+    R_env: DenseTensor[dtype],
+    W_site: MPOSite[dtype],
+    ctx: DeviceContext,
+    max_iter: Int,
+    tol: Float64,
+) raises -> Tuple[Float64, DenseTensor[dtype]]:
+    """Lanczos ground-state optimization for a single MPS site (C eigensystem_krylov_symmetric)."""
+    var v0 = initial_vec
+    var dim = v0.size
+    var shape = v0.shape.copy()
+
+    var host_v0 = ctx.enqueue_create_host_buffer[dtype](dim)
+    ctx.enqueue_copy(host_v0, v0.storage)
+    ctx.synchronize()
+
+    var norm0: Float64 = 0.0
+    for i in range(dim):
+        norm0 += Float64(host_v0[i]) * Float64(host_v0[i])
+    norm0 = sqrt(norm0)
+    if norm0 < 1e-14:
+        raise Error("Initial vector has zero norm")
+    for i in range(dim):
+        host_v0[i] = host_v0[i] / Scalar[dtype](norm0)
+
+    var v_current = create_dense_tensor_uninitialized[dtype](ctx, shape.copy())
+    ctx.enqueue_copy(v_current.storage, host_v0)
+    ctx.synchronize()
+
+    var krylov = List[List[Float64]](capacity=max_iter)
+    var v0_f64 = List[Float64](capacity=dim)
+    for i in range(dim):
+        v0_f64.append(Float64(host_v0[i]))
+    krylov.append(v0_f64^)
+
+    var alpha = List[Float64](capacity=max_iter)
+    var beta = List[Float64](capacity=max_iter)
+    var beta_threshold: Float64 = 100.0 * Float64(dim) * 2.2204460492503131e-16
+    var numiter: Int = max_iter
+
+    for j in range(max_iter - 1):
+        var w = apply_one_site_heff[dtype](v_current^, L_env, R_env, W_site, ctx)
+        var host_w_raw = ctx.enqueue_create_host_buffer[dtype](dim)
+        ctx.enqueue_copy(host_w_raw, w.storage)
+        ctx.synchronize()
+
+        var w_f64 = List[Float64](capacity=dim)
+        for i in range(dim):
+            w_f64.append(Float64(host_w_raw[i]))
+
+        var v_f64 = krylov[j].copy()
+        var a: Float64 = 0.0
+        for i in range(dim):
+            a += v_f64[i] * w_f64[i]
+        alpha.append(a)
+
+        for i in range(dim):
+            w_f64[i] = w_f64[i] - a * v_f64[i]
+        if j > 0:
+            var bprev = beta[j - 1]
+            var vprev = krylov[j - 1].copy()
+            for i in range(dim):
+                w_f64[i] = w_f64[i] - bprev * vprev[i]
+
+        var b: Float64 = 0.0
+        for i in range(dim):
+            b += w_f64[i] * w_f64[i]
+        b = sqrt(b)
+
+        if b < beta_threshold:
+            numiter = j + 1
+            break
+
+        beta.append(b)
+        var vnext_f64 = List[Float64](capacity=dim)
+        for i in range(dim):
+            vnext_f64.append(w_f64[i] / b)
+        krylov.append(vnext_f64^)
+
+        v_current = create_dense_tensor_uninitialized[dtype](ctx, shape.copy())
+        var host_v_next = ctx.enqueue_create_host_buffer[dtype](dim)
+        for i in range(dim):
+            host_v_next[i] = Scalar[dtype](w_f64[i] / b)
+        ctx.enqueue_copy(v_current.storage, host_v_next)
+        ctx.synchronize()
+
+    if numiter == max_iter:
+        var j = max_iter - 1
+        var w = apply_one_site_heff[dtype](v_current^, L_env, R_env, W_site, ctx)
+        var host_w_raw = ctx.enqueue_create_host_buffer[dtype](dim)
+        ctx.enqueue_copy(host_w_raw, w.storage)
+        ctx.synchronize()
+        var v_f64 = krylov[j].copy()
+        var a: Float64 = 0.0
+        for i in range(dim):
+            a += v_f64[i] * Float64(host_w_raw[i])
+        alpha.append(a)
+
+    var nK = numiter
+    if nK == 0:
+        raise Error("Lanczos produced empty Krylov basis")
+
+    var T = List[List[Float64]](capacity=nK)
+    for _ in range(nK):
+        var row = List[Float64](capacity=nK)
+        for _ in range(nK):
+            row.append(0.0)
+        T.append(row^)
+    for i in range(nK):
+        T[i][i] = alpha[i]
+    for i in range(nK - 1):
+        T[i][i + 1] = beta[i]
+        T[i + 1][i] = beta[i]
+
+    var eig = _dmrg_jacobi_smallest_eigpair(T, tol)
+    var E0 = eig[0]
+    var coeffs = eig[1].copy()
+
+    var out_f64 = List[Float64](capacity=dim)
+    for j in range(dim):
+        out_f64.append(0.0)
+    for i in range(nK):
+        var ci = coeffs[i]
+        var vi = krylov[i].copy()
+        for j in range(dim):
+            out_f64[j] = out_f64[j] + ci * vi[j]
+
+    var out_norm: Float64 = 0.0
+    for j in range(dim):
+        out_norm += out_f64[j] * out_f64[j]
+    out_norm = sqrt(out_norm)
+    if out_norm > 0.0:
+        for j in range(dim):
+            out_f64[j] = out_f64[j] / out_norm
+
+    var host_out = ctx.enqueue_create_host_buffer[dtype](dim)
+    for j in range(dim):
+        host_out[j] = Scalar[dtype](out_f64[j])
+    var vec_opt = create_dense_tensor_uninitialized[dtype](ctx, shape^)
+    ctx.enqueue_copy(vec_opt.storage, host_out)
+    ctx.synchronize()
+
+    return (E0, vec_opt^)
+
+
+fn dmrg_local_update_one_site[dtype: DType](
+    site_index: Int,
+    mut mps: MatrixProductState[dtype],
+    mpo: MatrixProductOperator[dtype],
+    mut workspace: DMRGWorkspace[dtype],
+    params: DMRGParams,
+    ctx: DeviceContext,
+    left_to_right: Bool,
+) raises -> Float64:
+    """Single-site local energy minimization with Lanczos (bond dimension unchanged)."""
+    var i = site_index
+    var A_i = mps.sites[i].tensor
+    var L_i = workspace.L_env[i]
+    var R_ip1 = workspace.R_env[i + 1]
+    var W_i = mpo.sites[i]
+
+    var lanczos_result = lanczos_one_site_optimize[dtype](
+        A_i,
+        L_i,
+        R_ip1,
+        W_i,
+        ctx,
+        max_iter=params.max_krylov_iter,
+        tol=params.krylov_tol,
+    )
+    var eigenvalue = lanczos_result[0]
+    var A_opt = lanczos_result[1]
+    mps.sites[i] = MPSSite[dtype](A_opt^)
+
+    if left_to_right:
+        if i < mps.num_sites() - 1:
+            var ortho = mps_local_orthonormalize_qr_pair[dtype](
+                ctx,
+                mps.sites[i].tensor,
+                mps.sites[i + 1].tensor,
+            )
+            mps.sites[i] = ortho[0]
+            mps.sites[i + 1] = ortho[1]
+            mps.bond_dims[i + 1] = mps.sites[i].right_bond_dim()
+            var L_ip1 = update_left_environment[dtype](L_i, mps.sites[i], W_i, ctx)
+            workspace.L_env[i + 1] = L_ip1^
+    else:
+        if i > 0:
+            var ortho = mps_local_orthonormalize_rq_pair[dtype](
+                ctx,
+                mps.sites[i].tensor,
+                mps.sites[i - 1].tensor,
+            )
+            mps.sites[i] = ortho[0]
+            mps.sites[i - 1] = ortho[1]
+            mps.bond_dims[i] = mps.sites[i - 1].right_bond_dim()
+            var R_i = update_right_environment[dtype](R_ip1, mps.sites[i], W_i, ctx)
+            workspace.R_env[i] = R_i^
+
+    return eigenvalue
+
+
+fn dmrg_single_site[dtype: DType](
+    ctx: DeviceContext,
+    mpo: MatrixProductOperator[dtype],
+    var mps: MatrixProductState[dtype],
+    params: DMRGParams,
+) raises -> Tuple[Float64, MatrixProductState[dtype]]:
+    """Single-site DMRG: local optimizations without growing bond dimension (C dmrg_singlesite)."""
+    var N = mps.num_sites()
+    if N < 1:
+        raise Error("DMRG requires at least 1 site")
+
+    if params.verbose:
+        print("=== Starting single-site DMRG ===")
+        print("  Sites:", N)
+        print("  Max sweeps:", params.num_sweeps)
+
+    # Match C: right-normalize the initial MPS before building environments.
+    mps_orthonormalize_right[dtype](ctx, mps)
+
+    var workspace = DMRGWorkspace[dtype](mps, mpo, ctx)
+
+    var energy: Float64 = 0.0
+    var prev_energy: Float64 = 0.0
+
+    for sweep in range(params.num_sweeps):
+        if params.verbose:
+            print("\n--- Sweep", sweep + 1, "/", params.num_sweeps, "---")
+
+        for i in range(N - 1):
+            energy = dmrg_local_update_one_site[dtype](
+                i, mps, mpo, workspace, params, ctx, left_to_right=True
+            )
+
+        for i in range(N - 1, 0, -1):
+            energy = dmrg_local_update_one_site[dtype](
+                i, mps, mpo, workspace, params, ctx, left_to_right=False
+            )
+
+        # Right-normalize leftmost site with dummy tail (C dmrg_singlesite final step).
+        if N >= 1:
+            var Dl0 = mps.sites[0].left_bond_dim()
+            var tail_elems = Dl0 * Dl0
+            var tail_data = List[Scalar[dtype]](capacity=tail_elems)
+            for _ in range(tail_elems):
+                tail_data.append(Scalar[dtype](0.0))
+            for b in range(Dl0):
+                tail_data[b * Dl0 + b] = Scalar[dtype](1.0)
+            var tail = create_dense_tensor_from_data[dtype](
+                ctx, tail_data^, List[Int](Dl0, 1, Dl0)
+            )
+            var ortho0 = mps_local_orthonormalize_rq_pair[dtype](
+                ctx, mps.sites[0].tensor, tail
+            )
+            mps.sites[0] = ortho0[0]
+
+        var sweep_energy = energy
+        if params.verbose:
+            print("Sweep", sweep + 1, "completed. Energy:", sweep_energy)
+
+        if sweep > 0:
+            var energy_change = abs(sweep_energy - prev_energy)
+            if energy_change < params.energy_tol:
+                if params.verbose:
+                    print("Converged! Energy change:", energy_change)
+                break
+        prev_energy = sweep_energy
+
+    if params.verbose:
+        print("\n=== Single-site DMRG Complete ===")
+        print("Final energy:", energy)
+
+    return (energy, mps^)
+
+
 fn dmrg_two_site[dtype: DType](
     ctx: DeviceContext,
     mpo: MatrixProductOperator[dtype],
@@ -414,7 +834,7 @@ fn dmrg_two_site[dtype: DType](
         ```
     """
     if not params.two_site:
-        raise Error("Only two-site DMRG is currently implemented")
+        return dmrg_single_site[dtype](ctx, mpo, mps^, params)
     
     var N = mps.num_sites()
     if N < 2:
@@ -426,6 +846,8 @@ fn dmrg_two_site[dtype: DType](
         print("  Max sweeps:", params.num_sweeps)
         print("  Max bond dim:", params.chi_max)
         print("  Truncation threshold:", params.eps_trunc)
+
+    mps_orthonormalize_right[dtype](ctx, mps)
     
     # Initialize workspace
     var workspace = DMRGWorkspace[dtype](mps, mpo, ctx)
