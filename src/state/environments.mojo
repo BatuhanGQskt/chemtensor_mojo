@@ -876,7 +876,7 @@ fn _mps_contraction_step_left[dtype: DType](
     var Dr_ket = A_ket.shape[2]
 
     @parameter
-    if dtype == DType.float32:
+    if False: # dtype == DType.float32:
         var t0 = perf_counter_ns()
         var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
         profile.alloc_ns += perf_counter_ns() - t0

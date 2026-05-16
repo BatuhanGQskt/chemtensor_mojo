@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Optional
 import math
 import re
+import statistics
 
 
 def parse_contraction_timings_filename(filename: str) -> Optional[tuple[int, int, int]]:
@@ -562,17 +563,29 @@ def analyze_dmrg_benchmarks(c_path: str = None, mojo_path: str = None):
             return max(with_ts, key=lambda r: r.timestamp)
         return runs[-1]
 
-    # For each operation, choose a param signature present in both backends.
-    latest: dict[str, dict[str, BenchmarkResult]] = {'c': {}, 'mojo': {}}
+    def summarize_runs(runs: list[BenchmarkResult]) -> dict:
+        """Compute mean/std aggregates for a list of benchmark records."""
+        times = [r.time_seconds for r in runs]
+        energies = [r.result for r in runs]
+        n = len(runs)
+        time_mean = statistics.mean(times) if n else float('nan')
+        time_std = statistics.stdev(times) if n > 1 else 0.0
+        energy_mean = statistics.mean(energies) if n else float('nan')
+        energy_std = statistics.stdev(energies) if n > 1 else 0.0
+        return {
+            "n": n,
+            "time_mean": time_mean,
+            "time_std": time_std,
+            "energy_mean": energy_mean,
+            "energy_std": energy_std,
+            "params": runs[0].params if runs else {},
+        }
+
+    # For each operation choose one parameter signature, then aggregate repeated runs.
+    summary_by_backend: dict[str, dict[str, dict]] = {'c': {}, 'mojo': {}}
     for op in dmrg_ops:
         c_runs = results.get('c', {}).get(op, [])
         m_runs = results.get('mojo', {}).get(op, [])
-        if not c_runs or not m_runs:
-            if c_runs:
-                latest['c'][op] = latest_for_signature(c_runs)
-            if m_runs:
-                latest['mojo'][op] = latest_for_signature(m_runs)
-            continue
 
         c_by_sig: dict[tuple, list[BenchmarkResult]] = defaultdict(list)
         m_by_sig: dict[tuple, list[BenchmarkResult]] = defaultdict(list)
@@ -582,56 +595,72 @@ def analyze_dmrg_benchmarks(c_path: str = None, mojo_path: str = None):
             m_by_sig[param_signature(r.params)].append(r)
 
         common_sigs = [sig for sig in c_by_sig.keys() if sig in m_by_sig]
+        chosen_sig = None
         if common_sigs:
-            # Pick the most recently updated signature.
-            def sig_recency(sig: tuple) -> float:
+            # Prefer signatures with more paired repeats; tie-break by recency.
+            def sig_score(sig: tuple) -> tuple[int, float]:
+                paired_repeats = min(len(c_by_sig[sig]), len(m_by_sig[sig]))
                 cr = latest_for_signature(c_by_sig[sig])
                 mr = latest_for_signature(m_by_sig[sig])
                 c_t = cr.timestamp if cr.timestamp is not None else -1
                 m_t = mr.timestamp if mr.timestamp is not None else -1
-                return max(c_t, m_t)
+                return paired_repeats, max(c_t, m_t)
 
-            chosen_sig = max(common_sigs, key=sig_recency)
-            latest['c'][op] = latest_for_signature(c_by_sig[chosen_sig])
-            latest['mojo'][op] = latest_for_signature(m_by_sig[chosen_sig])
+            chosen_sig = max(common_sigs, key=sig_score)
+
+        if chosen_sig is not None:
+            summary_by_backend['c'][op] = summarize_runs(c_by_sig[chosen_sig])
+            summary_by_backend['mojo'][op] = summarize_runs(m_by_sig[chosen_sig])
         else:
-            # Fallback: still show latest per backend, but this means params differ.
-            latest['c'][op] = latest_for_signature(c_runs)
-            latest['mojo'][op] = latest_for_signature(m_runs)
+            # If no common signature, still summarize best available backend signature.
+            if c_by_sig:
+                best_c_sig = max(c_by_sig.keys(), key=lambda sig: (len(c_by_sig[sig]), latest_for_signature(c_by_sig[sig]).timestamp or -1))
+                summary_by_backend['c'][op] = summarize_runs(c_by_sig[best_c_sig])
+            if m_by_sig:
+                best_m_sig = max(m_by_sig.keys(), key=lambda sig: (len(m_by_sig[sig]), latest_for_signature(m_by_sig[sig]).timestamp or -1))
+                summary_by_backend['mojo'][op] = summarize_runs(m_by_sig[best_m_sig])
     
     # Print summary table
     print_subheader("DMRG Performance Summary")
     
-    print(f"{'Operation':<20} {'C Time':>12} {'Mojo Time':>12} {'Speedup':>18} {'Energy Match':>20}")
+    print(f"{'Operation':<20} {'C Time (mean±std)':>24} {'Mojo Time (mean±std)':>24} {'Speedup':>18} {'Energy Match':>20}")
     print("─" * 82)
     
     summary_data = []
     
     for op in dmrg_ops:
-        c_res = latest.get('c', {}).get(op)
-        mojo_res = latest.get('mojo', {}).get(op)
+        c_res = summary_by_backend.get('c', {}).get(op)
+        mojo_res = summary_by_backend.get('mojo', {}).get(op)
         
         if c_res and mojo_res:
-            c_time_str = format_time(c_res.time_seconds)
-            mojo_time_str = format_time(mojo_res.time_seconds)
-            _, speedup_str = compute_speedup(c_res.time_seconds, mojo_res.time_seconds)
-            _, match_str = check_result_match(c_res.result, mojo_res.result, rtol=2e-3)  # DMRG can have larger tolerance
+            c_time_str = f"{format_time(c_res['time_mean'])} ± {format_time(c_res['time_std'])} (n={c_res['n']})"
+            mojo_time_str = f"{format_time(mojo_res['time_mean'])} ± {format_time(mojo_res['time_std'])} (n={mojo_res['n']})"
+            _, speedup_str = compute_speedup(c_res['time_mean'], mojo_res['time_mean'])
+            _, match_str = check_result_match(c_res['energy_mean'], mojo_res['energy_mean'], rtol=5e-3)  # float32 Mojo vs double C
             
             print(f"{op:<20} {c_time_str:>12} {mojo_time_str:>12} {speedup_str:>28} {match_str:>30}")
             
             summary_data.append({
                 'op': op,
-                'c_time': c_res.time_seconds,
-                'mojo_time': mojo_res.time_seconds,
-                'c_result': c_res.result,
-                'mojo_result': mojo_res.result,
-                'c_params': c_res.params,
-                'mojo_params': mojo_res.params
+                'c_time': c_res['time_mean'],
+                'mojo_time': mojo_res['time_mean'],
+                'c_time_std': c_res['time_std'],
+                'mojo_time_std': mojo_res['time_std'],
+                'c_result': c_res['energy_mean'],
+                'mojo_result': mojo_res['energy_mean'],
+                'c_result_std': c_res['energy_std'],
+                'mojo_result_std': mojo_res['energy_std'],
+                'c_n': c_res['n'],
+                'mojo_n': mojo_res['n'],
+                'c_params': c_res['params'],
+                'mojo_params': mojo_res['params'],
             })
         elif c_res:
-            print(f"{op:<20} {format_time(c_res.time_seconds):>12} {'N/A':>12} {'N/A':>18} {'N/A':>20}")
+            c_time_str = f"{format_time(c_res['time_mean'])} ± {format_time(c_res['time_std'])} (n={c_res['n']})"
+            print(f"{op:<20} {c_time_str:>12} {'N/A':>12} {'N/A':>18} {'N/A':>20}")
         elif mojo_res:
-            print(f"{op:<20} {'N/A':>12} {format_time(mojo_res.time_seconds):>12} {'N/A':>18} {'N/A':>20}")
+            mojo_time_str = f"{format_time(mojo_res['time_mean'])} ± {format_time(mojo_res['time_std'])} (n={mojo_res['n']})"
+            print(f"{op:<20} {'N/A':>12} {mojo_time_str:>12} {'N/A':>18} {'N/A':>20}")
     
     # Detailed analysis
     print_subheader("Detailed DMRG Analysis")
@@ -652,8 +681,14 @@ def analyze_dmrg_benchmarks(c_path: str = None, mojo_path: str = None):
             params_str = f"nsites={c_params.get('nsites', '?')}, d={c_params.get('d', '?')}, chi_max={c_params.get('chi_max', '?')}, sweeps={c_params.get('num_sweeps', '?')}"
             print(f"  Parameters: {params_str}")
         
-        print(f"  C (CPU):     {format_time(c_time):>12}  |  Energy: {format_result(data['c_result'])}")
-        print(f"  Mojo (GPU):  {format_time(mojo_time):>12}  |  Energy: {format_result(data['mojo_result'])}")
+        print(
+            f"  C (CPU):     {format_time(c_time):>12} ± {format_time(data['c_time_std'])}"
+            f" (n={data['c_n']}) | Energy: {format_result(data['c_result'])} ± {format_result(data['c_result_std'])}"
+        )
+        print(
+            f"  Mojo (GPU):  {format_time(mojo_time):>12} ± {format_time(data['mojo_time_std'])}"
+            f" (n={data['mojo_n']}) | Energy: {format_result(data['mojo_result'])} ± {format_result(data['mojo_result_std'])}"
+        )
         
         if ratio > 1.0:
             print(f"  {Colors.GREEN}→ Mojo is {ratio:.2f}x faster{Colors.END}")
@@ -676,7 +711,7 @@ def analyze_dmrg_benchmarks(c_path: str = None, mojo_path: str = None):
         # Check for energy mismatches
         mismatches = []
         for d in summary_data:
-            match, _ = check_result_match(d['c_result'], d['mojo_result'], rtol=2e-3)
+            match, _ = check_result_match(d['c_result'], d['mojo_result'], rtol=5e-3)
             if not match:
                 mismatches.append(d['op'])
         
@@ -684,7 +719,7 @@ def analyze_dmrg_benchmarks(c_path: str = None, mojo_path: str = None):
             print(f"\n  {Colors.RED}⚠ Energy mismatches detected in: {', '.join(mismatches)}{Colors.END}")
             print(f"  {Colors.YELLOW}  This may indicate different convergence or initial state.{Colors.END}")
         else:
-            print(f"\n  {Colors.GREEN}✓ All DMRG energies match between C and Mojo (within 0.2% tolerance){Colors.END}")
+            print(f"\n  {Colors.GREEN}✓ All DMRG energies match between C and Mojo (within 0.5% tolerance){Colors.END}")
 
 
 def main():
