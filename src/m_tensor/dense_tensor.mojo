@@ -1,15 +1,9 @@
-from memory import Pointer, AddressSpace, OwnedPointer
-from layout import Layout, LayoutTensor, RuntimeLayout, IntTuple, RuntimeTuple
-from collections.list import List
-from utils import IndexList
-from gpu import thread_idx, block_idx, block_dim, barrier, global_idx
-from gpu.host import DeviceContext, DeviceBuffer
-from buffer.buffer import NDBuffer
-from memory.unsafe_pointer import UnsafePointer
+from layout.layout import Layout
+from layout.layout_tensor import LayoutTensor
+from layout.runtime_layout import RuntimeLayout
+from layout.runtime_tuple import RuntimeTuple
 import linalg
 from linalg.qr_factorization import qr_factorization, form_q
-from random import random_float64
-from math import sqrt, ceildiv
 from src.mylinalg.backend import SVDBackend
 from src.mylinalg.matrix import MatrixF64
 from src.mylinalg.svd import svd_f64
@@ -21,7 +15,7 @@ from src.m_tensor.tensor_traits import TensorOps, TensorBackend
 # GPU helper kernels for element-wise operations
 # ---------------------------------------------------------------------------
 
-fn _gpu_fill_kernel[dtype: DType](
+def _gpu_fill_kernel[dtype: DType](
     data: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     value_buf: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     total_size: Int,
@@ -33,7 +27,7 @@ fn _gpu_fill_kernel[dtype: DType](
     data[tid] = value_buf[0]
 
 
-fn _gpu_set_identity_kernel[dtype: DType](
+def _gpu_set_identity_kernel[dtype: DType](
     data: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     rows: Int,
     cols: Int,
@@ -55,7 +49,7 @@ fn _gpu_set_identity_kernel[dtype: DType](
         data[tid] = Scalar[dtype](0.0)
 
 
-fn _gpu_scale_kernel[dtype: DType](
+def _gpu_scale_kernel[dtype: DType](
     data: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     scale_buf: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     total_size: Int,
@@ -67,7 +61,7 @@ fn _gpu_scale_kernel[dtype: DType](
     data[tid] = data[tid] * scale_buf[0]
 
 
-fn _gpu_norm_sq_kernel[dtype: DType](
+def _gpu_norm_sq_kernel[dtype: DType](
     data: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     partial_sums: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     total_size: Int,
@@ -77,7 +71,7 @@ fn _gpu_norm_sq_kernel[dtype: DType](
     Each block of 256 threads reduces its portion into a single partial sum.
     The host then sums the (small) partial_sums array.
     """
-    alias BLOCK_SIZE = 256
+    comptime BLOCK_SIZE = 256
     var tid = Int(thread_idx.x)
     var gid = Int(block_dim.x * block_idx.x + thread_idx.x)
     var bid = Int(block_idx.x)
@@ -103,7 +97,7 @@ fn _gpu_norm_sq_kernel[dtype: DType](
         data[gid] = sq  # Overwrite in-place (caller uses a copy)
 
 
-fn _gpu_dot_kernel[dtype: DType](
+def _gpu_dot_kernel[dtype: DType](
     a: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     b: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     dst: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
@@ -120,7 +114,7 @@ fn _gpu_dot_kernel[dtype: DType](
     dst[tid] = a[tid] * b[tid]
 
 
-fn _gpu_axpy_kernel[dtype: DType](
+def _gpu_axpy_kernel[dtype: DType](
     y: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     x: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     alpha_buf: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
@@ -140,7 +134,7 @@ fn _gpu_axpy_kernel[dtype: DType](
 # GPU reduction kernels: sum array on device, copy back only 1 scalar
 # ---------------------------------------------------------------------------
 
-fn _gpu_reduce_block_sum_kernel[dtype: DType](
+def _gpu_reduce_block_sum_kernel[dtype: DType](
     data: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     partial_sums: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     total_size: Int,
@@ -148,7 +142,7 @@ fn _gpu_reduce_block_sum_kernel[dtype: DType](
     """GPU kernel: one thread per block sums its block's elements into partial_sums[block_idx].
     No host-side bulk copy: only partial_sums (num_blocks elements) is used in next stage.
     """
-    alias BLOCK_SIZE = 256
+    comptime BLOCK_SIZE = 256
     var bid = Int(block_idx.x)
     # Only first thread of each block does the reduction
     if thread_idx.x != 0:
@@ -163,7 +157,7 @@ fn _gpu_reduce_block_sum_kernel[dtype: DType](
     partial_sums[bid] = s
 
 
-fn _gpu_reduce_final_kernel[dtype: DType](
+def _gpu_reduce_final_kernel[dtype: DType](
     partial_sums: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     out_single: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     n_blocks: Int,
@@ -179,7 +173,7 @@ fn _gpu_reduce_final_kernel[dtype: DType](
     out_single[0] = s
 
 
-fn _device_reduce_sum_to_scalar[dtype: DType](
+def _device_reduce_sum_to_scalar[dtype: DType](
     ctx: DeviceContext,
     data: DeviceBuffer[dtype],
     total_size: Int,
@@ -211,7 +205,7 @@ fn _device_reduce_sum_to_scalar[dtype: DType](
     return Float64(host_single[0])
 
 
-fn _gpu_strided_copy_2d_kernel[dtype: DType](
+def _gpu_strided_copy_2d_kernel[dtype: DType](
     src: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     dst: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     m: Int,
@@ -230,7 +224,7 @@ fn _gpu_strided_copy_2d_kernel[dtype: DType](
     dst[tid] = src[src_idx]
 
 
-fn _gpu_transpose_kernel[dtype: DType](
+def _gpu_transpose_kernel[dtype: DType](
     src: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     dst: UnsafePointer[Scalar[dtype], origin=MutAnyOrigin],
     meta: UnsafePointer[Scalar[DType.int32], origin=MutAnyOrigin],
@@ -275,27 +269,13 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
     
     Parameters:
         dtype: The data type of the tensor elements (e.g., DType.float32).
-    
-    Example:
-        ```mojo
-        with DeviceContext() as ctx:
-            # Create a 3x4 tensor initialized to zeros
-            var tensor = create_dense_tensor[DType.float32](
-                ctx, List[Int](3, 4)^, init_value=Scalar[DType.float32](0.0)
-            )
-            
-            # Check properties via trait methods
-            print("Shape:", tensor.get_shape())
-            print("Is contiguous:", tensor.is_contiguous())
-            print("Norm:", tensor.compute_norm(ctx))
-        ```
     """
     var storage: DeviceBuffer[dtype]  # GPU storage for tensor data
     var shape: List[Int]  # Runtime shape
     var stride: List[Int]  # Runtime stride
     var size: Int  # Total number of elements
 
-    fn __init__(out self, storage: DeviceBuffer[dtype], var shape: List[Int], var stride: List[Int]):
+    def __init__(out self, storage: DeviceBuffer[dtype], var shape: List[Int], var stride: List[Int]):
         """Initialize a dense tensor with runtime parameters.
         
         Args:
@@ -313,15 +293,12 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
             total_size *= elem
         self.size = total_size
 
-    fn __copyinit__(out self, existing: Self):
+    def __copyinit__(self, existing: Self):
         """Copy constructor for DenseTensor.
         
         Creates a new tensor that shares the same GPU storage but has independent
         shape, stride, and size metadata. This is a shallow copy - the underlying
         GPU buffer is shared between copies.
-        
-        Args:
-            existing: The tensor to copy from.
         """
         self.storage = existing.storage
         self.shape = existing.shape.copy()
@@ -332,7 +309,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
     # TensorOps Trait Implementation
     # =========================================================================
     
-    fn get_shape(self) -> List[Int]:
+    def get_shape(self) -> List[Int]:
         """Get the shape of the tensor (TensorOps trait).
         
         Returns:
@@ -340,7 +317,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return self.shape.copy()
     
-    fn get_stride(self) -> List[Int]:
+    def get_stride(self) -> List[Int]:
         """Get the stride of the tensor (TensorOps trait).
         
         Returns:
@@ -348,7 +325,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return self.stride.copy()
     
-    fn get_size(self) -> Int:
+    def get_size(self) -> Int:
         """Get the total number of elements (TensorOps trait).
         
         Returns:
@@ -356,7 +333,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return self.size
     
-    fn get_rank(self) -> Int:
+    def get_rank(self) -> Int:
         """Get the number of dimensions (TensorOps trait).
         
         Returns:
@@ -364,7 +341,18 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return len(self.shape)
     
-    fn compute_norm(self, ctx: DeviceContext) raises -> Float64:
+    def get_shape_at(self, idx: Int) -> Int:
+        """Get the dimension at a specific index (TensorOps trait).
+        
+        Args:
+            idx: The dimension index (0-based).
+        
+        Returns:
+            The size of dimension idx.
+        """
+        return self.shape[idx]
+    
+    def compute_norm(self, ctx: DeviceContext) raises -> Float64:
         """Compute Frobenius norm (TensorOps trait).
         
         Wrapper around norm() for trait compatibility.
@@ -377,7 +365,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return self.norm(ctx)
     
-    fn compute_norm_sq(self, ctx: DeviceContext) raises -> Float64:
+    def compute_norm_sq(self, ctx: DeviceContext) raises -> Float64:
         """Compute squared Frobenius norm (TensorOps trait).
         
         Wrapper around norm_sq() for trait compatibility.
@@ -390,7 +378,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return self.norm_sq(ctx)
     
-    fn compute_dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
+    def compute_dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
         """Compute inner product <self, other> (TensorOps trait).
         
         Wrapper around dot_product() for trait compatibility.
@@ -404,7 +392,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return self.dot_product(other, ctx)
     
-    fn get_flat_index(self, indices: List[Int]) -> Int:
+    def get_flat_index(self, indices: List[Int]) -> Int:
         """Compute flat index from multi-dimensional indices (TensorOps trait).
         
         Args:
@@ -418,7 +406,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
             flat_idx += indices[i] * self.stride[i]
         return flat_idx
     
-    fn print_contents(self, ctx: DeviceContext) raises -> None:
+    def print_contents(self, ctx: DeviceContext) raises -> None:
         """Print the tensor contents for debugging (TensorOps trait).
         
         Wrapper around print_tensor() for trait compatibility.
@@ -430,7 +418,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
     # =========================================================================
     
     @staticmethod
-    fn backend() -> TensorBackend:
+    def backend() -> TensorBackend:
         """Get the backend type for this tensor implementation.
         
         Returns:
@@ -438,7 +426,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         """
         return TensorBackend(TensorBackend.DENSE)
 
-    fn write_to[W: Writer](self, mut writer: W) -> None:
+    def write_to[W: Writer](self, mut writer: W) -> None:
         """Write tensor information to a writer."""
         var rank = len(self.shape)
         writer.write("DenseTensor[rank=")
@@ -452,7 +440,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         writer.write(self.size)
         writer.write("]")
 
-    fn print_tensor(self, ctx: DeviceContext) raises -> None:
+    def print_tensor(self, ctx: DeviceContext) raises -> None:
         """Print the entire tensor contents (works for any rank)."""
         var host_out = ctx.enqueue_create_host_buffer[Self.dtype](self.size)
         ctx.enqueue_copy(host_out, self.storage)
@@ -486,7 +474,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
             if self.size > 100:
                 print("... (", self.size - 100, " more elements)")
 
-    fn is_contiguous(self) -> Bool:
+    def is_contiguous(self) -> Bool:
         """Check if tensor memory layout is contiguous in row-major order.
         
         A contiguous tensor means elements are stored sequentially in memory without gaps.
@@ -495,26 +483,6 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         Row-major order means the last dimension changes fastest:
         - For shape [3, 4], row-major strides are [4, 1]
         - For shape [2, 3, 4], row-major strides are [12, 4, 1]
-        
-        Args:
-            self: The tensor to check.
-        
-        Returns:
-            True if the tensor is contiguous in row-major order, False otherwise.
-        
-        Example:
-            ```
-            
-            mojo
-            # Contiguous tensor
-            var shape = List[Int](3, 4)
-            var tensor = create_dense_tensor(ctx, shape^)
-            print(tensor.is_contiguous())  # True, strides are [4, 1]
-            
-            # Non-contiguous after slicing or view operations
-            var transposed = tensor^.transpose(List[Int](1, 0), ctx)
-            print(transposed.is_contiguous())  # Might be False
-            
         """
         var expected_stride = 1
         for i in range(len(self.shape) - 1, -1, -1):
@@ -523,7 +491,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
             expected_stride *= self.shape[i]
         return True
 
-    fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> DenseTensor[dtype]:
+    def copy_to_contiguous(var self, ctx: DeviceContext) raises -> DenseTensor[dtype]:
         """Create a contiguous copy of the tensor in row-major order.
         
         If the tensor is already contiguous, transfers ownership without copying.
@@ -572,7 +540,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         ctx.enqueue_copy(new_storage, self.storage)
         return DenseTensor[dtype](new_storage, new_shape^, new_strides^)
 
-    fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DenseTensor[dtype]:
+    def transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> DenseTensor[dtype]:
         """Transpose tensor dimensions according to a permutation.
         
         Reorders the dimensions of the tensor according to the permutation list.
@@ -659,7 +627,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
 
         return DenseTensor[dtype](new_storage, new_shape^, new_strides^)
 
-    fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DenseTensor[dtype]:
+    def flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> DenseTensor[dtype]:
         """Flatten a contiguous range of dimensions into a single dimension.
         
         Combines multiple consecutive dimensions into one by multiplying their sizes.
@@ -726,7 +694,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         # Return a view with updated shape/stride (no data copy)
         return DenseTensor[dtype](self.storage^, new_shape^, new_strides^)
 
-    fn reshape(var self, var new_shape: List[Int]) raises -> DenseTensor[dtype]:
+    def reshape(var self, var new_shape: List[Int]) raises -> DenseTensor[dtype]:
         """Return a tensor view with a different shape but identical storage."""
         if len(new_shape) == 0:
             raise Error("Reshape requires rank >= 1")
@@ -749,7 +717,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         var new_strides = compute_row_major_strides(new_shape, rank)
         return DenseTensor[dtype](self.storage^, new_shape^, new_strides^)
 
-    fn norm(self, ctx: DeviceContext) raises -> Float64:
+    def norm(self, ctx: DeviceContext) raises -> Float64:
         """Compute the Frobenius norm using GPU element-wise square + GPU reduction.
         
         No O(n) device→host copy: reduction is done on GPU, only 1 scalar is copied back.
@@ -773,7 +741,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         var sum_sq = _device_reduce_sum_to_scalar[Self.dtype](ctx, scratch, self.size)
         return sqrt(sum_sq)
 
-    fn norm_sq(self, ctx: DeviceContext) raises -> Float64:
+    def norm_sq(self, ctx: DeviceContext) raises -> Float64:
         """Compute the squared Frobenius norm (no sqrt).
         
         Returns ||self||_F^2 = sum_i |x_i|^2. GPU reduction; only 1 scalar copied to host.
@@ -796,7 +764,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
 
         return _device_reduce_sum_to_scalar[Self.dtype](ctx, scratch, self.size)
 
-    fn scale_in_place(var self, scale: Scalar[dtype], ctx: DeviceContext) raises -> None:
+    def scale_in_place(var self, scale: Scalar[Self.dtype], ctx: DeviceContext) raises -> None:
         """Scale tensor entries by a scalar factor in-place (GPU kernel).
         No synchronize: work is enqueued only; caller syncs when a host value is needed.
         """
@@ -818,7 +786,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
             block_dim=BLOCK_SIZE,
         )
 
-    fn dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
+    def dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
         """Compute inner product <self, other> using GPU element-wise multiply + GPU reduction.
         
         No O(n) device→host: only 1 scalar is copied back after reduction on GPU.
@@ -843,7 +811,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
 
         return _device_reduce_sum_to_scalar[Self.dtype](ctx, scratch, self.size)
 
-    fn axpy_in_place(var self, alpha: Scalar[dtype], x: Self, ctx: DeviceContext) raises -> None:
+    def axpy_in_place(var self, alpha: Scalar[Self.dtype], x: Self, ctx: DeviceContext) raises -> None:
         """self += alpha * x   (BLAS-style axpy, GPU kernel).
         No synchronize: work is enqueued only; caller syncs when a host value is needed.
         """
@@ -869,7 +837,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
         )
 
     @staticmethod
-    fn random(
+    def random(
         ctx: DeviceContext,
         var shape: List[Int],
         row_major: Bool = True
@@ -879,7 +847,7 @@ struct DenseTensor[dtype: DType](Writable, Movable, ImplicitlyCopyable, TensorOp
 
 
 
-fn compute_row_major_strides(shape: List[Int], rank: Int) -> List[Int]:
+def compute_row_major_strides(shape: List[Int], rank: Int) -> List[Int]:
     """Compute row-major strides for given shape.
     
     Row-major means the last dimension changes fastest.
@@ -903,7 +871,7 @@ fn compute_row_major_strides(shape: List[Int], rank: Int) -> List[Int]:
     return strides.copy()
 
 
-fn compute_column_major_strides(shape: List[Int], rank: Int) -> List[Int]:
+def compute_column_major_strides(shape: List[Int], rank: Int) -> List[Int]:
     """Compute column-major strides for given shape.
     
     Column-major means the first dimension changes fastest.
@@ -927,7 +895,7 @@ fn compute_column_major_strides(shape: List[Int], rank: Int) -> List[Int]:
     return strides.copy()
 
 
-fn create_dense_tensor[dtype: DType = DType.float32](
+def create_dense_tensor[dtype: DType = DType.float32](
     ctx: DeviceContext, 
     var shape: List[Int], 
     row_major: Bool = True,
@@ -986,7 +954,7 @@ fn create_dense_tensor[dtype: DType = DType.float32](
     return DenseTensor[dtype](device_storage, shape^, strides^)
 
 
-fn create_dense_tensor_uninitialized[dtype: DType = DType.float32](
+def create_dense_tensor_uninitialized[dtype: DType = DType.float32](
     ctx: DeviceContext,
     var shape: List[Int],
     row_major: Bool = True,
@@ -1023,7 +991,7 @@ fn create_dense_tensor_uninitialized[dtype: DType = DType.float32](
     return DenseTensor[dtype](device_storage, shape^, strides^)
 
 
-fn create_dense_tensor_from_data[dtype: DType = DType.float32](
+def create_dense_tensor_from_data[dtype: DType = DType.float32](
     ctx: DeviceContext, 
     data: List[Scalar[dtype]],
     var shape: List[Int], 
@@ -1075,7 +1043,7 @@ fn create_dense_tensor_from_data[dtype: DType = DType.float32](
     
     return DenseTensor[dtype](device_storage, shape^, strides^)
 
-fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: DenseTensor[dtype], var B: DenseTensor[dtype], ctx: DeviceContext, ndim_mult: Int = 1, axrange_A: Bool = False, axrange_B: Bool = False) raises:  # axrange False=trailing, True=leading
+def dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: DenseTensor[dtype], var B: DenseTensor[dtype], ctx: DeviceContext, ndim_mult: Int = 1, axrange_A: Bool = False, axrange_B: Bool = False) raises:  # axrange False=trailing, True=leading
     """Perform generalized tensor dot product (contraction) on GPU.
     
     This function implements Einstein summation-style tensor contraction by:
@@ -1445,7 +1413,7 @@ fn dense_tensor_dot[dtype: DType = DType.float32](C: DenseTensor[dtype], var A: 
     # Grid: 2D (ceildiv(n, tile), ceildiv(m, tile)); Blocks: 2D (tile, tile) threads; Warps: tile/32 per dim, load tiles to shared, accumulate; Threads: each owns C element, loops over k/tilesize.
     # Tile typically 16/32 for float32.
     
-fn dense_tensor_qr[dtype: DType = DType.float32](
+def dense_tensor_qr[dtype: DType = DType.float32](
         var tensor: DenseTensor[dtype],
         ctx: DeviceContext
     ) raises -> Tuple[DenseTensor[dtype], DenseTensor[dtype]]:
@@ -1558,7 +1526,7 @@ fn dense_tensor_qr[dtype: DType = DType.float32](
 
     return (Q, R)
 
-fn ensure_contiguous_2d[dtype: DType](
+def ensure_contiguous_2d[dtype: DType](
     var tensor: DenseTensor[dtype], 
     ctx: DeviceContext
 ) raises -> DenseTensor[dtype]:
@@ -1595,7 +1563,7 @@ fn ensure_contiguous_2d[dtype: DType](
     
     return contiguous^
 
-fn dense_tensor_svd_trunc_lapack_f64[dtype: DType](
+def dense_tensor_svd_trunc_lapack_f64[dtype: DType](
     var tensor: DenseTensor[dtype],
     ctx: DeviceContext,
     chi_max: Int,
@@ -1707,7 +1675,7 @@ fn dense_tensor_svd_trunc_lapack_f64[dtype: DType](
     return (U_out^, S_out^, Vt_out^, chi_kept)
 
 
-fn dense_tensor_svd_trunc[dtype: DType](
+def dense_tensor_svd_trunc[dtype: DType](
     var tensor: DenseTensor[dtype],
     ctx: DeviceContext,
     chi_max: Int,

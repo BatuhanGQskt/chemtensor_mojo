@@ -1,6 +1,7 @@
 from collections.list import List
 from math import sqrt
 from gpu.host import DeviceContext
+from src.m_tensor.tensor_traits import TensorOps
 from src.m_tensor.dense_tensor import (
     DenseTensor,
     create_dense_tensor,
@@ -8,68 +9,159 @@ from src.m_tensor.dense_tensor import (
     dense_tensor_qr,
     dense_tensor_dot,
 )
+from src.m_tensor.block_sparse_tensor import (
+    BlockSparseTensor,
+    QNumber,
+    block_sparse_to_dense,
+    create_block_sparse_tensor,
+)
+from src.m_tensor.tensor_ops import (
+    tensor_qr,
+    tensor_dot,
+    tensor_reshape,
+    tensor_transpose,
+    tensor_norm,
+    tensor_scale_in_place,
+    create_tensor,
+    create_tensor_from_data,
+)
 
 
-@fieldwise_init
-struct MPSSite[dtype: DType](Writable, Movable, ImplicitlyCopyable):
+# =============================================================================
+# Helper: Convert DenseTensor to trivial BlockSparseTensor
+# =============================================================================
+# TODO: make this more optimized to figuring out the sparsity pattern instead of just using all-zero quantum numbers.
+fn _dense_to_trivial_block_sparse[dtype: DType](
+    var t: DenseTensor[dtype], ctx: DeviceContext
+) raises -> BlockSparseTensor[dtype]:
+    """Convert DenseTensor to BlockSparseTensor with trivial (all-zero) quantum numbers."""
+    var sh = t.shape.copy()
+    var ndim = len(sh)
+    var qnums_per_leg = List[List[QNumber]](capacity=ndim)
+    for i in range(ndim):
+        var leg = List[QNumber](capacity=sh[i])
+        for _ in range(sh[i]):
+            leg.append(QNumber(0))
+        qnums_per_leg.append(leg^)
+    var out = create_block_sparse_tensor[dtype](ctx, sh^, qnums_per_leg^, init_value=Scalar[dtype](0.0))
+    # Copy data from dense to block-sparse
+    var host_t = ctx.enqueue_create_host_buffer[dtype](t.size)
+    ctx.enqueue_copy(host_t, t.storage)
+    ctx.synchronize()
+    # For trivial qnums, there's only one block with all the data
+    var blk = out.blocks_flat[0]
+    ctx.enqueue_copy(blk.storage, host_t)
+    ctx.synchronize()
+    return out^
+
+
+# =============================================================================
+# Convenience Type Aliases for Common Tensor Backends
+# =============================================================================
+
+alias DenseMPSSite = MPSSite[DType.float32, DenseTensor[DType.float32]]
+"""Dense MPS site with float32 data type."""
+
+alias DenseMPS = MatrixProductState[DType.float32, DenseTensor[DType.float32]]
+"""Dense MPS with float32 data type."""
+
+alias BlockSparseMPSSite = MPSSite[DType.float32, BlockSparseTensor[DType.float32]]
+"""Block-sparse MPS site with float32 data type."""
+
+alias BlockSparseMPS = MatrixProductState[DType.float32, BlockSparseTensor[DType.float32]]
+"""Block-sparse MPS with float32 data type."""
+
+
+struct MPSSite[dtype: DType, T: TensorOps](Writable, Movable, ImplicitlyCopyable):
     """Single site tensor inside an MPS.
 
-    Each site is stored as a rank-3 DenseTensor with layout
+    Each site is stored as a rank-3 tensor with layout
     [left_bond, physical, right_bond].
+    
+    The tensor type T must implement the TensorOps trait (plus Movable and Copyable),
+    allowing both DenseTensor and BlockSparseTensor to be used.
+    
+    Parameters:
+        dtype: The data type of tensor elements.
+        T: The tensor type (must implement TensorOps, Movable, Copyable).
     """
-    var tensor: DenseTensor[dtype]
+    var tensor: T
+
+    fn __init__(out self, var tensor: T):
+        """Initialize an MPS site with a tensor."""
+        self.tensor = tensor^
+
+    fn __copyinit__(out self, other: Self):
+        """Copy an MPS site."""
+        self.tensor = other.tensor.copy()
+    
+    fn __moveinit__(out self, deinit other: Self):
+        """Move an MPS site."""
+        self.tensor = other.tensor^
 
     fn rank(self) -> Int:
-        return len(self.tensor.shape)
+        """Get the rank (number of dimensions) of the site tensor."""
+        return self.tensor.get_rank()
 
     fn shape(self) -> List[Int]:
-        return self.tensor.shape.copy()
+        """Get the shape of the site tensor."""
+        return self.tensor.get_shape()
 
     fn physical_dim(self) raises -> Int:
+        """Get the physical dimension (middle index of rank-3 tensor)."""
         self._assert_rank3()
-        return self.tensor.shape[1]
+        return self.tensor.get_shape_at(1)
 
     fn left_bond_dim(self) raises -> Int:
+        """Get the left bond dimension (first index of rank-3 tensor)."""
         self._assert_rank3()
-        return self.tensor.shape[0]
+        return self.tensor.get_shape_at(0)
 
     fn right_bond_dim(self) raises -> Int:
+        """Get the right bond dimension (last index of rank-3 tensor)."""
         self._assert_rank3()
-        return self.tensor.shape[2]
+        return self.tensor.get_shape_at(2)
 
     fn _assert_rank3(self) raises -> None:
-        var rank = len(self.tensor.shape)
-        if rank != 3:
+        """Validate that the tensor has rank 3."""
+        var r = self.tensor.get_rank()
+        if r != 3:
             raise Error(
                 "MPSSite expects rank-3 tensors [bond_left, physical, bond_right], got rank "
-                + String(rank)
+                + String(r)
             )
 
     fn write_to[W: Writer](self, mut writer: W) -> None:
-        self.tensor.write_to(writer)
+        """Write tensor info to a writer (for Writable trait)."""
+        var s = self.tensor.get_shape()
+        writer.write("MPSSite[")
+        for i in range(len(s)):
+            if i > 0:
+                writer.write(", ")
+            writer.write(s[i])
+        writer.write("]")
 
 
-struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
-    """Matrix Product State built on top of DenseTensor.
+struct MatrixProductState[dtype: DType, T: TensorOps](Writable, Movable, ImplicitlyCopyable):
+    """Matrix Product State generic over tensor type.
 
-    Typical usage:
-        ```mojo
-        with DeviceContext() as ctx:
-            var basis = List[Int](0, 1, 0)
-            var psi = create_product_mps(ctx, 2, basis^)
-            psi.describe()  # Prints bond dims and site shapes
-        ```
+    This MPS implementation works with any tensor type T that implements the
+    TensorOps trait, allowing both DenseTensor and BlockSparseTensor backends.
+    
+    Parameters:
+        dtype: The data type of tensor elements.
+        T: The tensor type (must implement TensorOps).
     """
-    var sites: List[MPSSite[dtype]]
+    var sites: List[MPSSite[dtype, T]]
     var physical_dim: Int
     var length: Int
     var bond_dims: List[Int]
 
-    fn __init__(out self, var sites: List[MPSSite[dtype]]) raises:
+    fn __init__(out self, var sites: List[MPSSite[dtype, T]]) raises:
         if len(sites) == 0:
             raise Error("MatrixProductState requires at least one site tensor")
 
-        var first_site: MPSSite[dtype] = sites[0]
+        var first_site: MPSSite[dtype, T] = sites[0]
         var phys_dim = first_site.physical_dim()
         var bonds: List[Int] = List[Int](capacity=len(sites))
         bonds.append(first_site.left_bond_dim())
@@ -166,56 +258,6 @@ struct MatrixProductState[dtype: DType](Writable, Movable, ImplicitlyCopyable):
             writer.write(")")
         writer.write("])")
 
-    # TODO: Review this function
-    fn left_canonicalize(inout self, ctx: DeviceContext) raises:
-        """Bring the MPS to left-canonical form using QR decomposition.
-        
-        Sweeps from left to right, orthogonalizing each site and absorbing the R factor to the next.
-        Assumes DenseTensor has qr() -> (Q, R), reshape, contract, and norm methods.
-        """
-        var ortho_center = 0
-        while ortho_center < self.length - 1:
-            var site = self.sites[ortho_center]
-            var left_dim = site.left_bond_dim()
-            var phys_dim = site.physical_dim()
-            var right_dim = site.right_bond_dim()
-            
-            # Reshape to matrix: [left * phys, right]
-            var mat = site.tensor.reshape(List[Int](left_dim * phys_dim, right_dim))
-            
-            # QR decomposition
-            var qr_result = dense_tensor_qr[dtype](mat^, ctx)
-            var Q = qr_result[0]
-            var R = qr_result[1]
-            
-            # Normalize Q if needed (optional, but ensures unit norm)
-            var q_norm = Q.norm(ctx)
-            if q_norm > 0:
-                Q.scale_in_place(Scalar[dtype](1.0 / q_norm), ctx)  # Normalize columns
-            
-            # Reshape Q back to [left, phys, right] (right dim from Q cols)
-            var new_right_dim = Q.shape[1]  # May truncate if QR does
-            self.sites[ortho_center].tensor = Q.reshape(List[Int](left_dim, phys_dim, new_right_dim))
-            self.bond_dims[ortho_center + 1] = new_right_dim  # Update bond dim
-            
-            # Absorb R into next site: next_tensor = R @ next_tensor (contract on right_dim)
-            var next_site = self.sites[ortho_center + 1]
-            # Assume contract(axes: List[Tuple[Int, Int]]) or similar; here, R (old_right, new_right) @ next (old_left=old_right, phys, right)
-            next_site.tensor = R.contract(next_site.tensor, List[Tuple[Int, Int]]((1, 0)))  # Contract R.col with next.left
-            
-            # Update next left bond dim
-            self.bond_dims[ortho_center + 1] = new_right_dim  # Already done above
-            self.sites[ortho_center + 1] = next_site  # If needed, but since inout self, direct assign ok
-            
-            ortho_center += 1
-        
-        # Final norm absorption (scale last site)
-        var last_site = self.sites[self.length - 1]
-        var last_norm = last_site.tensor.norm(ctx)
-        if last_norm > 0:
-            last_site.tensor.scale_in_place(Scalar[dtype](1.0 / last_norm), ctx)
-        self.sites[self.length - 1] = last_site
-
 
 fn create_uniform_mps[dtype: DType = DType.float32](
     ctx: DeviceContext,
@@ -223,8 +265,8 @@ fn create_uniform_mps[dtype: DType = DType.float32](
     physical_dim: Int,
     bond_dims: List[Int],
     init_value: Optional[Scalar[dtype]] = None,
-) raises -> MatrixProductState[dtype]:
-    """Allocate an MPS with constant entries in every site tensor."""
+) raises -> MatrixProductState[dtype, DenseTensor[dtype]]:
+    """Allocate a DenseTensor-based MPS with constant entries in every site tensor."""
     if num_sites < 1:
         raise Error("num_sites must be >= 1")
     if physical_dim < 1:
@@ -232,7 +274,7 @@ fn create_uniform_mps[dtype: DType = DType.float32](
     if len(bond_dims) != num_sites + 1:
         raise Error("bond_dims must have length num_sites + 1")
 
-    var sites = List[MPSSite[dtype]](capacity=num_sites)
+    var sites = List[MPSSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     for i in range(num_sites):
         var left_dim = bond_dims[i]
         var right_dim = bond_dims[i + 1]
@@ -243,7 +285,6 @@ fn create_uniform_mps[dtype: DType = DType.float32](
         var site_tensor: DenseTensor[dtype]
         if init_value is None:
             site_tensor = DenseTensor[dtype].random(ctx, shape^)
-            # Scale by 1/sqrt(nelem) per site to match C construct_random_mps (keeps norms/overlaps O(1))
             var nelem = left_dim * physical_dim * right_dim
             var scale_val = 1.0 / sqrt(Float64(nelem))
             site_tensor.scale_in_place(Scalar[dtype](scale_val), ctx)
@@ -251,15 +292,15 @@ fn create_uniform_mps[dtype: DType = DType.float32](
             site_tensor = create_dense_tensor[dtype](
                 ctx, shape^, row_major=True, init_value=init_value.value()
             )
-        sites.append(MPSSite[dtype](site_tensor^))
-    return MatrixProductState[dtype](sites^)
+        sites.append(MPSSite[dtype, DenseTensor[dtype]](site_tensor^))
+    return MatrixProductState[dtype, DenseTensor[dtype]](sites^)
 
 
 fn create_product_mps[dtype: DType = DType.float32](
     ctx: DeviceContext,
     physical_dim: Int,
     basis: List[Int],
-) raises -> MatrixProductState[dtype]:
+) raises -> MatrixProductState[dtype, DenseTensor[dtype]]:
     """Create a product-state MPS from a list of local basis choices.
 
     Args:
@@ -268,7 +309,7 @@ fn create_product_mps[dtype: DType = DType.float32](
         basis: List of integers (length = num_sites) specifying |basis[i]> at each site.
 
     Returns:
-        MatrixProductState where all internal bonds are 1 (unentangled).
+        DenseTensor-based MatrixProductState where all internal bonds are 1 (unentangled).
     """
     var num_sites = len(basis)
     if num_sites < 1:
@@ -276,7 +317,7 @@ fn create_product_mps[dtype: DType = DType.float32](
     if physical_dim < 1:
         raise Error("physical_dim must be >= 1")
 
-    var sites = List[MPSSite[dtype]](capacity=num_sites)
+    var sites = List[MPSSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     for i in range(num_sites):
         var choice = basis[i]
         if choice < 0 or choice >= physical_dim:
@@ -299,15 +340,15 @@ fn create_product_mps[dtype: DType = DType.float32](
                 data.append(Scalar[dtype](0.0))
 
         var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
-        sites.append(MPSSite[dtype](site_tensor^))
+        sites.append(MPSSite[dtype, DenseTensor[dtype]](site_tensor^))
 
-    return MatrixProductState[dtype](sites^)
+    return MatrixProductState[dtype, DenseTensor[dtype]](sites^)
 
 
 fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
     ctx: DeviceContext,
     var block: DenseTensor[dtype],
-) raises -> Tuple[MPSSite[dtype], DenseTensor[dtype]]:
+) raises -> Tuple[MPSSite[dtype, DenseTensor[dtype]], DenseTensor[dtype]]:
     """Left-orthonormalize a single site tensor and absorb R into the remainder.
 
     Mirrors the behavior of `mps_local_orthonormalize_qr` in the reference
@@ -374,7 +415,7 @@ fn mps_local_orthonormalize_qr[dtype: DType = DType.float32](
 
     var site_shape = List[Int](left_dim, phys_dim, reduced_cols)
     var site_tensor = reduced_Q.reshape(site_shape^)
-    var site = MPSSite[dtype](site_tensor^)
+    var site = MPSSite[dtype, DenseTensor[dtype]](site_tensor^)
 
     var next_shape = List[Int](capacity=len(tail_shape) + 1)
     next_shape.append(reduced_cols)
@@ -389,7 +430,7 @@ fn mps_local_orthonormalize_qr_pair[dtype: DType = DType.float32](
     ctx: DeviceContext,
     var A_i: DenseTensor[dtype],
     var A_ip1: DenseTensor[dtype],
-) raises -> Tuple[MPSSite[dtype], MPSSite[dtype]]:
+) raises -> Tuple[MPSSite[dtype, DenseTensor[dtype]], MPSSite[dtype, DenseTensor[dtype]]]:
     """Left-orthonormalize site i and absorb R into site i+1 (C `mps_local_orthonormalize_qr`)."""
     var shape_i = A_i.shape.copy()
     var Dl = shape_i[0]
@@ -438,14 +479,14 @@ fn mps_local_orthonormalize_qr_pair[dtype: DType = DType.float32](
     dense_tensor_dot(A_ip1_new_mat, R_red^, A_ip1_mat^, ctx)
     var A_ip1_new = A_ip1_new_mat^.reshape(List[Int](reduced_cols, d_ip1, Dr))
 
-    return (MPSSite[dtype](A_i_new^), MPSSite[dtype](A_ip1_new^))
+    return (MPSSite[dtype, DenseTensor[dtype]](A_i_new^), MPSSite[dtype, DenseTensor[dtype]](A_ip1_new^))
 
 
 fn mps_local_orthonormalize_rq_pair[dtype: DType = DType.float32](
     ctx: DeviceContext,
     var A_i: DenseTensor[dtype],
     var A_im1: DenseTensor[dtype],
-) raises -> Tuple[MPSSite[dtype], MPSSite[dtype]]:
+) raises -> Tuple[MPSSite[dtype, DenseTensor[dtype]], MPSSite[dtype, DenseTensor[dtype]]]:
     """Right-orthonormalize site i and absorb R into site i-1 (C `mps_local_orthonormalize_rq`)."""
     var shape_i = A_i.shape.copy()
     var Dl = shape_i[0]
@@ -489,17 +530,18 @@ fn mps_local_orthonormalize_rq_pair[dtype: DType = DType.float32](
     dense_tensor_dot(A_im1_new_mat, A_im1_mat^, R_out^, ctx)
     var A_im1_new = A_im1_new_mat^.reshape(List[Int](Dl_prev, d_prev, k))
 
-    return (MPSSite[dtype](A_i_new^), MPSSite[dtype](A_im1_new^))
+    return (MPSSite[dtype, DenseTensor[dtype]](A_i_new^), MPSSite[dtype, DenseTensor[dtype]](A_im1_new^))
 
 
 fn mps_orthonormalize_right[dtype: DType = DType.float32](
     ctx: DeviceContext,
-    mut mps: MatrixProductState[dtype],
+    mut mps: MatrixProductState[dtype, DenseTensor[dtype]],
 ) raises:
-    """Right-canonicalize MPS (C `mps_orthonormalize_qr(..., MPS_ORTHONORMAL_RIGHT)`)."""
+    """Right-canonicalize MPS."""
     var N = mps.num_sites()
     if N < 1:
         return
+    
     if N == 1:
         var Dl0 = mps.sites[0].left_bond_dim()
         var tail_elems = Dl0 * Dl0
@@ -512,7 +554,7 @@ fn mps_orthonormalize_right[dtype: DType = DType.float32](
             ctx, tail_data^, List[Int](Dl0, 1, Dl0)
         )
         var ortho0 = mps_local_orthonormalize_rq_pair[dtype](
-            ctx, mps.sites[0].tensor, tail
+            ctx, mps.sites[0].tensor, tail^
         )
         mps.sites[0] = ortho0[0]
         return
@@ -536,7 +578,7 @@ fn mps_orthonormalize_right[dtype: DType = DType.float32](
         ctx, tail_data^, List[Int](Dl0, 1, Dl0)
     )
     var ortho0 = mps_local_orthonormalize_rq_pair[dtype](
-        ctx, mps.sites[0].tensor, tail
+        ctx, mps.sites[0].tensor, tail^
     )
     mps.sites[0] = ortho0[0]
 
@@ -544,7 +586,7 @@ fn mps_orthonormalize_right[dtype: DType = DType.float32](
 fn mps_orthogonalize_qr[dtype: DType = DType.float32](
     ctx: DeviceContext,
     var full_state: DenseTensor[dtype],
-) raises -> MatrixProductState[dtype]:
+) raises -> MatrixProductState[dtype, DenseTensor[dtype]]:
     """Decompose a dense rank-N tensor into an MPS via successive QR sweeps.
     
     We iteratively reshape the remaining tensor into a matrix, run a QR, keep the Q
@@ -553,6 +595,7 @@ fn mps_orthogonalize_qr[dtype: DType = DType.float32](
     TODO: We can add RQ sweeps to implement the right-canonicalization.
     
     Args:
+        ctx: GPU device context.
         full_state: Dense tensor of shape [d, d, ..., d] (rank = num_sites).
                     All physical dimensions must be identical because the current
                     MatrixProductState assumes uniform local Hilbert spaces.
@@ -577,7 +620,7 @@ fn mps_orthogonalize_qr[dtype: DType = DType.float32](
                 + String(dims[idx])
             )
 
-    var sites = List[MPSSite[dtype]](capacity=num_sites)
+    var sites = List[MPSSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
 
     var augmented_shape = List[Int](capacity=num_sites + 1)
     augmented_shape.append(1)
@@ -602,13 +645,13 @@ fn mps_orthogonalize_qr[dtype: DType = DType.float32](
     var final_norm = final_site.norm(ctx)
     if final_norm > 0:
         final_site.scale_in_place(Scalar[dtype](1.0 / final_norm), ctx)
-    sites.append(MPSSite[dtype](final_site^))
+    sites.append(MPSSite[dtype, DenseTensor[dtype]](final_site^))
 
-    return MatrixProductState[dtype](sites^)
+    return MatrixProductState[dtype, DenseTensor[dtype]](sites^)
 
 
 fn mps_to_statevector[dtype: DType = DType.float32](
-    psi: MatrixProductState[dtype],
+    psi: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> DenseTensor[dtype]:
     """Contract MPS to full state vector (size d^L) in row-major physical index order.
@@ -621,30 +664,32 @@ fn mps_to_statevector[dtype: DType = DType.float32](
     var L = psi.num_sites()
     if L == 0:
         raise Error("mps_to_statevector requires at least one site")
-    # First site: [1, d, D1] -> [d, D1]
+    
     var result = psi.sites[0].tensor
-    var left_dim = result.shape[0] * result.shape[1]
-    var right_dim = result.shape[2]
+    var shape0 = result.shape.copy()
+    var left_dim = shape0[0] * shape0[1]
+    var right_dim = shape0[2]
     result = result^.reshape(List[Int](left_dim, right_dim))
+    
     for i in range(1, L):
         var site = psi.sites[i].tensor
-        var D_i = site.shape[0]
-        var d_i = site.shape[1]
-        var D_next = site.shape[2]
+        var site_shape = site.shape.copy()
+        var D_i = site_shape[0]
+        var d_i = site_shape[1]
+        var D_next = site_shape[2]
         if right_dim != D_i:
             raise Error("Bond dimension mismatch in mps_to_statevector")
         var site_flat = site.reshape(List[Int](D_i, d_i * D_next))
-        # Matmul result (left_dim, right_dim) @ (D_i, d_i*D_next) has shape (left_dim, d_i*D_next)
         var dot_rows = left_dim
         var dot_cols = d_i * D_next
         var result_new = create_dense_tensor[dtype](
             ctx, List[Int](dot_rows, dot_cols), row_major=True, init_value=Scalar[dtype](0.0)
         )
         dense_tensor_dot(result_new, result^, site_flat^, ctx)
-        # Reshape to (left_dim*d_i, D_next) for next iteration
         result = result_new^.reshape(List[Int](left_dim * d_i, D_next))
         left_dim = left_dim * d_i
         right_dim = D_next
+    
     if right_dim != 1:
         raise Error("Expected trailing bond dimension 1 in mps_to_statevector")
     var total = left_dim
@@ -652,13 +697,13 @@ fn mps_to_statevector[dtype: DType = DType.float32](
 
 
 fn mps_norm[dtype: DType = DType.float32](
-    psi: MatrixProductState[dtype],
+    psi: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute Euclidean norm of the MPS (sqrt of inner product with itself).
 
     Implemented by contracting to state vector then computing norm, so only
-    suitable for small systems. Tolerates small numerical error (implementation-agnostic).
+    suitable for small systems.
     """
     var vec = mps_to_statevector[dtype](psi, ctx)
     return vec.norm(ctx)

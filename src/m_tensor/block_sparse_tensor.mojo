@@ -1,18 +1,3 @@
-"""Block sparse tensor: ChemTensor-compatible layout (additive quantum numbers).
-
-Mirrors ``struct block_sparse_tensor`` / ``allocate_block_sparse_tensor`` in
-``chemtensor/src/tensor/block_sparse_tensor.c``: logical dimensions, per-axis
-sector quantum numbers, axis directions, and a dense ``DenseTensor`` per
-conserved sector (flat index in ``dim_blocks[0] × … × dim_blocks[ndim-1]``).
-
-Use :func:`allocate_block_sparse_for_tensor_dot` to build a pre-allocated ``C``
-matching :func:`dense_tensor_dot` / C ``block_sparse_tensor_dot`` conventions,
-then call :func:`block_sparse_tensor_dot`.
-"""
-
-from collections.list import List
-from math import sqrt
-from gpu.host import DeviceContext
 from src.m_tensor.tensor_traits import TensorOps, TensorBackend
 from src.m_tensor.dense_tensor import (
     DenseTensor,
@@ -20,6 +5,7 @@ from src.m_tensor.dense_tensor import (
     create_dense_tensor_uninitialized,
     compute_row_major_strides,
     dense_tensor_dot,
+    dense_tensor_qr,
     dense_tensor_svd_trunc,
 )
 
@@ -29,46 +15,49 @@ from src.m_tensor.dense_tensor import (
 # =============================================================================
 
 
-@value
-struct QNumber:
+@fieldwise_init
+struct QNumber(Copyable, Movable, ImplicitlyCopyable):
     """Conserved quantum number label (maps to C ``qnumber`` / int)."""
 
     var value: Int
 
-    fn __init__(out self, value: Int = 0):
-        self.value = value
-
-    fn __eq__(self, other: Self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
         return self.value == other.value
 
-    fn __add__(self, other: Self) -> Self:
+    def __add__(self, other: Self) -> Self:
         return QNumber(self.value + other.value)
 
-    fn __neg__(self) -> Self:
+    def __neg__(self) -> Self:
         return QNumber(-self.value)
 
 
-@value
-struct BlockIndex:
+struct BlockIndex(Copyable, Movable):
     """Sector quantum numbers: one conserved label per tensor leg (like C ``get_block``)."""
 
     var qnums: List[QNumber]
 
-    fn __init__(out self, var qnums: List[QNumber]):
+    def __init__(out self, var qnums: List[QNumber]):
         self.qnums = qnums^
 
-    fn rank(self) -> Int:
+    def __copyinit__(out self, existing: Self):
+        self.qnums = List[QNumber]()
+        for q in existing.qnums:
+            self.qnums.append(q)
+
+    def __moveinit__(out self, deinit existing: Self):
+        self.qnums = existing.qnums^
+
+    def rank(self) -> Int:
         return len(self.qnums)
 
 
-@value
-struct Block[dtype: DType]:
+struct Block[dtype: DType](Movable):
     """One dense sector block and its sector ``BlockIndex``."""
 
     var index: BlockIndex
     var data: DenseTensor[dtype]
 
-    fn __init__(out self, index: BlockIndex, data: DenseTensor[dtype]):
+    def __init__(out self, index: BlockIndex, data: DenseTensor[dtype]):
         self.index = index
         self.data = data
 
@@ -78,14 +67,14 @@ struct Block[dtype: DType]:
 # =============================================================================
 
 
-fn _dim_product(dims: List[Int]) -> Int:
+def _dim_product(dims: List[Int]) -> Int:
     var p = 1
     for i in range(len(dims)):
         p *= dims[i]
     return p
 
 
-fn _tensor_index_to_offset(ndim: Int, dims: List[Int], idx: List[Int]) -> Int:
+def _tensor_index_to_offset(ndim: Int, dims: List[Int], idx: List[Int]) -> Int:
     var offset = 0
     var fac = 1
     for i in range(ndim - 1, -1, -1):
@@ -94,14 +83,14 @@ fn _tensor_index_to_offset(ndim: Int, dims: List[Int], idx: List[Int]) -> Int:
     return offset
 
 
-fn _offset_to_tensor_index(offset: Int, ndim: Int, dims: List[Int], mut idx: List[Int]) -> None:
+def _offset_to_tensor_index(offset: Int, ndim: Int, dims: List[Int], mut idx: List[Int]) -> None:
     var n = offset
     for i in range(ndim - 1, -1, -1):
         idx[i] = n % dims[i]
         n = n // dims[i]
 
 
-fn _next_tensor_index(ndim: Int, dims: List[Int], mut idx: List[Int]) -> Bool:
+def _next_tensor_index(ndim: Int, dims: List[Int], mut idx: List[Int]) -> Bool:
     """Lexicographic next; returns False when past end."""
     for i in range(ndim - 1, -1, -1):
         idx[i] += 1
@@ -111,14 +100,14 @@ fn _next_tensor_index(ndim: Int, dims: List[Int], mut idx: List[Int]) -> Bool:
     return False
 
 
-fn _leg_to_ints(var leg: List[QNumber]) -> List[Int]:
+def _leg_to_ints(var leg: List[QNumber]) -> List[Int]:
     var out = List[Int](capacity=len(leg))
     for q in leg:
         out.append(q.value)
     return out^
 
 
-fn _sort_sector_pairs(inout qnums: List[Int], inout counts: List[Int]) -> None:
+def _sort_sector_pairs(mut qnums: List[Int], mut counts: List[Int]) -> None:
     """Sort ``qnums`` ascending; permute ``counts`` the same way (insertion sort)."""
     var n = len(qnums)
     for i in range(1, n):
@@ -133,13 +122,13 @@ fn _sort_sector_pairs(inout qnums: List[Int], inout counts: List[Int]) -> None:
         counts[j + 1] = ck
 
 
-@value
+@fieldwise_init
 struct _SectorLists:
     var qnums: List[Int]
     var counts: List[Int]
 
 
-fn _collect_sectors(leg: List[Int]) raises -> _SectorLists:
+def _collect_sectors(leg: List[Int]) raises -> _SectorLists:
     """Distinct quantum numbers on one leg with multiplicities, sorted by qnum."""
     var uniq = List[Int]()
     var counts = List[Int]()
@@ -158,7 +147,7 @@ fn _collect_sectors(leg: List[Int]) raises -> _SectorLists:
     return _SectorLists(uniq^, counts^)
 
 
-fn _qnums_lists_from_per_leg(var per_leg: List[List[QNumber]]) raises -> List[List[Int]]:
+def _qnums_lists_from_per_leg(var per_leg: List[List[QNumber]]) raises -> List[List[Int]]:
     var out = List[List[Int]](capacity=len(per_leg))
     for leg in per_leg:
         var ints = List[Int](capacity=len(leg))
@@ -168,19 +157,24 @@ fn _qnums_lists_from_per_leg(var per_leg: List[List[QNumber]]) raises -> List[Li
     return out^
 
 
-fn _deep_copy_int_matrix(src: List[List[Int]]) -> List[List[Int]]:
+def _deep_copy_int_matrix(src: List[List[Int]]) -> List[List[Int]]:
     var out = List[List[Int]](capacity=len(src))
     for i in range(len(src)):
         out.append(src[i].copy())
     return out^
 
 
+def _dense_block_for_dot[dtype: DType](block: DenseTensor[dtype], ctx: DeviceContext) raises -> DenseTensor[dtype]:
+    """Deep copy a block so ``dense_tensor_dot`` can take ownership without aliasing ``blocks_flat``."""
+    return block.copy_to_contiguous(ctx)
+
+
 # =============================================================================
 # BlockSparseTensor
 # =============================================================================
 
-
-struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
+@fieldwise_init
+struct BlockSparseTensor[dtype: DType](Writable, Movable, Copyable, ImplicitlyCopyable, TensorOps):
     """ChemTensor-style block-sparse tensor with GPU ``DenseTensor`` blocks."""
 
     var ndim: Int
@@ -197,37 +191,7 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
     var blocks_flat: List[DenseTensor[dtype]]
     var _dummy_scalar: DenseTensor[dtype]
 
-    fn __init__(
-        out self,
-        ndim: Int,
-        var dim_logical: List[Int],
-        var dim_blocks: List[Int],
-        var axis_dir: List[Int],
-        var qnums_logical: List[List[Int]],
-        var qnums_blocks: List[List[Int]],
-        var sector_counts: List[List[Int]],
-        var stride_logical: List[Int],
-        logical_size: Int,
-        nblocks_total: Int,
-        var block_present: List[Bool],
-        var blocks_flat: List[DenseTensor[dtype]],
-        dummy: DenseTensor[dtype],
-    ):
-        self.ndim = ndim
-        self.dim_logical = dim_logical^
-        self.dim_blocks = dim_blocks^
-        self.axis_dir = axis_dir^
-        self.qnums_logical = qnums_logical^
-        self.qnums_blocks = qnums_blocks^
-        self.sector_counts = sector_counts^
-        self.stride_logical = stride_logical^
-        self.logical_size = logical_size
-        self.nblocks_total = nblocks_total
-        self.block_present = block_present^
-        self.blocks_flat = blocks_flat^
-        self._dummy_scalar = dummy
-
-    fn __copyinit__(out self, existing: Self):
+    def __copyinit__(self, existing: Self):
         self.ndim = existing.ndim
         self.dim_logical = existing.dim_logical.copy()
         self.dim_blocks = existing.dim_blocks.copy()
@@ -242,28 +206,32 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
         self.blocks_flat = existing.blocks_flat.copy()
         self._dummy_scalar = existing._dummy_scalar
 
-    fn get_shape(self) -> List[Int]:
+    def get_shape(self) -> List[Int]:
         return self.dim_logical.copy()
 
-    fn get_stride(self) -> List[Int]:
+    def get_stride(self) -> List[Int]:
         return self.stride_logical.copy()
 
-    fn get_size(self) -> Int:
+    def get_size(self) -> Int:
         return self.logical_size
 
-    fn get_rank(self) -> Int:
+    def get_rank(self) -> Int:
         return self.ndim
 
-    fn is_contiguous(self) -> Bool:
+    def get_shape_at(self, idx: Int) -> Int:
+        """Get the dimension at a specific index (TensorOps trait)."""
+        return self.dim_logical[idx]
+
+    def is_contiguous(self) -> Bool:
         return False
 
-    fn get_flat_index(self, indices: List[Int]) -> Int:
+    def get_flat_index(self, indices: List[Int]) -> Int:
         var flat_idx = 0
         for i in range(self.ndim):
             flat_idx += indices[i] * self.stride_logical[i]
         return flat_idx
 
-    fn compute_norm_sq(self, ctx: DeviceContext) raises -> Float64:
+    def compute_norm_sq(self, ctx: DeviceContext) raises -> Float64:
         var s = 0.0
         for k in range(self.nblocks_total):
             if not self.block_present[k]:
@@ -272,10 +240,10 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             s += ns
         return s
 
-    fn compute_norm(self, ctx: DeviceContext) raises -> Float64:
+    def compute_norm(self, ctx: DeviceContext) raises -> Float64:
         return sqrt(self.compute_norm_sq(ctx))
 
-    fn compute_dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
+    def compute_dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
         if self.logical_size != other.logical_size or self.ndim != other.ndim:
             raise Error("BlockSparseTensor.compute_dot_product: incompatible tensors")
         for i in range(self.ndim):
@@ -295,7 +263,7 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             acc += self.blocks_flat[k].compute_dot_product(other.blocks_flat[k], ctx)
         return acc
 
-    fn print_contents(self, ctx: DeviceContext) raises -> None:
+    def print_contents(self, ctx: DeviceContext) raises -> None:
         print("BlockSparseTensor ndim=", self.ndim, " logical_shape=", end="")
         for i in range(self.ndim):
             print(" ", self.dim_logical[i], end="")
@@ -306,20 +274,20 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
                 occ += 1
         print(occ, " sparsity_ratio=", self.sparsity_ratio())
 
-    fn dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
+    def dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
         return self.compute_dot_product(other, ctx)
 
-    fn norm(self, ctx: DeviceContext) raises -> Float64:
+    def norm(self, ctx: DeviceContext) raises -> Float64:
         return self.compute_norm(ctx)
 
-    fn norm_sq(self, ctx: DeviceContext) raises -> Float64:
+    def norm_sq(self, ctx: DeviceContext) raises -> Float64:
         return self.compute_norm_sq(ctx)
 
     @staticmethod
-    fn backend() -> TensorBackend:
+    def backend() -> TensorBackend:
         return TensorBackend(TensorBackend.BLOCK_SPARSE)
 
-    fn write_to[W: Writer](self, mut writer: W) -> None:
+    def write_to[W: Writer](self, mut writer: W) -> None:
         writer.write("BlockSparseTensor[dtype=")
         writer.write(Self.dtype)
         writer.write(", ndim=")
@@ -333,19 +301,19 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
         writer.write(self.nblocks_total)
         writer.write("]")
 
-    fn actual_nonzero_count(self) -> Int:
+    def actual_nonzero_count(self) -> Int:
         var total = 0
         for k in range(self.nblocks_total):
             if self.block_present[k]:
                 total += self.blocks_flat[k].size
         return total
 
-    fn sparsity_ratio(self) -> Float64:
+    def sparsity_ratio(self) -> Float64:
         if self.logical_size == 0:
             return 0.0
         return Float64(self.actual_nonzero_count()) / Float64(self.logical_size)
 
-    fn get_block(self, index: BlockIndex) raises -> Block[dtype]:
+    def get_block(self, index: BlockIndex) raises -> Block[Self.dtype]:
         if len(index.qnums) != self.ndim:
             raise Error("get_block: BlockIndex rank does not match tensor ndim")
         var idx = List[Int](capacity=self.ndim)
@@ -364,7 +332,7 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             raise Error("get_block: sector violates charge conservation (no block)")
         return Block[dtype](index, self.blocks_flat[flat])
 
-    fn transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> BlockSparseTensor[dtype]:
+    def transpose(var self, perm: List[Int], ctx: DeviceContext) raises -> BlockSparseTensor[dtype]:
         if len(perm) != self.ndim:
             raise Error("transpose: perm length must equal ndim")
         var used = List[Bool](capacity=self.ndim)
@@ -438,7 +406,7 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             self._dummy_scalar,
         )
 
-    fn reshape(var self, var new_shape: List[Int]) raises -> BlockSparseTensor[dtype]:
+    def reshape(var self, var new_shape: List[Int]) raises -> BlockSparseTensor[dtype]:
         _ = self^
         _ = new_shape^
         raise Error(
@@ -446,7 +414,7 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             + "with a DeviceContext when reshaping changes the sector structure"
         )
 
-    fn flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> BlockSparseTensor[
+    def flatten_dims(var self, start: Int, end: Int, ctx: DeviceContext) raises -> BlockSparseTensor[
         dtype
     ]:
         _ = self^
@@ -456,14 +424,14 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             + "block_sparse_tensor_flatten_axes)"
         )
 
-    fn copy_to_contiguous(var self, ctx: DeviceContext) raises -> BlockSparseTensor[dtype]:
+    def copy_to_contiguous(var self, ctx: DeviceContext) raises -> BlockSparseTensor[dtype]:
         var s = self^
         var r_present = List[Bool](capacity=s.nblocks_total)
         var r_blocks = List[DenseTensor[dtype]](capacity=s.nblocks_total)
         for k in range(s.nblocks_total):
             r_present.append(s.block_present[k])
             if s.block_present[k]:
-                r_blocks.append(s.blocks_flat[k]^.copy_to_contiguous(ctx))
+                r_blocks.append(s.blocks_flat[k].copy_to_contiguous(ctx))
             else:
                 r_blocks.append(s._dummy_scalar)
         return BlockSparseTensor[dtype](
@@ -482,12 +450,12 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             s._dummy_scalar,
         )
 
-    fn scale_in_place(mut self, scale: Scalar[dtype], ctx: DeviceContext) raises -> None:
+    def scale_in_place(mut self, scale: Scalar[Self.dtype], ctx: DeviceContext) raises -> None:
         for k in range(self.nblocks_total):
             if self.block_present[k]:
                 self.blocks_flat[k].scale_in_place(scale, ctx)
 
-    fn axpy_in_place(mut self, alpha: Scalar[dtype], x: Self, ctx: DeviceContext) raises -> None:
+    def axpy_in_place(mut self, alpha: Scalar[Self.dtype], x: Self, ctx: DeviceContext) raises -> None:
         if self.nblocks_total != x.nblocks_total or self.ndim != x.ndim:
             raise Error("axpy_in_place: incompatible tensors")
         for k in range(self.nblocks_total):
@@ -498,7 +466,7 @@ struct BlockSparseTensor[dtype: DType](Writable, Movable, TensorOps):
             self.blocks_flat[k].axpy_in_place(alpha, x.blocks_flat[k], ctx)
 
 
-fn _allocate_block_sparse_tensor_inner[dtype: DType](
+def _allocate_block_sparse_tensor_inner[dtype: DType](
     ctx: DeviceContext,
     ndim: Int,
     var dim_logical: List[Int],
@@ -508,26 +476,30 @@ fn _allocate_block_sparse_tensor_inner[dtype: DType](
     zero_fill: Bool = False,
 ) raises -> BlockSparseTensor[dtype]:
     if ndim == 0:
-        var dummy = create_dense_tensor[dtype](ctx, List[Int](1)^, init_value=Scalar[dtype](0.0))
-        var zero_block = create_dense_tensor[dtype](ctx, List[Int]()^, init_value=Scalar[dtype](0.0))
+        var dummy_shape = List[Int](1)
+        var dummy = create_dense_tensor[dtype](ctx, dummy_shape^, init_value=Scalar[dtype](0.0))
+        var zero_shape = List[Int]()
+        var zero_block = create_dense_tensor[dtype](ctx, zero_shape^, init_value=Scalar[dtype](0.0))
         var bp = List[Bool]()
         bp.append(True)
         var bf = List[DenseTensor[dtype]]()
         bf.append(zero_block^)
-        var empty = List[Int]()
-        var empty_ql = List[List[Int]]()
-        var empty_qb = List[List[Int]]()
-        var empty_sc = List[List[Int]]()
-        var st = List[Int]()
+        var dim_logical = List[Int]()
+        var dim_blocks = List[Int]()
+        var axis_dir_out = List[Int]()
+        var qnums_logical = List[List[Int]]()
+        var qnums_blocks = List[List[Int]]()
+        var sector_counts = List[List[Int]]()
+        var stride_logical = List[Int]()
         return BlockSparseTensor[dtype](
             0,
-            empty^,
-            empty^,
-            empty^,
-            empty_ql^,
-            empty_qb^,
-            empty_sc^,
-            st^,
+            dim_logical^,
+            dim_blocks^,
+            axis_dir_out^,
+            qnums_logical^,
+            qnums_blocks^,
+            sector_counts^,
+            stride_logical^,
             1,
             1,
             bp^,
@@ -554,7 +526,7 @@ fn _allocate_block_sparse_tensor_inner[dtype: DType](
     var logical_size = _dim_product(dim_logical)
     var nblocks = _dim_product(dim_blocks)
 
-    var dummy = create_dense_tensor[dtype](ctx, List[Int](1)^, init_value=Scalar[dtype](0.0))
+    var dummy = create_dense_tensor[dtype](ctx, List[Int](1), init_value=Scalar[dtype](0.0))
 
     var block_present = List[Bool](capacity=nblocks)
     var blocks_flat = List[DenseTensor[dtype]](capacity=nblocks)
@@ -602,7 +574,7 @@ fn _allocate_block_sparse_tensor_inner[dtype: DType](
     )
 
 
-fn create_block_sparse_tensor[dtype: DType](
+def create_block_sparse_tensor[dtype: DType](
     ctx: DeviceContext,
     var shape: List[Int],
     var qnums_per_leg: List[List[QNumber]],
@@ -616,7 +588,7 @@ fn create_block_sparse_tensor[dtype: DType](
         for _ in range(ndim):
             ad.append(1)
     else:
-        var ad_in = axis_dir.value()
+        var ad_in = axis_dir.value().copy()
         if len(ad_in) != ndim:
             raise Error("create_block_sparse_tensor: axis_dir length must match rank")
         for i in range(ndim):
@@ -628,7 +600,7 @@ fn create_block_sparse_tensor[dtype: DType](
     return _allocate_block_sparse_tensor_inner[dtype](ctx, ndim, shape^, ad^, qnums_int^, init_value)
 
 
-fn allocate_block_sparse_tensor_like[dtype: DType](
+def allocate_block_sparse_tensor_like[dtype: DType](
     ctx: DeviceContext, existing: BlockSparseTensor[dtype], init_value: Optional[Scalar[dtype]] = None
 ) raises -> BlockSparseTensor[dtype]:
     """Same sector layout as ``existing``; new GPU buffers."""
@@ -642,7 +614,7 @@ fn allocate_block_sparse_tensor_like[dtype: DType](
     )
 
 
-fn _effective_axrange_B_for_dot[dtype: DType](
+def _effective_axrange_B_for_dot[dtype: DType](
     a: BlockSparseTensor[dtype], b: BlockSparseTensor[dtype], ndim_mult: Int, axrange_a: Bool, axrange_b: Bool
 ) raises -> Bool:
     """Match ``dense_tensor_dot`` inference when both B flags are false."""
@@ -665,7 +637,7 @@ fn _effective_axrange_B_for_dot[dtype: DType](
     return axrange_b
 
 
-fn allocate_block_sparse_for_tensor_dot[dtype: DType](
+def allocate_block_sparse_for_tensor_dot[dtype: DType](
     a: BlockSparseTensor[dtype],
     b: BlockSparseTensor[dtype],
     ctx: DeviceContext,
@@ -699,8 +671,11 @@ fn allocate_block_sparse_for_tensor_dot[dtype: DType](
                 raise Error("allocate_block_sparse_for_tensor_dot: sector qnums mismatch")
 
     if a.ndim + b.ndim == 2 * ndim_mult:
+        var empty_dim = List[Int]()
+        var empty_axis = List[Int]()
+        var empty_ql = List[List[Int]]()
         return _allocate_block_sparse_tensor_inner[dtype](
-            ctx, 0, List[Int]()^, List[Int]()^, List[List[Int]]()^, init_value, zero_fill=True
+            ctx, 0, empty_dim^, empty_axis^, empty_ql^, init_value, zero_fill=True
         )
 
     var ndim_r = a.ndim + b.ndim - 2 * ndim_mult
@@ -722,7 +697,7 @@ fn allocate_block_sparse_for_tensor_dot[dtype: DType](
     )
 
 
-fn block_sparse_tensor_dot[dtype: DType](
+def block_sparse_tensor_dot[dtype: DType](
     mut c: BlockSparseTensor[dtype],
     var a: BlockSparseTensor[dtype],
     var b: BlockSparseTensor[dtype],
@@ -750,6 +725,7 @@ fn block_sparse_tensor_dot[dtype: DType](
             raise Error("block_sparse_tensor_dot: axis_dir mismatch")
 
     # Zero occupied output blocks (caller should use zero-initialized ``C`` from the allocator)
+    # TODO: This can be optimized using uninitialized blocks and fill with the results
     for k in range(c.nblocks_total):
         if c.block_present[k]:
             c.blocks_flat[k].scale_in_place(Scalar[dtype](0.0), ctx)
@@ -778,10 +754,12 @@ fn block_sparse_tensor_dot[dtype: DType](
             if not (a.block_present[ib] and b.block_present[ib]):
                 continue
             if first_sc:
+                var ab = _dense_block_for_dot[dtype](a.blocks_flat[ib], ctx)
+                var bb = _dense_block_for_dot[dtype](b.blocks_flat[ib], ctx)
                 dense_tensor_dot(
                     out0,
-                    a.blocks_flat[ib]^,
-                    b.blocks_flat[ib]^,
+                    ab^,
+                    bb^,
                     ctx,
                     ndim_mult,
                     axrange_a,
@@ -789,10 +767,12 @@ fn block_sparse_tensor_dot[dtype: DType](
                 )
                 first_sc = False
             else:
+                var ab = _dense_block_for_dot[dtype](a.blocks_flat[ib], ctx)
+                var bb = _dense_block_for_dot[dtype](b.blocks_flat[ib], ctx)
                 dense_tensor_dot(
                     tmp_sc,
-                    a.blocks_flat[ib]^,
-                    b.blocks_flat[ib]^,
+                    ab^,
+                    bb^,
                     ctx,
                     ndim_mult,
                     axrange_a,
@@ -851,10 +831,12 @@ fn block_sparse_tensor_dot[dtype: DType](
             if not (a.block_present[oa] and b.block_present[ob]):
                 continue
             if first:
+                var ab = _dense_block_for_dot[dtype](a.blocks_flat[oa], ctx)
+                var bb = _dense_block_for_dot[dtype](b.blocks_flat[ob], ctx)
                 dense_tensor_dot(
                     c.blocks_flat[k],
-                    a.blocks_flat[oa]^,
-                    b.blocks_flat[ob]^,
+                    ab^,
+                    bb^,
                     ctx,
                     ndim_mult,
                     axrange_a,
@@ -862,10 +844,12 @@ fn block_sparse_tensor_dot[dtype: DType](
                 )
                 first = False
             else:
+                var ab = _dense_block_for_dot[dtype](a.blocks_flat[oa], ctx)
+                var bb = _dense_block_for_dot[dtype](b.blocks_flat[ob], ctx)
                 dense_tensor_dot(
                     tmp,
-                    a.blocks_flat[oa]^,
-                    b.blocks_flat[ob]^,
+                    ab^,
+                    bb^,
                     ctx,
                     ndim_mult,
                     axrange_a,
@@ -878,7 +862,7 @@ fn block_sparse_tensor_dot[dtype: DType](
     _ = b^
 
 
-fn block_sparse_tensor_svd_trunc[dtype: DType](
+def block_sparse_tensor_svd_trunc[dtype: DType](
     var tensor: BlockSparseTensor[dtype],
     ctx: DeviceContext,
     chi_max: Int,
@@ -897,10 +881,48 @@ fn block_sparse_tensor_svd_trunc[dtype: DType](
     return (u_bs^, s_bs^, v_bs^, chi)
 
 
-fn _dense_matrix_to_single_sector_block_sparse[dtype: DType](
+# TODO: Implement direct QR decomposition for BlockSparseTensor.
+def block_sparse_tensor_qr[dtype: DType](
+    var tensor: BlockSparseTensor[dtype],
+    ctx: DeviceContext,
+) raises -> Tuple[BlockSparseTensor[dtype], BlockSparseTensor[dtype]]:
+    """QR decomposition for BlockSparseTensor.
+    
+    Converts to dense, performs QR decomposition, and wraps results back as
+    block-sparse tensors with single-sector (trivial quantum number) structure.
+    
+    This implementation is suitable for MPS orthonormalization where the matrix
+    was created from reshaping a tensor (losing the original quantum number structure).
+    For operations that need to preserve full quantum number structure, a more
+    sophisticated block-wise QR implementation would be needed.
+    
+    Args:
+        tensor: 2D block-sparse matrix to decompose (ownership transferred).
+        ctx: Device context.
+    
+    Returns:
+        Tuple of (Q, R) as block-sparse tensors where:
+        - Q has shape [m, k] with orthonormal columns (k = min(m, n))
+        - R has shape [k, n] and is upper triangular
+    """
+    if tensor.ndim != 2:
+        raise Error("block_sparse_tensor_qr: requires 2D matrix, got rank " + String(tensor.ndim))
+    
+    var dense = block_sparse_to_dense(tensor^, ctx)
+    var qr_result = dense_tensor_qr[dtype](dense^, ctx)
+    var Q_dense = qr_result[0]
+    var R_dense = qr_result[1]
+    
+    var Q_bs = _dense_matrix_to_single_sector_block_sparse(ctx, Q_dense^)
+    var R_bs = _dense_matrix_to_single_sector_block_sparse(ctx, R_dense^)
+    
+    return (Q_bs^, R_bs^)
+
+
+def _dense_matrix_to_single_sector_block_sparse[dtype: DType](
     ctx: DeviceContext, var t: DenseTensor[dtype]
 ) raises -> BlockSparseTensor[dtype]:
-    var sh = t.shape
+    var sh = t.shape.copy()
     if len(sh) != 2:
         raise Error("_dense_matrix_to_single_sector_block_sparse: expected matrix")
     var qrows = List[QNumber](capacity=sh[0])
@@ -912,15 +934,15 @@ fn _dense_matrix_to_single_sector_block_sparse[dtype: DType](
     var legs = List[List[QNumber]]()
     legs.append(qrows^)
     legs.append(qcols^)
-    var out = create_block_sparse_tensor[dtype](ctx, sh.copy(), legs^, init_value=Scalar[dtype](0.0))
-    dense_to_block_sparse_entries(t^, out^, ctx)
+    var out = create_block_sparse_tensor[dtype](ctx, sh^, legs^, init_value=Scalar[dtype](0.0))
+    dense_to_block_sparse_entries(t, out, ctx)
     return out^
 
 
-fn _dense_vector_to_single_sector_block_sparse[dtype: DType](
+def _dense_vector_to_single_sector_block_sparse[dtype: DType](
     ctx: DeviceContext, var t: DenseTensor[dtype]
 ) raises -> BlockSparseTensor[dtype]:
-    var sh = t.shape
+    var sh = t.shape.copy()
     if len(sh) != 1:
         raise Error("_dense_vector_to_single_sector_block_sparse: expected vector")
     var q0 = List[QNumber](capacity=sh[0])
@@ -928,12 +950,12 @@ fn _dense_vector_to_single_sector_block_sparse[dtype: DType](
         q0.append(QNumber(0))
     var legs = List[List[QNumber]]()
     legs.append(q0^)
-    var out = create_block_sparse_tensor[dtype](ctx, sh.copy(), legs^, init_value=Scalar[dtype](0.0))
-    dense_to_block_sparse_entries(t^, out^, ctx)
+    var out = create_block_sparse_tensor[dtype](ctx, sh^, legs^, init_value=Scalar[dtype](0.0))
+    dense_to_block_sparse_entries(t, out, ctx)
     return out^
 
 
-fn dense_to_block_sparse[dtype: DType](
+def dense_to_block_sparse[dtype: DType](
     var dense: DenseTensor[dtype],
     var qnums_per_leg: List[List[QNumber]],
     ctx: DeviceContext,
@@ -948,12 +970,12 @@ fn dense_to_block_sparse[dtype: DType](
     var out = _allocate_block_sparse_tensor_inner[dtype](
         ctx, len(shape), shape^, ad^, qnums_int^, init_value=Scalar[dtype](0.0)
     )
-    dense_to_block_sparse_entries(dense^, out^, ctx)
+    dense_to_block_sparse_entries(dense, out, ctx)
     return out^
 
 
-fn dense_to_block_sparse_entries[dtype: DType](
-    var dense: DenseTensor[dtype], mut target: BlockSparseTensor[dtype], ctx: DeviceContext
+def dense_to_block_sparse_entries[dtype: DType](
+    dense: DenseTensor[dtype], mut target: BlockSparseTensor[dtype], ctx: DeviceContext
 ) raises:
     """Copy entries into an already allocated tensor (C ``dense_to_block_sparse_tensor_entries``)."""
     if len(dense.shape) != target.ndim:
@@ -1008,10 +1030,9 @@ fn dense_to_block_sparse_entries[dtype: DType](
 
         ctx.enqueue_copy(blk.storage, host_b)
         ctx.synchronize()
-    _ = dense^
 
 
-fn block_sparse_to_dense[dtype: DType](var sparse: BlockSparseTensor[dtype], ctx: DeviceContext) raises -> DenseTensor[
+def block_sparse_to_dense[dtype: DType](var sparse: BlockSparseTensor[dtype], ctx: DeviceContext) raises -> DenseTensor[
     dtype
 ]:
     """Scatter blocks into a dense row-major tensor (C ``block_sparse_to_dense_tensor``)."""

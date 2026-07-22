@@ -14,7 +14,8 @@ Operations are tested against known properties and C reference behavior.
 from collections.list import List
 from gpu.host import DeviceContext
 from src.m_tensor.dense_tensor import DenseTensor, create_dense_tensor, dense_tensor_dot
-from src.state.mpo_state import MatrixProductOperator, MPOSite
+from src.state.mpo_state import MatrixProductOperator, MPOSite, DenseMPOSite, DenseMPO
+from src.m_tensor.tensor_traits import TensorOps
 from src.state.hamiltonians import create_ising_1d_mpo
 from src.tests.test_utils import assert_equal, assert_close, compare_tensors
 from src.tests.state.mpo.mpo_test_helpers import mpo_to_full_matrix, check_hermiticity
@@ -33,9 +34,9 @@ fn print_subsection(title: String) -> None:
     print("\n--- " + title + " ---")
 
 
-fn merge_mpo_tensor_pair(
-    site0: MPOSite[DType.float32],
-    site1: MPOSite[DType.float32],
+fn merge_mpo_tensor_pair[T: TensorOps](
+    site0: MPOSite[DType.float32, T],
+    site1: MPOSite[DType.float32, T],
     ctx: DeviceContext,
 ) raises -> DenseTensor[DType.float32]:
     """Merge two adjacent MPO site tensors by contracting the shared bond.
@@ -57,11 +58,9 @@ fn merge_mpo_tensor_pair(
         Merged tensor with shape `[Wl0, d_in*d_in, d_out*d_out, Wr1]`.
         Physical indices are properly ordered: combined inputs then combined outputs.
     """
-    var W0 = site0.tensor
-    var W1 = site1.tensor
-    
-    var W0_shape = W0.shape.copy()
-    var W1_shape = W1.shape.copy()
+    # Get shapes using trait methods
+    var W0_shape = site0.tensor.get_shape()
+    var W1_shape = site1.tensor.get_shape()
     
     var wl0 = W0_shape[0]
     var d_in0 = W0_shape[1]
@@ -77,6 +76,10 @@ fn merge_mpo_tensor_pair(
         raise Error("Bond dimension mismatch")
     if d_in0 != d_in1 or d_out0 != d_out1:
         raise Error("Physical dimension mismatch")
+    
+    # Copy and rebind to DenseTensor for DenseTensor-specific operations
+    var W0 = rebind[DenseTensor[DType.float32]](site0.tensor.copy())
+    var W1 = rebind[DenseTensor[DType.float32]](site1.tensor.copy())
     
     # Step 1: Contract over bond
     var W0_temp = W0.reshape(List[Int](wl0 * d_in0 * d_out0, wr0))

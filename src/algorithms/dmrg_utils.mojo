@@ -3,9 +3,6 @@
 Uses dense_tensor operations (expectation_value, variance, mps_overlap) from
 environments. Do NOT compare raw MPS tensors entry-wise.
 """
-
-from collections.list import List
-from gpu.host import DeviceContext
 from src.state.mps_state import MatrixProductState, MPSSite
 from src.state.mpo_state import MatrixProductOperator, MPOSite, create_single_site_op_mpo, create_two_site_op_mpo
 from src.state.environments import (
@@ -15,27 +12,27 @@ from src.state.environments import (
 )
 
 
-fn energy[dtype: DType](
-    mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+def energy[dtype: DType](
+    mps: MatrixProductState[dtype, _],
+    mpo: MatrixProductOperator[dtype, _],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute E = <psi|H|psi> / <psi|psi> via MPS-MPO-MPS contraction."""
     return expectation_value_normalized[dtype](mps, mpo, ctx)
 
 
-fn variance_op[dtype: DType](
-    mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+def variance_op[dtype: DType](
+    mps: MatrixProductState[dtype, _],
+    mpo: MatrixProductOperator[dtype, _],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute var = <H^2> - <H>^2 via MPO composition and MPS contraction."""
     return variance[dtype](mps, mpo, ctx)
 
 
-fn fidelity[dtype: DType](
-    mps1: MatrixProductState[dtype],
-    mps2: MatrixProductState[dtype],
+def fidelity[dtype: DType](
+    mps1: MatrixProductState[dtype, _],
+    mps2: MatrixProductState[dtype, _],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute F = |<psi1|psi2>| (absolute value for real, ignores global phase)."""
@@ -45,16 +42,16 @@ fn fidelity[dtype: DType](
 
 # Pauli matrices (2x2 row-major): Z = [[1,0],[0,-1]], X = [[0,1],[1,0]]
 # Sz = Z/2, Sx = X/2
-fn _pauli_z_data[dtype: DType]() -> List[Scalar[dtype]]:
-    return List[Scalar[dtype]](Scalar[dtype](1.0), Scalar[dtype](0.0), Scalar[dtype](0.0), Scalar[dtype](-1.0))
+def _pauli_z_data[dtype: DType]() -> List[Scalar[dtype]]:
+    return [(1.0), (0.0), (0.0), (-1.0)]
 
 
-fn _pauli_x_data[dtype: DType]() -> List[Scalar[dtype]]:
-    return List[Scalar[dtype]](Scalar[dtype](0.0), Scalar[dtype](1.0), Scalar[dtype](1.0), Scalar[dtype](0.0))
+def _pauli_x_data[dtype: DType]() -> List[Scalar[dtype]]:
+    return [(0.0), (1.0), (1.0), (0.0)]
 
 
-fn observe_sz[dtype: DType](
-    mps: MatrixProductState[dtype],
+def observe_sz[dtype: DType](
+    mps: MatrixProductState[dtype, _],
     site_i: Int,
     ctx: DeviceContext,
 ) raises -> Float64:
@@ -65,8 +62,8 @@ fn observe_sz[dtype: DType](
     return 0.5 * val
 
 
-fn observe_sz_sz[dtype: DType](
-    mps: MatrixProductState[dtype],
+def observe_sz_sz[dtype: DType](
+    mps: MatrixProductState[dtype, _],
     site_i: Int,
     site_j: Int,
     ctx: DeviceContext,
@@ -78,8 +75,8 @@ fn observe_sz_sz[dtype: DType](
     return 0.25 * val
 
 
-fn observe_sx_sx[dtype: DType](
-    mps: MatrixProductState[dtype],
+def observe_sx_sx[dtype: DType](
+    mps: MatrixProductState[dtype, _],
     site_i: Int,
     site_j: Int,
     ctx: DeviceContext,

@@ -1,11 +1,8 @@
-from collections.list import List
-from gpu.host import DeviceContext
-from m_tensor.dense_tensor import DenseTensor, create_dense_tensor
-from math import sqrt, abs as math_abs
+from src.m_tensor.dense_tensor import DenseTensor, create_dense_tensor
+from std.math import sqrt, abs as math_abs
 
-
-fn lanczos_ground_state[dtype: DType](
-    apply_H: fn(DenseTensor[dtype], DeviceContext) raises -> DenseTensor[dtype],
+def lanczos_ground_state[dtype: DType](
+    apply_H: def(DenseTensor[dtype], DeviceContext) raises -> DenseTensor[dtype],
     initial_vec: DenseTensor[dtype],
     ctx: DeviceContext,
     max_iter: Int = 20,
@@ -168,7 +165,7 @@ fn lanczos_ground_state[dtype: DType](
     return (eigenvalue, out^)
 
 
-fn solve_tridiagonal_ground_state(
+def solve_tridiagonal_ground_state(
     alpha: List[Float64],
     beta: List[Float64],
     tol: Float64
@@ -194,7 +191,7 @@ fn solve_tridiagonal_ground_state(
         return alpha[0]
 
     var result = _tridiag_qr_eig(alpha, beta, tol)
-    var eigenvalues = result[0]
+    var eigenvalues = result[0].copy()
 
     # Return smallest eigenvalue
     var min_eval = eigenvalues[0]
@@ -204,7 +201,7 @@ fn solve_tridiagonal_ground_state(
     return min_eval
 
 
-fn _tridiag_qr_eig(
+def _tridiag_qr_eig(
     alpha: List[Float64],
     beta: List[Float64],
     tol: Float64,
@@ -348,7 +345,7 @@ fn _tridiag_qr_eig(
     return (eigenvalues^, eigenvectors^)
 
 
-fn reconstruct_eigenvector[dtype: DType](
+def reconstruct_eigenvector[dtype: DType](
     alpha: List[Float64],
     beta: List[Float64],
     krylov_vectors: List[List[Scalar[dtype]]],

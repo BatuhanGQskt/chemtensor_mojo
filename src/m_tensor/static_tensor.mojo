@@ -1,12 +1,15 @@
-from memory import Pointer, AddressSpace, OwnedPointer
-from layout import Layout, LayoutTensor, RuntimeLayout, IntTuple, RuntimeTuple
+from memory.pointer import Pointer, AddressSpace
+from memory.owned_pointer import OwnedPointer
+from layout.layout import Layout
+from layout.layout_tensor import LayoutTensor
+from layout.runtime_layout import RuntimeLayout
+from layout.runtime_tuple import RuntimeTuple
 from collections.list import List
 from gpu import thread_idx, block_idx, block_dim, barrier
 from gpu.host import DeviceContext, DeviceBuffer
-from layout.tensor_builder import LayoutTensorBuild as tb
 from layout.layout import DimList
 from math import ceildiv
-from main import MAX_RANK, list_to_dimlist
+from src.__init__ import MAX_RANK, list_to_dimlist
 
 alias dtype = DType.float32
 

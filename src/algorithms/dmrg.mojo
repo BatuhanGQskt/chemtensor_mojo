@@ -1,6 +1,4 @@
-from collections.list import List
-from gpu.host import DeviceContext
-from math import sqrt, atan2, sin, cos
+from std.math import sqrt, atan2, sin, cos
 from src.m_tensor.dense_tensor import (
     DenseTensor,
     create_dense_tensor,
@@ -12,18 +10,20 @@ from src.m_tensor.dense_tensor import (
 from src.state.mps_state import (
     MPSSite,
     MatrixProductState,
+    DenseMPS,
+    DenseMPSSite,
     mps_local_orthonormalize_qr_pair,
     mps_local_orthonormalize_rq_pair,
     mps_orthonormalize_right,
 )
-from src.state.mpo_state import MPOSite, MatrixProductOperator
+from src.state.mpo_state import MPOSite, MatrixProductOperator, DenseMPO, DenseMPOSite
 from src.state.environments import (
     update_left_environment,
     update_right_environment,
     build_right_environments,
 )
 from src.algorithms.krylov import lanczos_ground_state
-import benchmark
+import std.benchmark
 
 
 @fieldwise_init
@@ -49,14 +49,14 @@ struct DMRGWorkspace[dtype: DType]:
     Stores left and right environments that are updated incrementally
     during sweeps.
     """
-    var L_env: List[DenseTensor[dtype]]  # Left environments, length N+1
-    var R_env: List[DenseTensor[dtype]]  # Right environments, length N+1
+    var L_env: List[DenseTensor[Self.dtype]]  # Left environments, length N+1
+    var R_env: List[DenseTensor[Self.dtype]]  # Right environments, length N+1
     var num_sites: Int
     
-    fn __init__(
+    def __init__(
         out self,
-        mps: MatrixProductState[dtype],
-        mpo: MatrixProductOperator[dtype],
+        mps: MatrixProductState[Self.dtype, DenseTensor[Self.dtype]],
+        mpo: MatrixProductOperator[Self.dtype, DenseTensor[Self.dtype]],
         ctx: DeviceContext,
     ) raises:
         """Initialize workspace with boundary conditions.
@@ -69,24 +69,24 @@ struct DMRGWorkspace[dtype: DType]:
             raise Error("MPS and MPO must have the same number of sites")
         
         # Build right environments from scratch
-        self.R_env = build_right_environments[dtype](mps, mpo, ctx)
+        self.R_env = build_right_environments[Self.dtype](mps, mpo, ctx)
         
         # Initialize left environments (will be built during sweep)
-        self.L_env = List[DenseTensor[dtype]](capacity=self.num_sites + 1)
+        self.L_env = List[DenseTensor[Self.dtype]](capacity=self.num_sites + 1)
         
         # Left boundary: L[0] is identity
         var wL_boundary = mpo.bond_dimension(0)
         var Dl_boundary = mps.bond_dimension(0)
         
         var L_boundary_shape = List[Int](wL_boundary, Dl_boundary, Dl_boundary)
-        var L_boundary = create_dense_tensor[dtype](ctx, L_boundary_shape^, init_value=Scalar[dtype](0.0))
+        var L_boundary = create_dense_tensor[Self.dtype](ctx, L_boundary_shape^, init_value=Scalar[Self.dtype](0.0))
         
         # Set to identity
-        var host_L = ctx.enqueue_create_host_buffer[dtype](wL_boundary * Dl_boundary * Dl_boundary)
+        var host_L = ctx.enqueue_create_host_buffer[Self.dtype](wL_boundary * Dl_boundary * Dl_boundary)
         for w in range(wL_boundary):
             for d in range(Dl_boundary):
                 var idx = w * (Dl_boundary * Dl_boundary) + d * Dl_boundary + d
-                host_L[idx] = Scalar[dtype](1.0)
+                host_L[idx] = Scalar[Self.dtype](1.0)
         ctx.enqueue_copy(L_boundary.storage, host_L)
         ctx.synchronize()
         
@@ -97,9 +97,9 @@ struct DMRGWorkspace[dtype: DType]:
         self.L_env[0] = L_boundary^
 
 
-fn build_two_site_theta[dtype: DType](
-    A_i: MPSSite[dtype],
-    A_ip1: MPSSite[dtype],
+def build_two_site_theta[dtype: DType](
+    A_i: MPSSite[dtype, DenseTensor[dtype]],
+    A_ip1: MPSSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> DenseTensor[dtype]:
     """Build two-site wavefunction theta from adjacent MPS tensors.
@@ -147,13 +147,13 @@ fn build_two_site_theta[dtype: DType](
     return theta^
 
 
-fn split_two_site_theta_svd[dtype: DType](
+def split_two_site_theta_svd[dtype: DType](
     theta: DenseTensor[dtype],
     chi_max: Int,
     eps_trunc: Float64,
     ctx: DeviceContext,
     left_to_right: Bool = True,
-) raises -> Tuple[MPSSite[dtype], MPSSite[dtype], Float64]:
+) raises -> Tuple[MPSSite[dtype, DenseTensor[dtype]], MPSSite[dtype, DenseTensor[dtype]], Float64]:
     """Split optimized two-site tensor using SVD with truncation.
     
     Decomposes theta[Dl, d, d, Dr] -> A_i[Dl, d, chi] and A_{i+1}[chi, d, Dr]
@@ -256,14 +256,14 @@ fn split_two_site_theta_svd[dtype: DType](
         A_i_new = US^.reshape(List[Int](Dl, d, chi_kept))
         A_ip1_new = Vt^.reshape(List[Int](chi_kept, d, Dr))
     
-    return (MPSSite[dtype](A_i_new^), MPSSite[dtype](A_ip1_new^), discarded_weight)
+    return (MPSSite[dtype, DenseTensor[dtype]](A_i_new^), MPSSite[dtype, DenseTensor[dtype]](A_ip1_new^), discarded_weight)
 
-fn apply_two_site_heff[dtype: DType](
+def apply_two_site_heff[dtype: DType](
     theta: DenseTensor[dtype],
     L_env: DenseTensor[dtype],
     R_env: DenseTensor[dtype],
-    W_i: MPOSite[dtype],
-    W_ip1: MPOSite[dtype],
+    W_i: MPOSite[dtype, DenseTensor[dtype]],
+    W_ip1: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> DenseTensor[dtype]:
     """Apply effective two-site Hamiltonian to theta without forming Heff explicitly.
@@ -381,7 +381,7 @@ fn apply_two_site_heff[dtype: DType](
     return result^
 
 
-fn _dmrg_jacobi_smallest_eigpair(
+def _dmrg_jacobi_smallest_eigpair(
     mut A: List[List[Float64]],
     tol: Float64,
     max_sweeps: Int = 200,
@@ -391,7 +391,7 @@ fn _dmrg_jacobi_smallest_eigpair(
     if n == 0:
         raise Error("Empty matrix in Jacobi eigensolver")
     if n == 1:
-        return (A[0][0], List[Float64](1.0))
+        return (A[0][0], [1.0])
 
     var V = List[List[Float64]](capacity=n)
     for i in range(n):
@@ -468,11 +468,11 @@ fn _dmrg_jacobi_smallest_eigpair(
     return (min_val, vec^)
 
 
-fn apply_one_site_heff[dtype: DType](
+def apply_one_site_heff[dtype: DType](
     vec: DenseTensor[dtype],
     L_env: DenseTensor[dtype],
     R_env: DenseTensor[dtype],
-    W_site: MPOSite[dtype],
+    W_site: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> DenseTensor[dtype]:
     """Apply effective single-site Hamiltonian H_eff|vec> (matrix-free, matches C apply_local_hamiltonian)."""
@@ -516,11 +516,11 @@ fn apply_one_site_heff[dtype: DType](
     return result_mat^.reshape(List[Int](Dl_bra, s_out, Dr_bra))
 
 
-fn lanczos_one_site_optimize[dtype: DType](
+def lanczos_one_site_optimize[dtype: DType](
     initial_vec: DenseTensor[dtype],
     L_env: DenseTensor[dtype],
     R_env: DenseTensor[dtype],
-    W_site: MPOSite[dtype],
+    W_site: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
     max_iter: Int,
     tol: Float64,
@@ -663,10 +663,10 @@ fn lanczos_one_site_optimize[dtype: DType](
     return (E0, vec_opt^)
 
 
-fn dmrg_local_update_one_site[dtype: DType](
+def dmrg_local_update_one_site[dtype: DType](
     site_index: Int,
-    mut mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+    mut mps: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
     mut workspace: DMRGWorkspace[dtype],
     params: DMRGParams,
     ctx: DeviceContext,
@@ -690,7 +690,7 @@ fn dmrg_local_update_one_site[dtype: DType](
     )
     var eigenvalue = lanczos_result[0]
     var A_opt = lanczos_result[1]
-    mps.sites[i] = MPSSite[dtype](A_opt^)
+    mps.sites[i] = MPSSite[dtype, DenseTensor[dtype]](A_opt^)
 
     if left_to_right:
         if i < mps.num_sites() - 1:
@@ -720,12 +720,12 @@ fn dmrg_local_update_one_site[dtype: DType](
     return eigenvalue
 
 
-fn dmrg_single_site[dtype: DType](
+def dmrg_single_site[dtype: DType](
     ctx: DeviceContext,
-    mpo: MatrixProductOperator[dtype],
-    var mps: MatrixProductState[dtype],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
+    var mps: MatrixProductState[dtype, DenseTensor[dtype]],
     params: DMRGParams,
-) raises -> Tuple[Float64, MatrixProductState[dtype]]:
+) raises -> Tuple[Float64, MatrixProductState[dtype, DenseTensor[dtype]]]:
     """Single-site DMRG: local optimizations without growing bond dimension (C dmrg_singlesite)."""
     var N = mps.num_sites()
     if N < 1:
@@ -794,12 +794,12 @@ fn dmrg_single_site[dtype: DType](
     return (energy, mps^)
 
 
-fn dmrg_two_site[dtype: DType](
+def dmrg_two_site[dtype: DType](
     ctx: DeviceContext,
-    mpo: MatrixProductOperator[dtype],
-    var mps: MatrixProductState[dtype],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
+    var mps: MatrixProductState[dtype, DenseTensor[dtype]],
     params: DMRGParams,
-) raises -> Tuple[Float64, MatrixProductState[dtype]]:
+) raises -> Tuple[Float64, MatrixProductState[dtype, DenseTensor[dtype]]]:
     """Two-site DMRG optimization to find ground state.
     
     Performs sweeps of local two-site optimizations using Lanczos,
@@ -905,12 +905,12 @@ fn dmrg_two_site[dtype: DType](
     return (energy, mps^)
 
 
-fn lanczos_two_site_optimize[dtype: DType](
+def lanczos_two_site_optimize[dtype: DType](
     initial_theta: DenseTensor[dtype],
     L_env: DenseTensor[dtype],
     R_env: DenseTensor[dtype],
-    W_i: MPOSite[dtype],
-    W_ip1: MPOSite[dtype],
+    W_i: MPOSite[dtype, DenseTensor[dtype]],
+    W_ip1: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
     max_iter: Int,
     tol: Float64,
@@ -1178,10 +1178,10 @@ fn lanczos_two_site_optimize[dtype: DType](
     return (E0, theta_opt^)
 
 
-fn dmrg_local_update_two_site[dtype: DType](
+def dmrg_local_update_two_site[dtype: DType](
     site_index: Int,
-    mut mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+    mut mps: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
     mut workspace: DMRGWorkspace[dtype],
     params: DMRGParams,
     ctx: DeviceContext,

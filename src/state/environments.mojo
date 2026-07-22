@@ -10,8 +10,8 @@ from src.m_tensor.dense_tensor import (
     create_dense_tensor_uninitialized,
     dense_tensor_dot,
 )
-from src.state.mps_state import MPSSite, MatrixProductState
-from src.state.mpo_state import MPOSite, MatrixProductOperator
+from src.state.mps_state import MPSSite, MatrixProductState, DenseMPS, DenseMPSSite
+from src.state.mpo_state import MPOSite, MatrixProductOperator, DenseMPO, DenseMPOSite
 from src.state.mpo_state import create_identity_mpo
 
 
@@ -98,8 +98,8 @@ struct ProfileStats(Writable, Movable):
 
 fn update_left_environment[dtype: DType](
     L_prev: DenseTensor[dtype],
-    A_site: MPSSite[dtype],
-    W_site: MPOSite[dtype],
+    A_site: MPSSite[dtype, DenseTensor[dtype]],
+    W_site: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> DenseTensor[dtype]:
     """Update left environment by contracting one site.
@@ -203,8 +203,8 @@ fn update_left_environment[dtype: DType](
 
 fn update_left_environment[dtype: DType](
     L_prev: DenseTensor[dtype],
-    A_site: MPSSite[dtype],
-    W_site: MPOSite[dtype],
+    A_site: MPSSite[dtype, DenseTensor[dtype]],
+    W_site: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
     mut profile: ProfileStats,
 ) raises -> DenseTensor[dtype]:
@@ -226,7 +226,7 @@ fn update_left_environment[dtype: DType](
     var t0 = perf_counter_ns()
     var L_trans = L_prev.transpose(List[Int](1, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
@@ -234,13 +234,13 @@ fn update_left_environment[dtype: DType](
 
     t0 = perf_counter_ns()
     var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_prime, s * Dr))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     ctx.synchronize()
     t0 = perf_counter_ns()
     dense_tensor_dot(temp1_contract, L_flat^, A_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     var temp1_full = temp1_contract^.reshape(List[Int](wL, Dl_prime, s, Dr))
@@ -253,7 +253,7 @@ fn update_left_environment[dtype: DType](
     t0 = perf_counter_ns()
     var temp1_perm = temp1_full^.transpose(List[Int](1, 3, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     var temp1_mat = temp1_perm^.reshape(List[Int](Dl_prime * Dr, wL * s))
@@ -261,13 +261,13 @@ fn update_left_environment[dtype: DType](
 
     t0 = perf_counter_ns()
     var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     ctx.synchronize()
     t0 = perf_counter_ns()
     dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
@@ -276,7 +276,7 @@ fn update_left_environment[dtype: DType](
     t0 = perf_counter_ns()
     var temp2_perm = temp2^.transpose(List[Int](1, 3, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     var temp2_mat2 = temp2_perm^.reshape(List[Int](Dr * wR, Dl_prime * s_out))
@@ -284,13 +284,13 @@ fn update_left_environment[dtype: DType](
 
     t0 = perf_counter_ns()
     var L_next_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr * wR, Dr))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     ctx.synchronize()
     t0 = perf_counter_ns()
     dense_tensor_dot(L_next_mat, temp2_mat2^, A_flat2^, ctx)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
@@ -299,7 +299,7 @@ fn update_left_environment[dtype: DType](
     t0 = perf_counter_ns()
     var L_next = L_next_temp^.transpose(List[Int](1, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     profile.total_ns += Int(perf_counter_ns() - fn_t0)
@@ -308,8 +308,8 @@ fn update_left_environment[dtype: DType](
 
 fn update_right_environment[dtype: DType](
     R_next: DenseTensor[dtype],
-    A_site: MPSSite[dtype],
-    W_site: MPOSite[dtype],
+    A_site: MPSSite[dtype, DenseTensor[dtype]],
+    W_site: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> DenseTensor[dtype]:
     """Update right environment by contracting one site (propagating leftward).
@@ -418,8 +418,8 @@ fn update_right_environment[dtype: DType](
 
 
 fn build_right_environments[dtype: DType](
-    mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+    mps: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> List[DenseTensor[dtype]]:
     """Build all right environments from scratch (initialization for DMRG).
@@ -473,8 +473,8 @@ fn build_right_environments[dtype: DType](
 
 
 fn expectation_value[dtype: DType](
-    mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+    mps: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute the scalar expectation value <mps|mpo|mps>.
@@ -494,7 +494,7 @@ fn expectation_value[dtype: DType](
     var Dl0 = mps.bond_dimension(0)
     var L = create_dense_tensor_uninitialized[dtype](
         ctx,
-        List[Int](wL0, Dl0, Dl0)^
+        List[Int](wL0, Dl0, Dl0)
     )
     var host_L = ctx.enqueue_create_host_buffer[dtype](wL0 * Dl0 * Dl0)
     for w in range(wL0):
@@ -519,8 +519,8 @@ fn expectation_value[dtype: DType](
 
 
 fn expectation_value_normalized[dtype: DType](
-    mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+    mps: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute <mps|mpo|mps> / <mps|mps>."""
@@ -534,9 +534,9 @@ fn expectation_value_normalized[dtype: DType](
 
 fn update_left_environment_two_mps[dtype: DType](
     L_prev: DenseTensor[dtype],
-    A_bra: MPSSite[dtype],
-    A_ket: MPSSite[dtype],
-    W_site: MPOSite[dtype],
+    A_bra: MPSSite[dtype, DenseTensor[dtype]],
+    A_ket: MPSSite[dtype, DenseTensor[dtype]],
+    W_site: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> DenseTensor[dtype]:
     """Update left environment with different bra and ket MPS (for overlap, etc.).
@@ -591,9 +591,9 @@ fn update_left_environment_two_mps[dtype: DType](
 
 fn update_left_environment_two_mps[dtype: DType](
     L_prev: DenseTensor[dtype],
-    A_bra: MPSSite[dtype],
-    A_ket: MPSSite[dtype],
-    W_site: MPOSite[dtype],
+    A_bra: MPSSite[dtype, DenseTensor[dtype]],
+    A_ket: MPSSite[dtype, DenseTensor[dtype]],
+    W_site: MPOSite[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
     mut profile: ProfileStats,
 ) raises -> DenseTensor[dtype]:
@@ -615,7 +615,7 @@ fn update_left_environment_two_mps[dtype: DType](
     var t0 = perf_counter_ns()
     var L_trans = L_prev.transpose(List[Int](1, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     var L_flat = L_trans^.reshape(List[Int](Dl_prev, wL * Dl_prime))
@@ -623,13 +623,13 @@ fn update_left_environment_two_mps[dtype: DType](
 
     t0 = perf_counter_ns()
     var temp1_contract = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL * Dl_prime, s * Dr))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     ctx.synchronize()
     t0 = perf_counter_ns()
     dense_tensor_dot(temp1_contract, L_flat^, A_ket_flat^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     var temp1_full = temp1_contract^.reshape(List[Int](wL, Dl_prime, s, Dr))
@@ -642,7 +642,7 @@ fn update_left_environment_two_mps[dtype: DType](
     t0 = perf_counter_ns()
     var temp1_perm = temp1_full^.transpose(List[Int](1, 3, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     var temp1_mat = temp1_perm^.reshape(List[Int](Dl_prime * Dr, wL * s))
@@ -650,13 +650,13 @@ fn update_left_environment_two_mps[dtype: DType](
 
     t0 = perf_counter_ns()
     var temp2_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_prime * Dr, s_out * wR))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     ctx.synchronize()
     t0 = perf_counter_ns()
     dense_tensor_dot(temp2_mat, temp1_mat^, W_mat^, ctx)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     var temp2 = temp2_mat^.reshape(List[Int](Dl_prime, Dr, s_out, wR))
@@ -665,7 +665,7 @@ fn update_left_environment_two_mps[dtype: DType](
     t0 = perf_counter_ns()
     var temp2_perm = temp2^.transpose(List[Int](1, 3, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     var temp2_mat2 = temp2_perm^.reshape(List[Int](Dr * wR, Dl_prime * s_out))
@@ -673,13 +673,13 @@ fn update_left_environment_two_mps[dtype: DType](
 
     t0 = perf_counter_ns()
     var L_next_mat = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr * wR, Dr))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     ctx.synchronize()
     t0 = perf_counter_ns()
     dense_tensor_dot(L_next_mat, temp2_mat2^, A_bra_flat^, ctx)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     var L_next_temp = L_next_mat^.reshape(List[Int](Dr, wR, Dr))
@@ -688,7 +688,7 @@ fn update_left_environment_two_mps[dtype: DType](
     t0 = perf_counter_ns()
     var L_next = L_next_temp^.transpose(List[Int](1, 0, 2), ctx)
     ctx.synchronize()
-    profile.transpose_ns += perf_counter_ns() - t0
+    profile.transpose_ns += Int(perf_counter_ns() - t0)
     profile.transpose_calls += 1
 
     profile.total_ns += Int(perf_counter_ns() - fn_t0)
@@ -696,9 +696,9 @@ fn update_left_environment_two_mps[dtype: DType](
 
 
 fn expectation_value_two_mps[dtype: DType](
-    mps_bra: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
-    mps_ket: MatrixProductState[dtype],
+    mps_bra: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
+    mps_ket: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute <mps_bra|mpo|mps_ket> with different bra and ket MPS."""
@@ -708,7 +708,7 @@ fn expectation_value_two_mps[dtype: DType](
 
     var wL0 = mpo.bond_dimension(0)
     var Dl0 = mps_bra.bond_dimension(0)
-    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL0, Dl0, Dl0)^)
+    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL0, Dl0, Dl0))
     var host_L = ctx.enqueue_create_host_buffer[dtype](wL0 * Dl0 * Dl0)
     for w in range(wL0):
         for d in range(Dl0):
@@ -730,9 +730,9 @@ fn expectation_value_two_mps[dtype: DType](
 
 
 fn expectation_value_two_mps[dtype: DType](
-    mps_bra: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
-    mps_ket: MatrixProductState[dtype],
+    mps_bra: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
+    mps_ket: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
     mut profile: ProfileStats,
 ) raises -> Float64:
@@ -743,7 +743,7 @@ fn expectation_value_two_mps[dtype: DType](
 
     var wL0 = mpo.bond_dimension(0)
     var Dl0 = mps_bra.bond_dimension(0)
-    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL0, Dl0, Dl0)^)
+    var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](wL0, Dl0, Dl0))
     var host_L = ctx.enqueue_create_host_buffer[dtype](wL0 * Dl0 * Dl0)
     for w in range(wL0):
         for d in range(Dl0):
@@ -879,7 +879,7 @@ fn _mps_contraction_step_left[dtype: DType](
     if False: # dtype == DType.float32:
         var t0 = perf_counter_ns()
         var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
-        profile.alloc_ns += perf_counter_ns() - t0
+        profile.alloc_ns += Int(perf_counter_ns() - t0)
 
         # Step 1 GEMM kernel
         var A_ket_mat = A_ket.reshape(List[Int](Dl_ket, d * Dr_ket))
@@ -904,13 +904,13 @@ fn _mps_contraction_step_left[dtype: DType](
             block_dim=BLOCK_SIZE,
         )
         ctx.synchronize()
-        profile.dot_ns += perf_counter_ns() - t0
+        profile.dot_ns += Int(perf_counter_ns() - t0)
         profile.dot_calls += 1
 
         # Step 2
         t0 = perf_counter_ns()
         var L_next = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr_ket, Dr_bra))
-        profile.alloc_ns += perf_counter_ns() - t0
+        profile.alloc_ns += Int(perf_counter_ns() - t0)
 
         var temp_mat = temp^.reshape(List[Int](Dl_bra * d, Dr_ket))
         var A_bra_mat = A_bra.reshape(List[Int](Dl_bra * d, Dr_bra))
@@ -934,7 +934,7 @@ fn _mps_contraction_step_left[dtype: DType](
             block_dim=BLOCK_SIZE,
         )
         ctx.synchronize()
-        profile.dot_ns += perf_counter_ns() - t0
+        profile.dot_ns += Int(perf_counter_ns() - t0)
         profile.dot_calls += 1
 
         return L_next^
@@ -942,7 +942,7 @@ fn _mps_contraction_step_left[dtype: DType](
     # Fallback: generic contraction via dense_tensor_dot (supports other dtypes).
     var t0 = perf_counter_ns()
     var temp = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_bra, d, Dr_ket))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     var L_view = L_prev.reshape(List[Int](Dl_ket, Dl_bra))
     var A_ket_view = A_ket.reshape(List[Int](Dl_ket, d, Dr_ket))
@@ -950,27 +950,27 @@ fn _mps_contraction_step_left[dtype: DType](
     t0 = perf_counter_ns()
     dense_tensor_dot(temp, L_view^, A_ket_view^, ctx, ndim_mult=1, axrange_A=True, axrange_B=True)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     t0 = perf_counter_ns()
     var L_next = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dr_ket, Dr_bra))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     var A_bra_view = A_bra.reshape(List[Int](Dl_bra, d, Dr_bra))
     ctx.synchronize()
     t0 = perf_counter_ns()
     dense_tensor_dot(L_next, temp^, A_bra_view^, ctx, ndim_mult=2, axrange_A=True, axrange_B=True)
     ctx.synchronize()
-    profile.dot_ns += perf_counter_ns() - t0
+    profile.dot_ns += Int(perf_counter_ns() - t0)
     profile.dot_calls += 1
 
     return L_next^
 
 
 fn mps_vdot_direct[dtype: DType](
-    bra: MatrixProductState[dtype],
-    ket: MatrixProductState[dtype],
+    bra: MatrixProductState[dtype, DenseTensor[dtype]],
+    ket: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Direct MPS-MPS overlap <bra|ket> without identity MPO.
@@ -1016,8 +1016,8 @@ fn mps_vdot_direct[dtype: DType](
 
 
 fn mps_overlap[dtype: DType](
-    mps_bra: MatrixProductState[dtype],
-    mps_ket: MatrixProductState[dtype],
+    mps_bra: MatrixProductState[dtype, DenseTensor[dtype]],
+    mps_ket: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute <mps_bra|mps_ket> using direct contraction (no identity MPO)."""
@@ -1025,8 +1025,8 @@ fn mps_overlap[dtype: DType](
 
 
 fn mps_overlap[dtype: DType](
-    mps_bra: MatrixProductState[dtype],
-    mps_ket: MatrixProductState[dtype],
+    mps_bra: MatrixProductState[dtype, DenseTensor[dtype]],
+    mps_ket: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
     mut profile: ProfileStats,
 ) raises -> Float64:
@@ -1043,7 +1043,7 @@ fn mps_overlap[dtype: DType](
 
     var t0 = perf_counter_ns()
     var L = create_dense_tensor_uninitialized[dtype](ctx, List[Int](Dl_ket, Dl_bra))
-    profile.alloc_ns += perf_counter_ns() - t0
+    profile.alloc_ns += Int(perf_counter_ns() - t0)
 
     var L_size = Dl_ket * Dl_bra
     var host_L = ctx.enqueue_create_host_buffer[dtype](L_size)
@@ -1069,8 +1069,8 @@ fn mps_overlap[dtype: DType](
 
 
 fn variance[dtype: DType](
-    mps: MatrixProductState[dtype],
-    mpo: MatrixProductOperator[dtype],
+    mps: MatrixProductState[dtype, DenseTensor[dtype]],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
 ) raises -> Float64:
     """Compute var = <H^2> - <H>^2 via MPO composition.
@@ -1084,10 +1084,10 @@ fn variance[dtype: DType](
 
 
 fn mpo_compose[dtype: DType](
-    mpo_a: MatrixProductOperator[dtype],
-    mpo_b: MatrixProductOperator[dtype],
+    mpo_a: MatrixProductOperator[dtype, DenseTensor[dtype]],
+    mpo_b: MatrixProductOperator[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
-) raises -> MatrixProductOperator[dtype]:
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
     """Compose two MPOs: (A o B)|psi> = A(B|psi>).
     
     At each site: W_new = sum_d_mid W_a[:,:,d_mid,:] * W_b[:,d_mid,:,:]
@@ -1097,7 +1097,7 @@ fn mpo_compose[dtype: DType](
     if mpo_b.num_sites() != N:
         raise Error("MPO compose: length mismatch")
 
-    var sites = List[MPOSite[dtype]](capacity=N)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=N)
     for i in range(N):
         var Wa = mpo_a.sites[i].tensor
         var Wb = mpo_b.sites[i].tensor
@@ -1127,16 +1127,16 @@ fn mpo_compose[dtype: DType](
         var C = C_mat^.reshape(List[Int](wLa, d_in, wRa, wLb, d_out, wRb))
         var C_perm = C^.transpose(List[Int](0, 3, 1, 4, 2, 5), ctx)
         var site_tensor = C_perm^.reshape(List[Int](wL_new, d_in, d_out, wR_new))
-        sites.append(MPOSite[dtype](site_tensor^))
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](site_tensor^))
 
-    return MatrixProductOperator[dtype](sites^)
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)
 
 
 fn apply_mpo[dtype: DType](
-    mpo: MatrixProductOperator[dtype],
-    mps: MatrixProductState[dtype],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
+    mps: MatrixProductState[dtype, DenseTensor[dtype]],
     ctx: DeviceContext,
-) raises -> MatrixProductState[dtype]:
+) raises -> MatrixProductState[dtype, DenseTensor[dtype]]:
     """Apply MPO to MPS: |out> = O|mps>.
 
     At each site: contract MPS site A[Dl, d, Dr] with MPO site W[wL, d, d_out, wR]
@@ -1148,7 +1148,7 @@ fn apply_mpo[dtype: DType](
     if mpo.num_sites() != N:
         raise Error("apply_mpo: MPS and MPO must have same number of sites")
 
-    var out_sites = List[MPSSite[dtype]](capacity=N)
+    var out_sites = List[MPSSite[dtype, DenseTensor[dtype]]](capacity=N)
     for i in range(N):
         var A = mps.sites[i].tensor
         var W = mpo.sites[i].tensor
@@ -1183,7 +1183,7 @@ fn apply_mpo[dtype: DType](
         # Permute to (wL, Dl, d_out, wR, Dr), reshape to (wL*Dl, d_out, wR*Dr).
         var C_perm = C^.transpose(List[Int](2, 0, 3, 4, 1), ctx)
         var site_tensor = C_perm^.reshape(List[Int](wL * Dl, d_out, wR * Dr))
-        out_sites.append(MPSSite[dtype](site_tensor^))
+        out_sites.append(MPSSite[dtype, DenseTensor[dtype]](site_tensor^))
 
     ctx.synchronize()
-    return MatrixProductState[dtype](out_sites^)
+    return MatrixProductState[dtype, DenseTensor[dtype]](out_sites^)

@@ -1,7 +1,7 @@
 from collections.list import List
 from gpu.host import DeviceContext
 from src.m_tensor.dense_tensor import create_dense_tensor_from_data, DenseTensor
-from src.state.mpo_state import MPOSite, MatrixProductOperator
+from src.state.mpo_state import MPOSite, MatrixProductOperator, DenseMPO, DenseMPOSite
 
 
 fn create_transverse_ising_mpo[dtype: DType = DType.float32](
@@ -9,8 +9,8 @@ fn create_transverse_ising_mpo[dtype: DType = DType.float32](
     num_sites: Int,
     J: Float64 = 1.0, # internal ferromagnetic coupling Ref: https://farside.ph.utexas.edu/teaching/329/lectures/node110.html
     h: Float64 = 0.5, # external field strength
-) raises -> MatrixProductOperator[dtype]:
-    """Create MPO for the transverse-field Ising model.
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create DenseTensor-based MPO for the transverse-field Ising model.
     
     Hamiltonian: H = -J * sum_i (Z_i Z_{i+1}) - h * sum_i X_i
     
@@ -28,18 +28,12 @@ fn create_transverse_ising_mpo[dtype: DType = DType.float32](
     
     Returns:
         MatrixProductOperator representing the Ising Hamiltonian.
-    
-    Example:
-        ```mojo
-        # Create Ising model with 10 sites
-        var H = create_transverse_ising_mpo(ctx, 10, J=1.0, h=0.5)
-        ```
     """
     if num_sites < 2:
         raise Error("Ising model requires at least 2 sites")
     
     var d = 2  # Physical dimension (qubit)
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     
     # Local operators (Pauli matrices).
     #
@@ -58,8 +52,8 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
     J: Float64 = 1.0,
     h_longitudinal: Float64 = 0.0,
     g_transverse: Float64 = 1.0,
-) raises -> MatrixProductOperator[dtype]:
-    """Create MPO for the 1D Ising model with longitudinal + transverse fields.
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create DenseTensor-based MPO for the 1D Ising model with longitudinal + transverse fields.
     
     Matches ChemTensor `construct_ising_1d_mpo(nsites, J, h, g)`:
         H = -J * sum_i (Z_i Z_{i+1}) - g * sum_i X_i - h * sum_i Z_i
@@ -69,7 +63,7 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
         raise Error("Ising model requires at least 2 sites")
 
     var d = 2
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
 
     # Identity
     var I_data = List[Scalar[dtype]](
@@ -119,7 +113,7 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
     var W0_tensor = create_dense_tensor_from_data[dtype](
         ctx, W0_data^, List[Int](1, d, d, 3)
     )
-    sites.append(MPOSite[dtype](W0_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](W0_tensor^))
     
     # Bulk sites (middle) - shape [Wl=3, d_in=2, d_out=2, Wr=3]
     for i in range(1, num_sites - 1):
@@ -147,7 +141,7 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
         var W_bulk_tensor = create_dense_tensor_from_data[dtype](
             ctx, W_bulk_data^, List[Int](3, d, d, 3)
         )
-        sites.append(MPOSite[dtype](W_bulk_tensor^))
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](W_bulk_tensor^))
     
     # Last site (right edge) - shape [Wl=3, d_in=2, d_out=2, Wr=1]
     # W[-1] = [ I, -J*Z, -h*Z-g*X ]^T
@@ -169,17 +163,17 @@ fn create_ising_1d_mpo[dtype: DType = DType.float32](
     var WN_tensor = create_dense_tensor_from_data[dtype](
         ctx, WN_data^, List[Int](3, d, d, 1)
     )
-    sites.append(MPOSite[dtype](WN_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](WN_tensor^))
     
-    return MatrixProductOperator[dtype](sites^)
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)
 
 
 fn create_heisenberg_mpo[dtype: DType = DType.float32](
     ctx: DeviceContext,
     num_sites: Int,
     J: Float64 = 1.0,
-) raises -> MatrixProductOperator[dtype]:
-    """Create MPO for the Heisenberg XXX model.
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create DenseTensor-based MPO for the Heisenberg XXX model.
     
     Hamiltonian: H = J * sum_i (X_i X_{i+1} + Y_i Y_{i+1} + Z_i Z_{i+1})
     
@@ -212,7 +206,7 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
         raise Error("Heisenberg model requires at least 2 sites")
     
     var d = 2  # Physical dimension (qubit)
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     
     # Identity  I = [[1, 0], [0, 1]]
     var I_data = List[Scalar[dtype]](
@@ -260,7 +254,7 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
     var W0_tensor = create_dense_tensor_from_data[dtype](
         ctx, W0_data^, List[Int](1, d, d, 5)
     )
-    sites.append(MPOSite[dtype](W0_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](W0_tensor^))
     
     # Bulk sites - shape [Wl=5, d_in=2, d_out=2, Wr=5]
     # Row 0: [I,   S+,    S-,    Z,    0   ]
@@ -310,7 +304,7 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
         var W_bulk_tensor = create_dense_tensor_from_data[dtype](
             ctx, W_bulk_data^, List[Int](5, d, d, 5)
         )
-        sites.append(MPOSite[dtype](W_bulk_tensor^))
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](W_bulk_tensor^))
     
     # Last site - shape [Wl=5, d_in=2, d_out=2, Wr=1]
     # Column vector: [0, 2J*S-, 2J*S+, J*Z, I]^T
@@ -336,9 +330,9 @@ fn create_heisenberg_mpo[dtype: DType = DType.float32](
     var WN_tensor = create_dense_tensor_from_data[dtype](
         ctx, WN_data^, List[Int](5, d, d, 1)
     )
-    sites.append(MPOSite[dtype](WN_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](WN_tensor^))
     
-    return MatrixProductOperator[dtype](sites^)
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)
 
 
 fn create_heisenberg_xxz_mpo[dtype: DType = DType.float32](
@@ -347,8 +341,8 @@ fn create_heisenberg_xxz_mpo[dtype: DType = DType.float32](
     J: Float64 = 1.0,
     D: Float64 = 1.0,
     h: Float64 = 0.0,
-) raises -> MatrixProductOperator[dtype]:
-    """Create MPO for the Heisenberg XXZ model.
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create DenseTensor-based MPO for the Heisenberg XXZ model.
     
     Hamiltonian: H = -J * sum_i[(X_i*X_{i+1} + Y_i*Y_{i+1} + D*Z_i*Z_{i+1})] - h * sum_i(Z_i)
     
@@ -392,7 +386,7 @@ fn create_heisenberg_xxz_mpo[dtype: DType = DType.float32](
         raise Error("Heisenberg model requires at least 2 sites")
     
     var d = 2  # Physical dimension (qubit)
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     
     # Identity  I = [[1, 0], [0, 1]]
     var I_data = List[Scalar[dtype]](
@@ -440,7 +434,7 @@ fn create_heisenberg_xxz_mpo[dtype: DType = DType.float32](
     var W0_tensor = create_dense_tensor_from_data[dtype](
         ctx, W0_data^, List[Int](1, d, d, 5)
     )
-    sites.append(MPOSite[dtype](W0_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](W0_tensor^))
     
     # Bulk sites - shape [Wl=5, d_in=2, d_out=2, Wr=5]
     # Row 0: [   I,    0,     0,     0,    0   ]
@@ -490,7 +484,7 @@ fn create_heisenberg_xxz_mpo[dtype: DType = DType.float32](
         var W_bulk_tensor = create_dense_tensor_from_data[dtype](
             ctx, W_bulk_data^, List[Int](5, d, d, 5)
         )
-        sites.append(MPOSite[dtype](W_bulk_tensor^))
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](W_bulk_tensor^))
     
     # Last site - shape [Wl=5, d_in=2, d_out=2, Wr=1]
     # Column vector: [I, -2J*S-, -2J*S+, -J*Z, -h*Z]^T
@@ -516,9 +510,9 @@ fn create_heisenberg_xxz_mpo[dtype: DType = DType.float32](
     var WN_tensor = create_dense_tensor_from_data[dtype](
         ctx, WN_data^, List[Int](5, d, d, 1)
     )
-    sites.append(MPOSite[dtype](WN_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](WN_tensor^))
     
-    return MatrixProductOperator[dtype](sites^)
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)
 
 
 fn create_bose_hubbard_mpo[dtype: DType = DType.float32](
@@ -528,8 +522,8 @@ fn create_bose_hubbard_mpo[dtype: DType = DType.float32](
     t: Float64 = 1.0,    # hopping strength
     u: Float64 = 1.0,    # on-site interaction strength
     mu: Float64 = 0.0    # chemical potential
-) raises -> MatrixProductOperator[dtype]:
-    """Create MPO for the 1D Bose-Hubbard model.
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create DenseTensor-based MPO for the 1D Bose-Hubbard model.
     
     Hamiltonian: H = -t*sum_i(b†_i b_{i+1} + h.c.) + (u/2)*sum_i(n_i(n_i-1)) - mu*sum_i(n_i)
     
@@ -564,7 +558,7 @@ fn create_bose_hubbard_mpo[dtype: DType = DType.float32](
         raise Error("Physical dimension must be >= 2")
     
     var d = physical_dim
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     
     # Create bosonic operators
     # Identity: I[i,j] = delta_{i,j}
@@ -623,7 +617,7 @@ fn create_bose_hubbard_mpo[dtype: DType = DType.float32](
     var W0_tensor = create_dense_tensor_from_data[dtype](
         ctx, W0_data^, List[Int](1, d, d, 4)
     )
-    sites.append(MPOSite[dtype](W0_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](W0_tensor^))
     
     # Bulk sites - shape [Wl=4, d, d, Wr=4]
     for _ in range(1, num_sites - 1):
@@ -658,7 +652,7 @@ fn create_bose_hubbard_mpo[dtype: DType = DType.float32](
         var W_bulk_tensor = create_dense_tensor_from_data[dtype](
             ctx, W_bulk_data^, List[Int](4, d, d, 4)
         )
-        sites.append(MPOSite[dtype](W_bulk_tensor^))
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](W_bulk_tensor^))
     
     # Last site - shape [Wl=4, d, d, Wr=1]
     var WN_data = List[Scalar[dtype]](capacity=d * d * 4)
@@ -680,6 +674,6 @@ fn create_bose_hubbard_mpo[dtype: DType = DType.float32](
     var WN_tensor = create_dense_tensor_from_data[dtype](
         ctx, WN_data^, List[Int](4, d, d, 1)
     )
-    sites.append(MPOSite[dtype](WN_tensor^))
+    sites.append(MPOSite[dtype, DenseTensor[dtype]](WN_tensor^))
     
-    return MatrixProductOperator[dtype](sites^)
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)

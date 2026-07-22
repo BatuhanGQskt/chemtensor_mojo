@@ -17,13 +17,13 @@ from src.m_tensor.dense_tensor import (
     create_dense_tensor_from_data,
     dense_tensor_dot,
 )
-from src.state.mpo_state import MatrixProductOperator, MPOSite
+from src.state.mpo_state import MatrixProductOperator, MPOSite, DenseMPO
 
 
 fn mpo_to_full_matrix[
     dtype: DType
 ](
-    mpo: MatrixProductOperator[dtype],
+    mpo: MatrixProductOperator[dtype, DenseTensor[dtype]],
     ctx: DeviceContext
 ) raises -> DenseTensor[dtype]:
     """Contract all MPO sites to obtain the full Hamiltonian matrix.
@@ -50,11 +50,11 @@ fn mpo_to_full_matrix[
         raise Error("Physical input and output dimensions must match")
     
     # Start with the first site: shape [Wl=1, d, d, Wr]
-    var result = mpo.sites[0].tensor
+    var result = mpo.sites[0].tensor.copy()
     
     # Contract remaining sites sequentially
     for i in range(1, nsites):
-        var next_site = mpo.sites[i].tensor
+        var next_site = mpo.sites[i].tensor.copy()
         
         # result currently has shape [..., d_prev, d_prev, Wr_prev]
         # next_site has shape [Wl_next, d, d, Wr_next]

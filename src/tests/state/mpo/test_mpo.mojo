@@ -14,7 +14,8 @@ Based on ChemTensor C implementation tests.
 
 from collections.list import List
 from gpu.host import DeviceContext
-from src.state.mpo_state import MatrixProductOperator, MPOSite, create_identity_mpo
+from src.state.mpo_state import MatrixProductOperator, MPOSite, DenseMPOSite, DenseMPO, create_identity_mpo
+from src.m_tensor.tensor_traits import TensorOps
 from src.state.hamiltonians import create_ising_1d_mpo, create_heisenberg_mpo, create_heisenberg_xxz_mpo
 from src.m_tensor.dense_tensor import DenseTensor, create_dense_tensor, create_dense_tensor_from_data, dense_tensor_dot
 from testing import TestSuite
@@ -91,8 +92,8 @@ fn print_dense_tensor_data[dtype: DType](t: DenseTensor[dtype], name: String, ct
         print("... (" + String(t.size - max_print) + " more elements not shown)")
 
 
-fn contract_mpo_to_dense_simple(
-    mpo: MatrixProductOperator[DType.float32],
+fn contract_mpo_to_dense_simple[T: TensorOps](
+    mpo: MatrixProductOperator[DType.float32, T],
     ctx: DeviceContext,
 ) raises -> DenseTensor[DType.float32]:
     """Contract an MPO to a dense matrix representation.
@@ -105,12 +106,12 @@ fn contract_mpo_to_dense_simple(
     if d != mpo.physical_out_dim:
         raise Error("Physical input and output dimensions must match for this test")
     
-    # Start with first site tensor
-    var result = mpo.sites[0].tensor
+    # Start with first site tensor - copy and rebind to DenseTensor
+    var result = rebind[DenseTensor[DType.float32]](mpo.sites[0].tensor.copy())
     
     # Contract remaining sites
     for i in range(1, nsites):
-        var next_site = mpo.sites[i].tensor
+        var next_site = rebind[DenseTensor[DType.float32]](mpo.sites[i].tensor.copy())
         
         # Contract result with next_site
         # result: [..., d, d, Wr_prev]
@@ -171,9 +172,9 @@ fn contract_mpo_to_dense_simple(
     return result.reshape(List[Int](left_dim, right_dim))
 
 
-fn merge_mpo_tensor_pair(
-    site0: MPOSite[DType.float32],
-    site1: MPOSite[DType.float32],
+fn merge_mpo_tensor_pair[T: TensorOps](
+    site0: MPOSite[DType.float32, T],
+    site1: MPOSite[DType.float32, T],
     ctx: DeviceContext,
 ) raises -> DenseTensor[DType.float32]:
     """Merge two adjacent MPO site tensors by contracting the shared bond.
@@ -195,11 +196,9 @@ fn merge_mpo_tensor_pair(
         Merged tensor with shape `[Wl0, d_in*d_in, d_out*d_out, Wr1]`.
         Physical indices are properly ordered: combined inputs then combined outputs.
     """
-    var W0 = site0.tensor
-    var W1 = site1.tensor
-    
-    var W0_shape = W0.shape.copy()
-    var W1_shape = W1.shape.copy()
+    # Copy tensors from sites and get shapes using trait methods
+    var W0_shape = site0.tensor.get_shape()
+    var W1_shape = site1.tensor.get_shape()
     
     var wl0 = W0_shape[0]
     var d_in0 = W0_shape[1]
@@ -218,6 +217,10 @@ fn merge_mpo_tensor_pair(
     
     print("Merged shape components:")
     print("  wl0 =", wl0, ", d_in0 =", d_in0, ", d_in1 =", d_in1, ", d_out0 =", d_out0, ", d_out1 =", d_out1, ", wr0 =", wr0, ", wr1 =", wr1)
+    
+    # Copy tensors and rebind to DenseTensor for DenseTensor-specific operations
+    var W0 = rebind[DenseTensor[DType.float32]](site0.tensor.copy())
+    var W1 = rebind[DenseTensor[DType.float32]](site1.tensor.copy())
     
     # Step 1: Contract over the bond dimension (Wr0 == Wl1)
     # W0: [Wl0, d_in0, d_out0, Wr0]

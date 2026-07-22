@@ -1,42 +1,11 @@
-"""Tensor abstraction layer for chemtensor.
-
-This module defines the TensorOps trait that provides a complete interface
-for tensor operations. Both DenseTensor and BlockSparseTensor implement
-this trait, allowing them to be used interchangeably in MPS, MPO, DMRG,
-and other algorithms.
-
-Usage:
-    # Import the trait and tensor types
-    from src.m_tensor.tensor_traits import TensorOps, TensorBackend
-    from src.m_tensor.tensor_ops import Tensor  # Alias based on compile-time selection
-    
-    # Write backend-agnostic algorithms:
-    fn my_algorithm[T: TensorOps](tensor: T, ctx: DeviceContext) raises:
-        var norm = tensor.compute_norm(ctx)
-        var shape = tensor.get_shape()
-        # ... algorithm implementation ...
-
-Compile-Time Backend Selection:
-    Change TensorBackendType in tensor_ops.mojo to switch backends globally:
-        alias TensorBackendType: Int = TensorBackend.DENSE        # Dense tensors
-        alias TensorBackendType: Int = TensorBackend.BLOCK_SPARSE # Block sparse
-
-Note on Trait Limitations:
-    Mojo traits cannot have methods that return Self or take `var self`.
-    Such methods (transpose, reshape, etc.) are implemented as:
-    1. Regular methods on each tensor type
-    2. Generic free functions in tensor_ops.mojo for dispatch
-"""
-
-from collections.list import List
-from gpu.host import DeviceContext, DeviceBuffer
-
-
-trait TensorOps:
+trait TensorOps(Movable, Copyable):
     """Complete interface for tensor operations.
     
     All tensor implementations (DenseTensor, BlockSparseTensor) must implement
     this trait to be usable in chemtensor algorithms.
+    
+    The trait inherits from Movable and Copyable to ensure all tensor types
+    can be stored in containers and moved around.
     
     The trait is organized into categories:
     - Property Access: get_shape, get_stride, get_size, get_rank
@@ -55,21 +24,15 @@ trait TensorOps:
     # Property Access
     # =========================================================================
     
-    fn get_shape(self) -> List[Int]:
+    def get_shape(self) -> List[Int]:
         """Get the shape of the tensor as a list of dimensions.
         
         Returns:
             Copy of the shape list, length equals tensor rank.
-        
-        Example:
-            ```mojo
-            var tensor = create_tensor(ctx, List[Int](3, 4, 5)^)
-            var shape = tensor.get_shape()  # [3, 4, 5]
-            ```
         """
         ...
     
-    fn get_stride(self) -> List[Int]:
+    def get_stride(self) -> List[Int]:
         """Get the stride of the tensor for each dimension.
         
         For row-major tensors, stride[i] is the number of elements to skip
@@ -77,40 +40,36 @@ trait TensorOps:
         
         Returns:
             Copy of the stride list.
-        
-        Example:
-            ```mojo
-            var tensor = create_tensor(ctx, List[Int](3, 4, 5)^)
-            var stride = tensor.get_stride()  # [20, 5, 1] for row-major
-            ```
         """
         ...
     
-    fn get_size(self) -> Int:
+    def get_size(self) -> Int:
         """Get the total number of elements in the tensor.
         
         Returns:
             Product of all dimensions.
-        
-        Example:
-            ```mojo
-            var tensor = create_tensor(ctx, List[Int](3, 4, 5)^)
-            var size = tensor.get_size()  # 60
-            ```
         """
         ...
     
-    fn get_rank(self) -> Int:
+    def get_rank(self) -> Int:
         """Get the number of dimensions (rank) of the tensor.
         
         Returns:
             Number of dimensions.
+        """
+        ...
+    
+    def get_shape_at(self, idx: Int) -> Int:
+        """Get the dimension at a specific index.
         
-        Example:
-            ```mojo
-            var tensor = create_tensor(ctx, List[Int](3, 4, 5)^)
-            var rank = tensor.get_rank()  # 3
-            ```
+        This is a convenience method to avoid copying the entire shape list
+        when only one dimension is needed.
+        
+        Args:
+            idx: The dimension index (0-based).
+        
+        Returns:
+            The size of dimension idx.
         """
         ...
     
@@ -118,7 +77,7 @@ trait TensorOps:
     # Memory Layout
     # =========================================================================
     
-    fn is_contiguous(self) -> Bool:
+    def is_contiguous(self) -> Bool:
         """Check if tensor memory layout is contiguous in row-major order.
         
         A contiguous tensor has elements stored sequentially in memory.
@@ -138,7 +97,7 @@ trait TensorOps:
     # Index Operations
     # =========================================================================
     
-    fn get_flat_index(self, indices: List[Int]) -> Int:
+    def get_flat_index(self, indices: List[Int]) -> Int:
         """Compute flat linear index from multi-dimensional indices.
         
         Uses the tensor's stride to compute the linear offset.
@@ -148,12 +107,6 @@ trait TensorOps:
         
         Returns:
             Linear index into the underlying storage.
-        
-        Example:
-            ```mojo
-            var tensor = create_tensor(ctx, List[Int](3, 4)^)  # stride [4, 1]
-            var idx = tensor.get_flat_index(List[Int](1, 2))  # 1*4 + 2*1 = 6
-            ```
         """
         ...
     
@@ -161,7 +114,7 @@ trait TensorOps:
     # Numerical Operations (Read-Only)
     # =========================================================================
     
-    fn compute_norm(self, ctx: DeviceContext) raises -> Float64:
+    def compute_norm(self, ctx: DeviceContext) raises -> Float64:
         """Compute the Frobenius norm of the tensor.
         
         The Frobenius norm is sqrt(sum of squared elements).
@@ -175,7 +128,7 @@ trait TensorOps:
         """
         ...
     
-    fn compute_norm_sq(self, ctx: DeviceContext) raises -> Float64:
+    def compute_norm_sq(self, ctx: DeviceContext) raises -> Float64:
         """Compute the squared Frobenius norm of the tensor.
         
         Avoids the sqrt for cases where only the squared norm is needed.
@@ -188,7 +141,7 @@ trait TensorOps:
         """
         ...
     
-    fn compute_dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
+    def compute_dot_product(self, other: Self, ctx: DeviceContext) raises -> Float64:
         """Compute the inner product <self, other>.
         
         The inner product is sum_i self_i * other_i (for real tensors).
@@ -210,7 +163,7 @@ trait TensorOps:
     # Debug/Utility
     # =========================================================================
     
-    fn print_contents(self, ctx: DeviceContext) raises -> None:
+    def print_contents(self, ctx: DeviceContext) raises -> None:
         """Print the tensor contents for debugging.
         
         Transfers data from GPU to host for printing.
@@ -218,6 +171,18 @@ trait TensorOps:
         
         Args:
             ctx: Device context for GPU operations.
+        """
+        ...
+    
+    @staticmethod
+    def backend() -> TensorBackend:
+        """Get the backend type of this tensor.
+        
+        Returns compile-time constant identifying the tensor implementation.
+        Used for compile-time dispatch with @parameter if.
+        
+        Returns:
+            TensorBackend constant DENSE, BLOCK_SPARSE, etc.
         """
         ...
 
@@ -267,45 +232,41 @@ struct TensorBackend:
     """Compile-time constants for tensor backend selection.
     
     Use these constants with @parameter if for compile-time dispatch:
-    
-    Example:
-        ```mojo
-        alias MyBackend: Int = TensorBackend.DENSE
-        
-        @parameter
-        if MyBackend == TensorBackend.DENSE:
-            # Dense tensor code path (compiled only if DENSE is selected)
-            pass
-        elif MyBackend == TensorBackend.BLOCK_SPARSE:
-            # Block sparse code path (compiled only if BLOCK_SPARSE is selected)
-            pass
-        ```
+
     """
     # Compile-time constants for backend selection
-    alias DENSE: Int = 0
-    alias BLOCK_SPARSE: Int = 1
-    alias COMPLEX_DENSE: Int = 2
+    comptime DENSE: Int = 0
+    comptime BLOCK_SPARSE: Int = 1
+    comptime COMPLEX_DENSE: Int = 2
     
     # Runtime value (for cases where runtime checks are needed)
     var value: Int
     
-    fn __init__(out self, value: Int):
+    def __init__(out self, value: Int):
         self.value = value
     
-    fn is_dense(self) -> Bool:
+    def __eq__(self, other: Self) -> Bool:
+        """Compare two TensorBackend values."""
+        return self.value == other.value
+    
+    def __ne__(self, other: Self) -> Bool:
+        """Compare two TensorBackend values for inequality."""
+        return self.value != other.value
+    
+    def is_dense(self) -> Bool:
         """Runtime check if this is a dense backend."""
         return self.value == Self.DENSE
     
-    fn is_block_sparse(self) -> Bool:
+    def is_block_sparse(self) -> Bool:
         """Runtime check if this is a block-sparse backend."""
         return self.value == Self.BLOCK_SPARSE
     
-    fn is_complex(self) -> Bool:
+    def is_complex(self) -> Bool:
         """Runtime check if this is a complex dense backend."""
         return self.value == Self.COMPLEX_DENSE
     
     @staticmethod
-    fn name(backend_type: Int) -> String:
+    def name(backend_type: Int) -> String:
         """Get the name of a backend type."""
         if backend_type == Self.DENSE:
             return "DenseTensor"
@@ -315,25 +276,3 @@ struct TensorBackend:
             return "ComplexDenseTensor"
         else:
             return "Unknown"
-
-
-# =============================================================================
-# Generic Operation Signatures
-# =============================================================================
-# These are type signatures that generic tensor operations should follow.
-# Actual implementations are in tensor_ops.mojo
-
-# Tensor contraction signature:
-# fn tensor_dot[T: TensorOps, dtype: DType](
-#     C: T, A: T, B: T, ctx: DeviceContext, 
-#     ndim_mult: Int, axrange_A: Bool, axrange_B: Bool
-# ) raises
-
-# Tensor decomposition signatures:
-# fn tensor_qr[T: TensorOps, dtype: DType](
-#     tensor: T, ctx: DeviceContext
-# ) raises -> Tuple[T, T]
-
-# fn tensor_svd_trunc[T: TensorOps, dtype: DType](
-#     tensor: T, ctx: DeviceContext, chi_max: Int, eps_trunc: Float64
-# ) raises -> Tuple[T, T, T, Int]

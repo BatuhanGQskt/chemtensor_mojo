@@ -1,61 +1,112 @@
 from collections.list import List
 from gpu.host import DeviceContext
+from src.m_tensor.tensor_traits import TensorOps
 from src.m_tensor.dense_tensor import (
     DenseTensor,
     create_dense_tensor,
     create_dense_tensor_from_data,
 )
+from src.m_tensor.block_sparse_tensor import BlockSparseTensor
 
 
-@fieldwise_init
-struct MPOSite[dtype: DType](Writable, Movable, ImplicitlyCopyable):
+# =============================================================================
+# Convenience Type Aliases for Common Tensor Backends
+# =============================================================================
+
+alias DenseMPOSite = MPOSite[DType.float32, DenseTensor[DType.float32]]
+"""Dense MPO site with float32 data type."""
+
+alias DenseMPO = MatrixProductOperator[DType.float32, DenseTensor[DType.float32]]
+"""Dense MPO with float32 data type."""
+
+alias BlockSparseMPOSite = MPOSite[DType.float32, BlockSparseTensor[DType.float32]]
+"""Block-sparse MPO site with float32 data type."""
+
+alias BlockSparseMPO = MatrixProductOperator[DType.float32, BlockSparseTensor[DType.float32]]
+"""Block-sparse MPO with float32 data type."""
+
+
+struct MPOSite[dtype: DType, T: TensorOps](Writable, Movable, ImplicitlyCopyable):
     """Single site tensor inside an MPO (Matrix Product Operator).
     
-    Each site is stored as a rank-4 DenseTensor with layout
+    Each site is stored as a rank-4 tensor with layout
     [left_bond, phys_in, phys_out, right_bond] or [Wl, d_in, d_out, Wr].
+    
+    The tensor type T must implement TensorOps (plus Movable and Copyable),
+    allowing both DenseTensor and BlockSparseTensor to be used.
+    
+    Parameters:
+        dtype: The data type of tensor elements.
+        T: The tensor type (must implement TensorOps).
     
     This convention matches the standard ChemTensor Python implementation:
     - Contract phys_in with ket physical index
     - phys_out becomes the new physical index
     """
-    var tensor: DenseTensor[dtype] # BlockSparse
+    var tensor: T
+
+    fn __init__(out self, var tensor: T):
+        """Initialize an MPO site with a tensor."""
+        self.tensor = tensor^
     
+    fn __copyinit__(out self, other: Self):
+        """Copy an MPO site."""
+        self.tensor = other.tensor.copy()
+    
+    fn __moveinit__(out self, deinit other: Self):
+        """Move an MPO site."""
+        self.tensor = other.tensor^
+
     fn rank(self) -> Int:
-        return len(self.tensor.shape)
+        """Get the rank (number of dimensions) of the site tensor."""
+        return self.tensor.get_rank()
     
     fn shape(self) -> List[Int]:
-        return self.tensor.shape.copy()
+        """Get the shape of the site tensor."""
+        return self.tensor.get_shape()
     
     fn left_bond_dim(self) raises -> Int:
+        """Get the left bond dimension (first index of rank-4 tensor)."""
         self._assert_rank4()
-        return self.tensor.shape[0]
+        return self.tensor.get_shape_at(0)
     
     fn physical_in_dim(self) raises -> Int:
+        """Get the physical input dimension (second index of rank-4 tensor)."""
         self._assert_rank4()
-        return self.tensor.shape[1]
+        return self.tensor.get_shape_at(1)
     
     fn physical_out_dim(self) raises -> Int:
+        """Get the physical output dimension (third index of rank-4 tensor)."""
         self._assert_rank4()
-        return self.tensor.shape[2]
+        return self.tensor.get_shape_at(2)
 
     fn right_bond_dim(self) raises -> Int:
+        """Get the right bond dimension (last index of rank-4 tensor)."""
         self._assert_rank4()
-        return self.tensor.shape[3]
+        return self.tensor.get_shape_at(3)
     
     fn _assert_rank4(self) raises -> None:
-        var rank = len(self.tensor.shape)
-        if rank != 4:
+        """Validate that the tensor has rank 4."""
+        var r = self.tensor.get_rank()
+        if r != 4:
             raise Error(
                 "MPOSite expects rank-4 tensors [Wl, d_in, d_out, Wr], got rank "
-                + String(rank)
+                + String(r)
             )
     
     fn write_to[W: Writer](self, mut writer: W) -> None:
-        self.tensor.write_to(writer)
+        """Write tensor info to a writer (for Writable trait)."""
+        var s = self.tensor.get_shape()
+        writer.write("MPOSite[")
+        for i in range(len(s)):
+            if i > 0:
+                writer.write(", ")
+            writer.write(s[i])
+        writer.write("]")
 
 
-struct MatrixProductOperator[dtype: DType](Writable, Movable, ImplicitlyCopyable):
-    """Matrix Product Operator (MPO) representation of quantum operators.
+struct MatrixProductOperator[dtype: DType, T: TensorOps](Writable, Movable, ImplicitlyCopyable):
+    """Matrix Product Operator (MPO) generic over tensor type.
     
     An MPO represents an operator on a many-body Hilbert space as a network
     of local tensors. Each site tensor has shape [Wl, d_in, d_out, Wr]:
@@ -63,26 +114,26 @@ struct MatrixProductOperator[dtype: DType](Writable, Movable, ImplicitlyCopyable
     - d_in: input physical dimension (acts on ket)
     - d_out: output physical dimension (produces new ket)
     
-    For Hermitian operators acting on real states, d_in == d_out.
+    The tensor type T must implement the TensorOps trait, allowing both
+    DenseTensor and BlockSparseTensor to be used.
     
-    Typical usage:
-        ```mojo
-        # Create a Heisenberg Hamiltonian MPO
-        var mpo = create_heisenberg_mpo(ctx, num_sites=10, J=1.0)
-        mpo.describe()
-        ```
+    Parameters:
+        dtype: The data type of tensor elements.
+        T: The tensor type (must implement TensorOps).
+    
+    For Hermitian operators acting on real states, d_in == d_out.
     """
-    var sites: List[MPOSite[dtype]]
+    var sites: List[MPOSite[dtype, T]]
     var physical_in_dim: Int
     var physical_out_dim: Int
     var length: Int
-    var bond_dims: List[Int]  # Length = num_sites + 1, bond_dims[i] = W_i (between site i-1 and i)
+    var bond_dims: List[Int]
     
-    fn __init__(out self, var sites: List[MPOSite[dtype]]) raises:
+    fn __init__(out self, var sites: List[MPOSite[dtype, T]]) raises:
         if len(sites) == 0:
             raise Error("MatrixProductOperator requires at least one site tensor")
         
-        var first_site: MPOSite[dtype] = sites[0]
+        var first_site: MPOSite[dtype, T] = sites[0]
         var phys_in = first_site.physical_in_dim()
         var phys_out = first_site.physical_out_dim()
         var bonds: List[Int] = List[Int](capacity=len(sites) + 1)
@@ -197,8 +248,8 @@ fn create_identity_mpo[dtype: DType = DType.float32](
     ctx: DeviceContext,
     num_sites: Int,
     physical_dim: Int,
-) raises -> MatrixProductOperator[dtype]:
-    """Create an MPO representing the identity operator.
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create a DenseTensor-based MPO representing the identity operator.
     
     All bond dimensions are 1 (unentangled operator).
     Each site tensor is the identity matrix reshaped to [1, d, d, 1].
@@ -209,24 +260,20 @@ fn create_identity_mpo[dtype: DType = DType.float32](
         physical_dim: Local Hilbert space dimension (e.g., 2 for qubits).
     
     Returns:
-        MatrixProductOperator representing the identity.
+        DenseTensor-based MatrixProductOperator representing the identity.
     """
     if num_sites < 1:
         raise Error("num_sites must be >= 1")
     if physical_dim < 1:
         raise Error("physical_dim must be >= 1")
     
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     
     for i in range(num_sites):
-        # Shape: [Wl=1, d_in, d_out, Wr=1]
         var shape = List[Int](1, physical_dim, physical_dim, 1)
         var total_size = physical_dim * physical_dim
         var data = List[Scalar[dtype]](capacity=total_size)
         
-        # Create identity matrix: I[i,j] = delta_{ij}
-        # Layout in memory: (Wl=0) -> row=p_in -> col=p_out -> (Wr=0)
-        # Since Wl and Wr are 1, this is just row-major [p_in, p_out]
         for p_in in range(physical_dim):
             for p_out in range(physical_dim):
                 if p_in == p_out:
@@ -235,9 +282,9 @@ fn create_identity_mpo[dtype: DType = DType.float32](
                     data.append(Scalar[dtype](0.0))
         
         var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
-        sites.append(MPOSite[dtype](site_tensor^))
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](site_tensor^))
     
-    return MatrixProductOperator[dtype](sites^)
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)
 
 
 fn create_single_site_op_mpo[dtype: DType = DType.float32](
@@ -245,8 +292,8 @@ fn create_single_site_op_mpo[dtype: DType = DType.float32](
     num_sites: Int,
     site_idx: Int,
     op_data: List[Scalar[dtype]],
-) raises -> MatrixProductOperator[dtype]:
-    """Create MPO for single-site operator O_i (identity elsewhere).
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create DenseTensor-based MPO for single-site operator O_i (identity elsewhere).
     
     op_data is 2x2 row-major: [op[0,0], op[0,1], op[1,0], op[1,1]].
     """
@@ -256,7 +303,7 @@ fn create_single_site_op_mpo[dtype: DType = DType.float32](
         raise Error("create_single_site_op_mpo: op_data must be 4 elements (2x2)")
 
     var d = 2
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     for i in range(num_sites):
         var shape = List[Int](1, d, d, 1)
         var data = List[Scalar[dtype]](capacity=4)
@@ -268,8 +315,8 @@ fn create_single_site_op_mpo[dtype: DType = DType.float32](
                 for p_out in range(d):
                     data.append(Scalar[dtype](1.0) if p_in == p_out else Scalar[dtype](0.0))
         var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
-        sites.append(MPOSite[dtype](site_tensor^))
-    return MatrixProductOperator[dtype](sites^)
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](site_tensor^))
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)
 
 
 fn create_two_site_op_mpo[dtype: DType = DType.float32](
@@ -279,8 +326,8 @@ fn create_two_site_op_mpo[dtype: DType = DType.float32](
     site_j: Int,
     op_i_data: List[Scalar[dtype]],
     op_j_data: List[Scalar[dtype]],
-) raises -> MatrixProductOperator[dtype]:
-    """Create MPO for two-site operator O_i O_j (identity elsewhere).
+) raises -> MatrixProductOperator[dtype, DenseTensor[dtype]]:
+    """Create DenseTensor-based MPO for two-site operator O_i O_j (identity elsewhere).
     Assumes site_i < site_j.
     """
     if num_sites < 2 or site_i < 0 or site_j >= num_sites or site_i >= site_j:
@@ -289,7 +336,7 @@ fn create_two_site_op_mpo[dtype: DType = DType.float32](
         raise Error("create_two_site_op_mpo: op data must be 4 elements each")
 
     var d = 2
-    var sites = List[MPOSite[dtype]](capacity=num_sites)
+    var sites = List[MPOSite[dtype, DenseTensor[dtype]]](capacity=num_sites)
     for i in range(num_sites):
         var shape = List[Int](1, d, d, 1)
         var data = List[Scalar[dtype]](capacity=4)
@@ -304,5 +351,5 @@ fn create_two_site_op_mpo[dtype: DType = DType.float32](
                 for p_out in range(d):
                     data.append(Scalar[dtype](1.0) if p_in == p_out else Scalar[dtype](0.0))
         var site_tensor = create_dense_tensor_from_data[dtype](ctx, data, shape^)
-        sites.append(MPOSite[dtype](site_tensor^))
-    return MatrixProductOperator[dtype](sites^)
+        sites.append(MPOSite[dtype, DenseTensor[dtype]](site_tensor^))
+    return MatrixProductOperator[dtype, DenseTensor[dtype]](sites^)
